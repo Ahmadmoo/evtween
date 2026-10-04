@@ -1,0 +1,50 @@
+data:
+  root: data/hsergb/train      # folder of sequences in the canonical layout (see README)
+  val_root: null               # optional, same layout
+  crop: 256                    # training crop, multiple of loss.patch
+  skip: 7                      # frames skipped between the two keyframes (supervise these)
+  n_tau: 8                     # random event intervals per sample
+  min_events: 2000             # retry crops with fewer events
+  workers: 8
+
+model:
+  width: 64
+  depth: [2, 2, 4, 2]          # ConvNeXt blocks per UNet level
+  K: 3                         # polynomial order of the flow / visibility correction
+  flow_prior: raft             # raft | none
+  flow_scale: 8.0              # pixel scale of predicted flow coefficients
+  gamma: 2.2                   # PNG -> linear light
+  eps: 0.01                    # L = log(Y + eps)
+  c_init: 0.25                 # contrast threshold (learned)
+  r_init: 1.0                  # C_off / C_on (learned)
+  amp: true                    # bf16 for the UNet on CUDA
+
+loss:
+  cos: 1.0                     # C-free event direction loss
+  fit: 1.0                     # quantization-aware event magnitude loss
+  photo: 1.0                   # skipped frames
+  smooth: 0.01                 # edge-aware smoothness of coefficients
+  patch: 16
+  blur: 1.0                    # Gaussian sigma (px) on dL and counts, averages out quantization
+  margin: 1.0                  # |dL - c*n| below margin*c is free
+
+sensor:                        # only used by generate.py
+  mismatch: 0.03               # per-pixel threshold std (relative)
+  refractory: 1.0e-4           # seconds
+  noise_rate: 0.1              # background events per pixel per second
+  min_steps: 4
+  max_steps: 256
+  seed: 0
+
+train:
+  out: runs/default
+  batch: 8                     # per GPU
+  lr: 2.0e-4
+  wd: 0.05
+  steps: 200000
+  warmup: 2000
+  clip: 1.0
+  log_every: 50
+  save_every: 2000
+  val_batches: 50
+  seed: 0
