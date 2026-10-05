@@ -4,6 +4,7 @@ import importlib.util
 import os
 import re
 import shutil
+import subprocess
 import urllib.request
 import numpy as np
 from PIL import Image
@@ -25,11 +26,22 @@ ap.add_argument("--copy", action="store_true", help="copy PNG frames instead of 
 a = ap.parse_args()
 raw = a.raw
 
+def extract(z, dst):
+    print(f"extracting {os.path.basename(z)}")
+    try:
+        shutil.unpack_archive(z, dst)
+    except shutil.ReadError:  # zip64 / large archives python cannot read
+        subprocess.run(["unzip", "-q", "-o", z, "-d", dst], check=True)
+
+
 if not os.path.isdir(raw):
     zips = glob.glob(os.path.join(HERE, "*.zip"))
     assert zips, f"put the HQ-EVFI zip (https://drive.google.com/file/d/{DRIVE_ID}) in {HERE}"
-    print(f"extracting {zips[0]} -> {raw}")
-    shutil.unpack_archive(zips[0], raw)
+    extract(zips[0], raw)
+for z in sorted(glob.glob(os.path.join(raw, "**", "*.zip"), recursive=True)):  # the release holds one zip per sequence
+    dst = z[:-4]
+    if not os.path.isdir(dst):
+        extract(z, dst)
 
 lists = os.path.join(a.out, "dataset_dict.py")
 if not os.path.exists(lists):
