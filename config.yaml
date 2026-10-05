@@ -27,7 +27,7 @@ model:
 loss:
   nll: 1.0                     # exact-time event likelihood
   photo: 1.0                   # hidden real frames
-  cmax: 0.1                    # contrast maximization of real events along the model flow
+  cmax: 0.0                    # contrast maximization (off: unbounded score lets flows collapse events onto few pixels)
   smooth: 0.01
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
