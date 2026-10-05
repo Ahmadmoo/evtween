@@ -1,35 +1,40 @@
 data:
   root: data/hsergb/train      # folder of sequences in the canonical layout (see README)
   val_root: null               # optional, same layout
-  crop: 256                    # training crop, multiple of loss.patch
-  skip: 7                      # frames skipped between the two keyframes (supervise these)
-  n_tau: 8                     # random event intervals per sample
+  crop: 256                    # multiple of 16
+  skip: 7                      # frames hidden between I0 and I1 (the gap)
+  context: 4                   # frames per side for the student (even for vjepa2_1: 2-frame tubelets)
+  bins: 16                     # time bins of the teacher's event input
   min_events: 2000             # retry crops with fewer events
   workers: 8
 
 model:
   width: 64
-  depth: [2, 2, 4, 2]          # ConvNeXt blocks per UNet level
-  K: 3                         # polynomial order of the flow / visibility correction
+  depth: [2, 2, 4, 2]          # decoder UNet levels
+  K: 3                         # polynomial order of the path in time
+  z_dim: 32                    # path code per 16x16 patch
   flow_prior: raft             # raft | none
-  flow_scale: 8.0              # pixel scale of predicted flow coefficients
+  flow_scale: 8.0
   gamma: 2.2                   # PNG -> linear light
   eps: 0.01                    # L = log(Y + eps)
   c_init: 0.25                 # contrast threshold (learned)
   r_init: 1.0                  # C_off / C_on (learned)
-  amp: true                    # bf16 for the UNet on CUDA
+  backbone: vjepa2_1           # vjepa2_1 | levjepa | none (trainable patch embedding, no world knowledge)
+  pred_dim: 384                # student transformer width
+  pred_depth: 4
+  amp: true                    # bf16 on CUDA
 
 loss:
-  cos: 1.0                     # C-free event direction loss
-  fit: 1.0                     # quantization-aware event magnitude loss
-  photo: 1.0                   # skipped frames
-  smooth: 0.01                 # edge-aware smoothness of coefficients
-  patch: 16
-  blur: 1.0                    # Gaussian sigma (px) on dL and counts, averages out quantization
-  margin: 1.0                  # |dL - c*n| below margin*c is free
+  nll: 1.0                     # exact-time event likelihood
+  photo: 1.0                   # hidden real frames
+  cmax: 0.1                    # contrast maximization of real events along the model flow
+  smooth: 0.01
+  sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
+  jepa: 1.0                    # student code vs teacher code
+  grid: 32                     # tau steps for the likelihood clocks
 
 sensor:                        # only used by generate.py
-  mismatch: 0.03               # per-pixel threshold std (relative)
+  mismatch: 0.03
   refractory: 1.0e-4           # seconds
   noise_rate: 0.1              # background events per pixel per second
   min_steps: 4
@@ -37,7 +42,9 @@ sensor:                        # only used by generate.py
   seed: 0
 
 train:
-  out: runs/default
+  stage: teacher               # probe | teacher | student | joint
+  init: null                   # checkpoint to start from (e.g. runs/teacher/last.pt for the student stage)
+  out: runs/teacher
   batch: 8                     # per GPU
   lr: 2.0e-4
   wd: 0.05

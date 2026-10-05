@@ -4,16 +4,23 @@ import sys
 import time
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from data import PairDataset
-from losses import total_loss
+from data import PairDataset, collate
+from losses import compute, diagnostics
 from model import build_model
+
+# which parameters each stage trains (pretrained RAFT / video backbone always stay frozen)
+TRAIN = {"probe": ("student.", "to_counts."),
+         "teacher": ("teacher.", "decoder.", "log_"),
+         "student": ("student.", "to_z."),
+         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_")}
 
 
 def load_cfg(argv):
-    # config path, then dotted overrides: python train.py config.yaml train.lr=1e-4 model.K=4
+    # config path, then dotted overrides: python train.py config.yaml train.stage=student train.lr=1e-4
     path = next((a for a in argv if a.endswith(".yaml")), "config.yaml")
     cfg = yaml.safe_load(open(path))
     for kv in (a for a in argv if "=" in a):
@@ -31,8 +38,18 @@ def load_cfg(argv):
     return cfg
 
 
+class Step(nn.Module):
+    # the whole loss runs inside forward so DDP can sync gradients
+    def __init__(self, model, w, stage):
+        super().__init__()
+        self.model, self.w, self.stage = model, w, stage
+
+    def forward(self, batch):
+        return compute(self.model, batch, self.w, self.stage)
+
+
 cfg = load_cfg(sys.argv[1:])
-D, T = cfg["data"], cfg["train"]
+D, T, stage = cfg["data"], cfg["train"], cfg["train"]["stage"]
 ddp, cuda = "WORLD_SIZE" in os.environ, torch.cuda.is_available()
 if ddp:
     dist.init_process_group("nccl" if cuda else "gloo")
@@ -44,6 +61,10 @@ torch.manual_seed(T["seed"] + rank)
 torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 
 model = build_model(cfg).to(dev)
+if T.get("init"):
+    model.load_state_dict(torch.load(T["init"], map_location=dev, weights_only=False)["model"], strict=False)
+for n, p in model.named_parameters():
+    p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n)
 params = [p for p in model.parameters() if p.requires_grad]
 opt = torch.optim.AdamW([{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
                          {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}],
@@ -51,19 +72,20 @@ opt = torch.optim.AdamW([{"params": [p for p in params if p.ndim > 1], "weight_d
 ckpt, step = os.path.join(T["out"], "last.pt"), 0
 if os.path.exists(ckpt):
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
-    model.load_state_dict(ck["model"])
+    model.load_state_dict(ck["model"], strict=False)
     opt.load_state_dict(ck["opt"])
     step = ck["step"]
-net = DDP(model, device_ids=[torch.cuda.current_device()] if cuda else None) if ddp else model
+net = Step(model, cfg["loss"], stage)
+net = DDP(net, device_ids=[torch.cuda.current_device()] if cuda else None) if ddp else net
 
-data = PairDataset(D["root"], D["crop"], D["skip"], D["n_tau"], D["min_events"])
+make = lambda root, train: PairDataset(root, D["crop"], D["skip"], D["context"], D["bins"], D["min_events"] if train else 0, train)
+data = make(D["root"], True)
 sampler = DistributedSampler(data) if ddp else None
-loader = DataLoader(data, T["batch"], shuffle=sampler is None, sampler=sampler, num_workers=D["workers"],
+loader = DataLoader(data, T["batch"], shuffle=sampler is None, sampler=sampler, num_workers=D["workers"], collate_fn=collate,
                     pin_memory=True, drop_last=True, persistent_workers=D["workers"] > 0)
 val = None
 if D.get("val_root") and rank == 0:
-    val = DataLoader(PairDataset(D["val_root"], D["crop"], D["skip"], D["n_tau"], 0, train=False),
-                     T["batch"], num_workers=D["workers"])
+    val = DataLoader(make(D["val_root"], False), T["batch"], num_workers=D["workers"], collate_fn=collate)
 
 
 def lr_at(step):
@@ -81,8 +103,11 @@ def validate():
         if b == T["val_batches"]:
             break
         batch = {k: v.to(dev) for k, v in batch.items()}
-        _, terms = total_loss(model, model(batch["i0"], batch["i1"]), batch, cfg["loss"])
-        sums = {k: sums.get(k, 0) + v.item() for k, v in terms.items()}
+        if stage == "probe":
+            out = dict(probe=compute(model, batch, cfg["loss"], stage)[0].item())
+        else:
+            out = diagnostics(model, batch, cfg["loss"], student=stage != "teacher")
+        sums = {k: sums.get(k, 0) + v for k, v in out.items()}
         n += 1
     model.train()
     return {k: v / max(n, 1) for k, v in sums.items()}
@@ -98,7 +123,7 @@ while step < T["steps"]:
         batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
-        loss, terms = total_loss(model, net(batch["i0"], batch["i1"]), batch, cfg["loss"])
+        loss, terms = net(batch)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(params, T["clip"])
@@ -107,10 +132,10 @@ while step < T["steps"]:
 
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
-            print(f"step {step} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
-                  f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
+            print(f"[{stage}] step {step} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
+                  f"k {model.log_k.exp().item():.2f} gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
-            torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
+            torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
             if val is not None:
                 print("val " + " ".join(f"{k} {v:.4f}" for k, v in validate().items()), flush=True)
         if step >= T["steps"]:

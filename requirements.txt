@@ -3,3 +3,7 @@ torchvision>=0.17
 numpy
 pyyaml
 pillow
+timm
+einops
+transformers
+lejepa @ git+https://github.com/rbalestr-lab/lejepa

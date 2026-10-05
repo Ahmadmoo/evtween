@@ -4,6 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
+# official V-JEPA 2.1 ViT-L checkpoint (the hub file in facebookresearch/vjepa2 points its downloads to localhost)
+VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt"
+LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
+
 
 def luminance(img, gamma=2.2):
     # RGB in [0,1] -> linear luminance (event pixels respond to linear light)
@@ -42,6 +46,12 @@ def warp_with_grad(y, flow, vel):
     return out.chunk(3)
 
 
+def fourier(v, n=16):
+    f = torch.exp(torch.linspace(0, math.log(100), n // 2, device=v.device))
+    a = v.float()[..., None] * f
+    return torch.cat([a.sin(), a.cos()], -1)
+
+
 class LayerNorm2d(nn.LayerNorm):
     def forward(self, x):
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
@@ -69,8 +79,6 @@ class UNet(nn.Module):
         self.up = nn.ModuleList(nn.Conv2d(b, a, 1) for a, b in zip(ch, ch[1:]))
         self.dec = nn.ModuleList(nn.Sequential(nn.Conv2d(2 * a, a, 1), Block(a)) for a in ch[:-1])
         self.head = nn.Sequential(LayerNorm2d(ch[0]), nn.Conv2d(ch[0], cout, 3, padding=1))
-        nn.init.zeros_(self.head[-1].weight)  # start from the plain flow-prior interpolation
-        nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x):
         x, skips = self.stem(x), []
@@ -111,16 +119,122 @@ class FlowPrior(nn.Module):
         return f.chunk(2)
 
 
+class Backbone(nn.Module):
+    # frozen pretrained video encoder, built and loaded with the authors' own code;
+    # "none" is a trainable per-frame patch embedding (baseline without world knowledge)
+    def __init__(self, kind, dim):
+        super().__init__()
+        self.kind = kind
+        if kind == "vjepa2_1":
+            self.net, _ = torch.hub.load("facebookresearch/vjepa2", "vjepa2_1_vit_large_384", pretrained=False)
+            sd = torch.hub.load_state_dict_from_url(VJEPA21_URL, map_location="cpu")["ema_encoder"]
+            self.net.load_state_dict({k.replace("module.", "").replace("backbone.", ""): v for k, v in sd.items()})
+            self.tubelet, self.dim = 2, self.net.embed_dim
+        elif kind == "levjepa":
+            from transformers import AutoModel
+            self.net = AutoModel.from_pretrained(LEVJEPA_ID, trust_remote_code=True)
+            self.tubelet, self.dim = self.net.config.tubelet_size, self.net.config.embed_dim
+        else:
+            self.net, self.tubelet, self.dim = nn.Conv2d(3, dim, 16, stride=16), 1, dim
+        if kind != "none":
+            self.net.eval().requires_grad_(False)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1, 1), persistent=False)
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1, 1), persistent=False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.kind != "none":
+            self.net.eval()
+        return self
+
+    def forward(self, clip):
+        # (B,T,3,H,W) in [0,1] -> tokens (B, T/tubelet, H/16, W/16, D)
+        B, T, _, H, W = clip.shape
+        if self.kind == "none":
+            return self.net(clip.flatten(0, 1)).view(B, T, self.dim, H // 16, W // 16).permute(0, 1, 3, 4, 2)
+        x = (clip.transpose(1, 2) - self.mean) / self.std
+        with torch.no_grad():
+            tok = self.net(x) if self.kind == "vjepa2_1" else self.net(pixel_values=x).last_hidden_state[:, 1:]
+        return tok.reshape(B, T // self.tubelet, H // 16, W // 16, self.dim)
+
+
+class Student(nn.Module):
+    # frozen video backbone on the context frames + small transformer that fills the gap
+    def __init__(self, backbone, dim, depth):
+        super().__init__()
+        self.backbone = Backbone(backbone, dim)
+        self.inp = nn.Linear(self.backbone.dim, dim)
+        self.pos = nn.Linear(64, dim)
+        self.query = nn.Parameter(torch.zeros(dim))
+        layer = nn.TransformerDecoderLayer(dim, 8, 4 * dim, dropout=0.0, batch_first=True, norm_first=True)
+        self.dec = nn.TransformerDecoder(layer, depth)
+
+    def embed(self, gy, gx, t, dt):
+        return self.pos(torch.cat([fourier(gy / 16), fourier(gx / 16), fourier(t), fourier(dt.log())], -1))
+
+    def forward(self, ctx, ctx_tau, dt):
+        # ctx: frames up to I0 then from I1 on (gap frames never included); ctx_tau: their times in gap units
+        B, T = ctx.shape[:2]
+        tok, tt = [], []
+        for side in (slice(0, T // 2), slice(T // 2, T)):  # encode each side alone so the backbone never sees a fake jump
+            tok.append(self.backbone(ctx[:, side]))
+            tt.append(ctx_tau[:, side].reshape(B, -1, self.backbone.tubelet).mean(-1))
+        tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)
+        _, n, h, w, _ = tok.shape
+        gy, gx = torch.meshgrid(torch.arange(h, device=tok.device), torch.arange(w, device=tok.device), indexing="ij")
+        mem = self.inp(tok) + self.embed(gy.expand(B, n, h, w), gx.expand(B, n, h, w),
+                                         tt.view(B, n, 1, 1).expand(B, n, h, w), dt.view(B, 1, 1, 1).expand(B, n, h, w))
+        q = self.query + self.embed(gy.expand(B, h, w), gx.expand(B, h, w),
+                                    torch.full((B, h, w), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, h, w))
+        out = self.dec(q.flatten(1, 2), mem.flatten(1, 3))
+        return out.transpose(1, 2).reshape(B, -1, h, w)
+
+
+class EventEncoder(nn.Module):
+    # teacher: real events in the gap (time-binned) + I0, I1 -> path code on the 16x16 patch grid
+    def __init__(self, cin, z_dim, width):
+        super().__init__()
+        ch = [width, 2 * width, 4 * width, 4 * width, 4 * width]
+        layers = [nn.Conv2d(cin, ch[0], 3, padding=1)]
+        for a, b in zip(ch, ch[1:]):
+            layers += [Block(a), LayerNorm2d(a), nn.Conv2d(a, b, 2, stride=2)]
+        self.net = nn.Sequential(*layers, Block(ch[-1]), Block(ch[-1]), LayerNorm2d(ch[-1]), nn.Conv2d(ch[-1], z_dim, 1))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Decoder(nn.Module):
+    # frames + path code -> per-pixel path coefficients; every coefficient is gated by z,
+    # so z = 0 gives exactly the plain SloMo path and the decoder cannot ignore the code
+    def __init__(self, z_dim, cout, width, depth):
+        super().__init__()
+        self.feat = UNet(12, width, width, depth)
+        self.gate = nn.Conv2d(z_dim, width, 1, bias=False)
+        self.head = nn.Conv2d(width, cout, 1, bias=False)
+        nn.init.zeros_(self.head.weight)
+
+    def forward(self, x, z):
+        g = self.gate(F.interpolate(z, size=x.shape[-2:], mode="bilinear", align_corners=False))
+        return self.head(self.feat(x) * g)
+
+
 class EvTween(nn.Module):
-    def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, flow_prior="raft", flow_scale=8.0,
-                 gamma=2.2, eps=0.01, c_init=0.25, r_init=1.0, amp=True):
+    def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
+                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
-        self.mult = max(8, 2 ** (len(depth) - 1))
+        self.mult = max(16, 2 ** (len(depth) - 1))
         self.flow = FlowPrior(flow_prior)
-        self.net = UNet(12, 5 * K + 1, width, depth)
-        self.log_c = nn.Parameter(torch.tensor(math.log(c_init)))
-        self.log_r = nn.Parameter(torch.tensor(math.log(r_init)))
+        self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
+        self.decoder = Decoder(z_dim, 5 * K + 1, width, depth)
+        self.student = Student(backbone, pred_dim, pred_depth)
+        self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
+        self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
+        self.log_c = nn.Parameter(torch.tensor(math.log(c_init)))   # ON threshold
+        self.log_r = nn.Parameter(torch.tensor(math.log(r_init)))   # C_off / C_on
+        self.log_k = nn.Parameter(torch.tensor(math.log(4.0)))      # inverse-Gaussian shape (timing regularity)
+        self.log_nu = nn.Parameter(torch.tensor(math.log(0.05)))    # background events per pixel per gap
 
     @property
     def c(self):
@@ -130,30 +244,55 @@ class EvTween(nn.Module):
     def r(self):
         return self.log_r.exp()
 
-    def forward(self, i0, i1):
-        # predict the trajectory state of one frame pair (run once, render at any tau)
-        B, _, H, W = i0.shape
-        pad = (0, -W % self.mult, 0, -H % self.mult)
-        i0, i1 = F.pad(i0, pad, mode="replicate"), F.pad(i1, pad, mode="replicate")
+    def frozen(self, name):
+        return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
+
+    def state(self):
+        # checkpoint without the frozen pretrained networks (reloaded from their official sources)
+        return {k: v for k, v in self.state_dict().items() if not self.frozen(k)}
+
+    def _ac(self, x):
+        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and x.is_cuda)
+
+    def _pad(self, x):
+        H, W = x.shape[-2:]
+        y = F.pad(x.reshape(-1, *x.shape[-3:]), (0, -W % self.mult, 0, -H % self.mult), mode="replicate")
+        return y.view(*x.shape[:-2], *y.shape[-2:])
+
+    def prepare(self, i0, i1):
+        # frame-only inputs shared by teacher and decoder, padded to the patch grid
+        H, W = i0.shape[-2:]
+        i0, i1 = self._pad(i0), self._pad(i1)
         f01, f10 = self.flow(i0, i1)
         y0, y1 = luminance(i0, self.gamma), luminance(i1, self.gamma)
         e0, e1 = (warp(y1, f01) - y0).abs(), (warp(y0, f10) - y1).abs()
         x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and x.is_cuda):
-            out = self.net(x)
-        out, crop = out.float()[..., :H, :W], (lambda t: t[..., :H, :W])
-        a, b, d = out.split([2 * self.K, 2 * self.K, self.K + 1], 1)
-        return dict(y0=crop(y0), y1=crop(y1), f01=crop(f01), f10=crop(f10),
-                    a=self.flow_scale * a.reshape(B, self.K, 2, H, W),
-                    b=self.flow_scale * b.reshape(B, self.K, 2, H, W), d=d)
+        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W)
 
-    def render(self, s, tau):
-        # log intensity L(tau) and its exact derivative dL/dtau, tau: (B,) or (B,1,H,W)
-        # flows:  F0 = SloMo(tau) + sum_k a_k tau^(k+1)        (zero at tau=0)
-        #         F1 = SloMo(tau) + sum_k b_k (1-tau)^(k+1)    (zero at tau=1)
-        # blend:  Y = (w0*Y0(p+F0) + w1*Y1(p+F1)) / (w0+w1),  w0=(1-tau)V, w1=tau(1-V)
-        # dY/dtau by chain rule: d/dtau Y0(p+F0) = grad Y0(p+F0) . dF0/dtau
-        tau = tau.view(-1, 1, 1, 1) if tau.dim() == 1 else tau
+    def encode(self, p, voxel):
+        x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
+        with self._ac(x):
+            return self.teacher(x).float()
+
+    def predict(self, ctx, ctx_tau, dt, head="z"):
+        ctx = self._pad(ctx)
+        with self._ac(ctx):
+            f = self.student(ctx, ctx_tau, dt).float()
+        return (self.to_z if head == "z" else self.to_counts)(f)
+
+    def decode(self, p, z):
+        # path code -> trajectory state used by render()
+        with self._ac(z):
+            out = self.decoder(p["x"], z)
+        H, W, B = p["H"], p["W"], z.shape[0]
+        crop = lambda t: t[..., :H, :W]
+        a, b, d = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1], 1)
+        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=d,
+                    a=self.flow_scale * a.reshape(B, self.K, 2, H, W), b=self.flow_scale * b.reshape(B, self.K, 2, H, W))
+
+    def flows(self, s, tau):
+        # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:
+        # F0 = SloMo(tau) + sum_k a_k tau^(k+1)  (zero at tau=0),  F1 = SloMo(tau) + sum_k b_k (1-tau)^(k+1)  (zero at tau=1)
         f01, f10 = s["f01"], s["f10"]
         k = torch.arange(self.K, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1, 1)
         t, u = tau.unsqueeze(1), (1 - tau).unsqueeze(1)
@@ -161,7 +300,13 @@ class EvTween(nn.Module):
         dF0 = -(1 - 2 * tau) * f01 + 2 * tau * f10 + (s["a"] * (k + 1) * t ** k).sum(1)
         F1 = (1 - tau) ** 2 * f01 - tau * (1 - tau) * f10 + (s["b"] * u ** (k + 1)).sum(1)
         dF1 = -2 * (1 - tau) * f01 - (1 - 2 * tau) * f10 - (s["b"] * (k + 1) * u ** k).sum(1)
+        return F0, dF0, F1, dF1
 
+    def render(self, s, tau):
+        # log intensity L(tau) and its analytic derivative dL/dtau, tau: (B,) or (B,1,H,W)
+        # Y = (w0*Y0(p+F0) + w1*Y1(p+F1)) / (w0+w1),  w0=(1-tau)V, w1=tau(1-V),  V = sigmoid(poly(tau))
+        tau = tau.view(-1, 1, 1, 1) if tau.dim() == 1 else tau
+        F0, dF0, F1, dF1 = self.flows(s, tau)
         j = torch.arange(1, self.K + 1, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1)
         z = s["d"][:, :1] + (s["d"][:, 1:] * tau ** j).sum(1, keepdim=True)
         dz = (s["d"][:, 1:] * j * tau ** (j - 1)).sum(1, keepdim=True)
@@ -181,4 +326,4 @@ class EvTween(nn.Module):
 
 
 def build_model(cfg):
-    return EvTween(**cfg["model"])
+    return EvTween(**cfg["model"], bins=cfg["data"]["bins"])

@@ -2,34 +2,44 @@
 
 Continuous-time event generation from RGB video, **learned from real events**.
 
-Given two frames, the model predicts the full log-intensity trajectory `L(u, τ)` between them.
-It is trained only on real RGB + event pairs (no simulator in the loop).
-At test time it needs **only RGB**. Events come out with continuous timestamps from an exact crossing solver, similar to TIDES.
+Frames show the endpoints of a motion; events show the path between them.
+A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
+A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
+At test time only RGB is needed.
+
+```
+TRAIN
+ I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 16×16 patch)
+ context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
+ z or ẑ + I0, I1 ──> physics decoder ──> L(u,τ), dL/dτ ──> exact-time event likelihood
+
+TEST
+ video ──> student ──> ẑ ──> physics decoder ──> crossing solver + sensor ──> events (t, x, y, p)
+```
 
 ---
 
-## 1. Idea
+## 1. Parts
 
 | Part | What it does |
 |---|---|
-| Trajectory | Warp both frames with time-polynomial flows, then blend them with a time-varying visibility mask |
-| Flows | Super SloMo base flows from a frozen RAFT prior, plus learned corrections `Σ a_k τ^(k+1)` and `Σ b_k (1-τ)^(k+1)` |
-| Exact `dL/dτ` | Closed-form chain rule through warp and blend. Uses the exact bilinear gradient, so it matches finite differences to ~1e-9 |
-| Endpoints | `L(0)` and `L(1)` equal the input frames exactly, by construction |
-| Sensor | Contrast threshold `C_on` and ratio `r = C_off / C_on` are learned from data |
-| Events | Per pixel, solve where the local quadratic of `L` crosses `ref ± C`. Adds threshold mismatch, refractory period and background noise |
+| Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 16×16 patch grid. Training only |
+| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
+| Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
+| Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
+| Sensor | `C_on`, `r = C_off / C_on`, timing regularity `k` and background rate `ν` are learned |
+| Events | Per pixel, exact crossing of the local quadratic of `L` with `ref ± C`, plus threshold mismatch, refractory period and noise |
 
 ### Losses
 
 | Loss | Meaning |
 |---|---|
-| `cos` | Per patch, the direction of the predicted `ΔL` must match the event counts `n_on - r·n_off`. Does not depend on `C` |
-| `fit` | `|ΔL - C·(n_on - r·n_off)|` is free below one threshold (quantization), Huber above it |
-| `photo` | `L(τ)` must match the real skipped frames |
-| `smooth` | Edge-aware smoothness of the predicted coefficients |
-
-`ΔL` is always measured against a known frame (from `τ=0` forward, and to `τ=1` backward), with a small Gaussian blur.
-This keeps quantization noise bounded while the signal grows. On toy data it gave 4× more learning signal than short independent intervals.
+| `nll` | Point-process likelihood of the real event **times**. Clocks `∫relu(±dL/dτ)/C` per polarity; waits in clock units are inverse-Gaussian; ON/OFF compete and reset together; no-event stretches enter through survival terms; unexplained events fall on a noise floor `ν` |
+| `photo` | `L(τ)` must match the real hidden frames |
+| `cmax` | Contrast maximization: real events moved along the model flow to τ=0 and τ=1 must stack into sharp edges (scale-normalized) |
+| `sigreg` | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to model later) |
+| `jepa` | Student code vs teacher code (`stopgrad` in the student stage, joint in the joint stage) |
+| `smooth` | Edge-aware smoothness of the path coefficients |
 
 ---
 
@@ -37,15 +47,24 @@ This keeps quantization noise bounded while the signal grows. On toy data it gav
 
 | File | Content |
 |---|---|
-| `model.py` | UNet (ConvNeXt blocks), RAFT prior, trajectory `render(s, τ) → L, dL/dτ` |
-| `losses.py` | Event, photometric and smoothness losses |
+| `model.py` | Backbones, teacher, student, gated decoder, flows, `render(s, τ) → L, dL/dτ` |
+| `losses.py` | Likelihood, photometric, contrast max, SIGReg, stage logic, validation diagnostics |
 | `physics.py` | Quadratic root solver and event `Simulator` |
-| `data.py` | Sequence reader and training dataset |
-| `train.py` | Training: single GPU, `torchrun` DDP, bf16, resume |
-| `generate.py` | RGB video → events `.npz` |
+| `data.py` | Sequence reader, training samples, collate |
+| `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
+| `generate.py` | RGB video → events `.npz` (student path) |
 | `convert.py` | Converts per-interval npz datasets (HS-ERGB, BS-ERGB, TimeLens style) |
-| `toy_data.py` | Small synthetic dataset for smoke tests |
+| `toy_data.py` | Synthetic dataset for smoke tests |
 | `config.yaml` | All settings |
+
+### Code used as-is from other projects
+
+| Part | Source | How |
+|---|---|---|
+| RAFT | torchvision | `raft_large(weights=Raft_Large_Weights.DEFAULT)` |
+| V-JEPA 2.1 ViT-L | [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2) | `torch.hub.load(..., "vjepa2_1_vit_large_384", pretrained=False)`, then the official checkpoint (`ema_encoder`). The repo's hub file points downloads to `localhost`, so the URL is set in `model.py` |
+| LeVJEPA ViT-L | [galilai-group/LeVJEPA-VideoMix-Large](https://huggingface.co/galilai-group/LeVJEPA-VideoMix-Large) | `AutoModel.from_pretrained(..., trust_remote_code=True)` |
+| SIGReg | [rbalestr-lab/lejepa](https://github.com/rbalestr-lab/lejepa) | `SlicingUnivariateTest(EppsPulley(n_points=17), num_slices=256)` |
 
 ---
 
@@ -70,9 +89,7 @@ seq/
   ev_p.npy                # (M,) int8, +1 / -1
 ```
 
-`data.root` points to a folder that holds many `seq/` folders.
-
-### Convert HS-ERGB (example)
+`data.root` points to a folder holding many `seq/` folders. Convert HS-ERGB:
 
 ```bash
 python convert.py \
@@ -83,36 +100,52 @@ python convert.py \
   --xy_scale 32 --t_scale 1e-6
 ```
 
-> Check the printed time ranges. Frames and events must both be in seconds. Fix with `--t_scale` / `--ts_scale`.
-
-Good training sources: HS-ERGB, BS-ERGB, ERF-X170FPS, HQ-EVFI (aligned RGB + events, high frame rate).
+> Check the printed time ranges. Frames and events must both be in seconds (`--t_scale`, `--ts_scale`).
 
 ---
 
 ## 5. Train
 
+Run the stages in order. Every command accepts dotted overrides; add `torchrun --nproc_per_node 4` for multi-GPU.
+
 ```bash
-# one GPU
-python train.py config.yaml
+# 0. probe (1-2 days): can the backbone predict event counts in the gap? compare backbones
+python train.py train.stage=probe model.backbone=vjepa2_1 train.out=runs/probe_vjepa train.steps=20000
+python train.py train.stage=probe model.backbone=levjepa  train.out=runs/probe_levjepa train.steps=20000
+python train.py train.stage=probe model.backbone=none     train.out=runs/probe_none train.steps=20000
 
-# 4 GPUs
-torchrun --nproc_per_node 4 train.py config.yaml
+# 1. teacher + decoder on real events
+python train.py train.stage=teacher train.out=runs/teacher
 
-# override any key
-python train.py config.yaml train.lr=1e-4 data.skip=15 model.K=4 train.out=runs/k4
+# 2. student (teacher and decoder frozen)
+python train.py train.stage=student train.init=runs/teacher/last.pt train.out=runs/student
+
+# 3. optional joint fine-tune (small lr)
+python train.py train.stage=joint train.init=runs/student/last.pt train.lr=2e-5 train.out=runs/joint
 ```
 
-The run resumes from `train.out/last.pt` if it exists.
+### What to watch (validation line)
 
-Log line: `cos fit photo smooth` losses, the learned `c` and `r`, grad norm, lr.
+| Value | Meaning | Healthy |
+|---|---|---|
+| `nll` | Teacher code | Lowest |
+| `nll_shuffled` | Codes swapped between samples | Clearly above `nll`, else `z` carries nothing |
+| `nll_zero` | Plain SloMo path | Above `nll` |
+| `nll_student` | Student code | Between `nll` and `nll_zero` |
+| `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
 
-### Smoke test (CPU, ~1 min)
+The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT and backbone weights.
+
+### Smoke test (CPU, a few minutes)
 
 ```bash
-python toy_data.py data/toy
-python train.py data.root=data/toy/train data.crop=64 data.skip=3 data.min_events=50 data.workers=0 \
-  model.flow_prior=none model.width=16 "model.depth=[1,1,1]" train.batch=4 train.steps=100 train.warmup=10 train.out=runs/toy
-python generate.py --ckpt runs/toy/last.pt --seq data/toy/val/seq100 --out runs/toy/events.npz
+python toy_data.py data/toy 24
+S="data.root=data/toy/train data.val_root=data/toy/val data.crop=64 data.skip=3 data.min_events=50 data.workers=2 data.bins=8 \
+   model.flow_prior=none model.backbone=none model.width=16 model.depth=[1,1,1] model.pred_dim=64 model.pred_depth=2 \
+   loss.grid=16 train.batch=4 train.lr=1e-3 train.warmup=20 train.log_every=100 train.val_batches=8"
+python train.py $S train.stage=teacher train.steps=1000 train.save_every=500 train.out=runs/teacher
+python train.py $S train.stage=student train.init=runs/teacher/last.pt train.steps=600 train.save_every=300 train.out=runs/student
+python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out runs/student/events.npz
 ```
 
 ---
@@ -120,12 +153,11 @@ python generate.py --ckpt runs/toy/last.pt --seq data/toy/val/seq100 --out runs/
 ## 6. Generate
 
 ```bash
-python generate.py --ckpt runs/default/last.pt --seq my_video/ --out events.npz
+python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz
 python generate.py --ckpt ... --seq ... --set noise_rate=0 mismatch=0.05 refractory=5e-4
 ```
 
-`my_video/` needs only `frames/` and `frame_ts.npy`.
-Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
+`my_video/` needs only `frames/` and `frame_ts.npy`. Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
 
 ---
 
@@ -133,21 +165,25 @@ Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
 
 | Key | Effect |
 |---|---|
-| `data.skip` | Gap between keyframes. Larger = harder motion, more supervision per sample |
-| `data.n_tau` | Random time cuts per sample for the event loss |
-| `model.K` | Polynomial order of the motion and visibility in time |
-| `model.flow_prior` | `raft` (default) or `none` |
-| `model.eps`, `model.gamma` | Log offset and display gamma. Must match how the sensor sees light |
-| `loss.blur`, `loss.margin` | Quantization handling in the event losses |
+| `data.skip` | Hidden frames in the gap. Larger gaps are where the world model should matter |
+| `data.context` | Frames per side for the student (even for V-JEPA 2.1, 2-frame tubelets) |
+| `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
+| `model.z_dim` | Size of the path code per patch |
+| `model.K` | Polynomial order of the path in time |
+| `loss.grid` | τ steps for the likelihood clocks |
 | `sensor.*` | Generation only: mismatch, refractory, noise, step limits |
 
 ---
 
-## 8. Verified
+## 8. Status
 
-- `dL/dτ` matches finite differences (rel. error ~1e-9 inside the interval, ~1e-6 at the endpoints).
-- After every interval, each pixel's level stays within its threshold band, so no crossing is missed.
-- Toy run: the loss goes down and the learned `c` and `r` move toward the true values.
-- RAFT path, 2-process DDP (gloo, CPU) and resume all run.
+Verified here (CPU, toy data):
+- `dL/dτ` matches finite differences of the model; inverse-Gaussian terms match numerical integration.
+- Teacher generalizes on held-out toy scenes: `nll` < `nll_zero` < `nll_shuffled`. Student lands in between.
+- All four stages, generation, V-JEPA 2.1 wrapper (official code, random weights), 2-process DDP.
 
-Not tested here: a full GPU run on real data.
+Not tested here: real data on GPU, pretrained weight downloads, the LeVJEPA wrapper (Hugging Face is blocked in this sandbox).
+
+Known limits:
+- The likelihood uses time-rescaled clocks; it is approximate when `L` goes up and down between two events, and it ignores refractory time and low-light bandwidth.
+- The student is deterministic, so ambiguous gaps (same endpoints, different timing) get an average code. A stochastic student `p(z | video)` is the next step.

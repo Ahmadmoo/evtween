@@ -42,7 +42,8 @@ def make(root, seed, H=96, W=128, n_frames=40, sub=20, fps=100.0, c=0.2, eps=0.0
 
 
 out = sys.argv[1] if len(sys.argv) > 1 else "data/toy"
-for split, seeds in (("train", range(4)), ("val", range(100, 101))):
+n = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+for split, seeds in (("train", range(n)), ("val", range(100, 100 + max(1, n // 8)))):
     for s in seeds:
         make(os.path.join(out, split, f"seq{s:03d}"), s)
 print(f"wrote {out}/train and {out}/val")
