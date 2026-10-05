@@ -4,3 +4,5 @@ __pycache__/
 *.pt
 *.npz
 raw/
+HQ-EVFI/*.zip
+HQ-EVFI/raw/

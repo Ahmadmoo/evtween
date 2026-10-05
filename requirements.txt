@@ -7,4 +7,3 @@ timm
 einops
 transformers
 lejepa @ git+https://github.com/rbalestr-lab/lejepa
-gdown

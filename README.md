@@ -53,7 +53,7 @@ TEST
 | `data.py` | Sequence reader, training samples, collate |
 | `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
 | `generate.py` | RGB video → events `.npz` (student path) |
-| `HQ-EVFI/hqevfi.py` | Downloads HQ-EVFI and converts it to the training layout |
+| `HQ-EVFI/hqevfi.py` | Extracts the HQ-EVFI zip and converts it to the training layout |
 | `toy_data.py` | Synthetic dataset for smoke tests |
 | `config.yaml` | All settings |
 
@@ -81,12 +81,14 @@ pip install -r requirements.txt
 **HQ-EVFI** (TimeLens-XL, ECCV'24): beam splitter with checkerboard calibration (pixel-aligned RGB and events), Prophesee EVK4-HD, 142 fps RGB, 71 sequences.
 High-fps RGB gives the hidden frames; pixel alignment is needed by the per-pixel likelihood.
 
+1. Download the zip from [Google Drive](https://drive.google.com/file/d/104ZMJ-M_frImOOCGfLk_HDb2FV1trveT) and put it in `HQ-EVFI/`.
+2. Run:
+
 ```bash
-python HQ-EVFI/hqevfi.py --out data/hqevfi                          # download + convert
-python HQ-EVFI/hqevfi.py --out data/hqevfi --raw path/to/extracted  # already downloaded
+python HQ-EVFI/hqevfi.py --out data/hqevfi
 ```
 
-The script downloads the archive (Google Drive), fetches the official ranges and test split from TimeLens-XL (`dataset_dict.py`), and writes `data/hqevfi/{train,test}/<sequence>/`. It uses the 3 ms corrected event folders with the one-frame image shift where TimeLens-XL does. Frame times come from the boundaries between event files. **Check the printed fps (≈142).**
+The script extracts the zip to `HQ-EVFI/raw/` (once), fetches the official ranges and test split from TimeLens-XL (`dataset_dict.py`), and writes `data/hqevfi/{train,test}/<sequence>/`. It uses the 3 ms corrected event folders with the one-frame image shift where TimeLens-XL does. Frame times come from the boundaries between event files. **Check the printed fps (≈142).**
 
 Layout per sequence:
 

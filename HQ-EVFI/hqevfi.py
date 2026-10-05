@@ -16,20 +16,20 @@ LISTS = "https://raw.githubusercontent.com/OpenImagingLab/TimeLens-XL/main/datas
 FPS = 142.0
 SCALES = (1.0, 1e-3, 1e-6, 1e-9)
 
-ap = argparse.ArgumentParser(description="download HQ-EVFI and convert it to the evtween layout: <out>/{train,test}/<sequence>/")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ap = argparse.ArgumentParser(description="HQ-EVFI zip (put in this folder) -> evtween layout: <out>/{train,test}/<sequence>/")
 ap.add_argument("--out", default="data/hqevfi")
-ap.add_argument("--raw", default=None, help="already extracted dataset (skips the download); default <out>/raw")
+ap.add_argument("--raw", default=os.path.join(HERE, "raw"), help="where the zip is extracted (skipped if it exists)")
 ap.add_argument("--lists", default=LISTS, help="TimeLens-XL dataset_dict.py (url or local path)")
 ap.add_argument("--copy", action="store_true", help="copy PNG frames instead of symlinking them")
 a = ap.parse_args()
-raw = a.raw or os.path.join(a.out, "raw")
+raw = a.raw
 
 if not os.path.isdir(raw):
-    import gdown
-    os.makedirs(raw)
-    archive = gdown.download(id=DRIVE_ID, output=raw + os.sep)
-    shutil.unpack_archive(archive, raw)
-    os.remove(archive)
+    zips = glob.glob(os.path.join(HERE, "*.zip"))
+    assert zips, f"put the HQ-EVFI zip (https://drive.google.com/file/d/{DRIVE_ID}) in {HERE}"
+    print(f"extracting {zips[0]} -> {raw}")
+    shutil.unpack_archive(zips[0], raw)
 
 lists = os.path.join(a.out, "dataset_dict.py")
 if not os.path.exists(lists):
