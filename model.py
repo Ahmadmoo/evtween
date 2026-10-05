@@ -19,7 +19,7 @@ def _coords(flow):
     _, _, H, W = flow.shape
     gy, gx = torch.meshgrid(torch.arange(H, device=flow.device, dtype=flow.dtype),
                             torch.arange(W, device=flow.device, dtype=flow.dtype), indexing="ij")
-    return (gx + flow[:, 0]).clamp(0, W - 1), (gy + flow[:, 1]).clamp(0, H - 1)
+    return gx + flow[:, 0], gy + flow[:, 1]
 
 
 def _sample(x, px, py):
@@ -36,14 +36,18 @@ def warp(x, flow):
 def warp_with_grad(y, flow, vel):
     # y(p + flow) and its exact spatial gradient under bilinear interpolation:
     # d/dx = forward difference in x sampled at the left integer column (linear in y), same for d/dy;
-    # on integer coordinates (kinks) take the one-sided difference in the direction of motion vel
-    px, py = _coords(flow)
+    # on integer coordinates (kinks) take the one-sided difference in the direction of motion vel;
+    # outside the image (or on the border moving out) the border value is constant, so the gradient is 0
+    H, W = y.shape[-2:]
+    rx, ry = _coords(flow)
+    px, py = rx.clamp(0, W - 1), ry.clamp(0, H - 1)
     corner = lambda p, v: torch.where(v >= 0, p.floor(), p.ceil() - 1).clamp(min=0)
+    inside = lambda p, v, n: (((p > 0) | ((p == 0) & (v >= 0))) & ((p < n - 1) | ((p == n - 1) & (v < 0))))[:, None]
     dx = F.pad(y[..., 1:] - y[..., :-1], (0, 1))
     dy = F.pad(y[..., 1:, :] - y[..., :-1, :], (0, 0, 0, 1))
-    out = _sample(torch.cat([y, dx, dy]), torch.cat([px, corner(px, vel[:, 0]), px]),
-                  torch.cat([py, py, corner(py, vel[:, 1])]))
-    return out.chunk(3)
+    v, gx, gy = _sample(torch.cat([y, dx, dy]), torch.cat([px, corner(px, vel[:, 0]), px]),
+                        torch.cat([py, py, corner(py, vel[:, 1])])).chunk(3)
+    return v, gx * inside(rx, vel[:, 0], W), gy * inside(ry, vel[:, 1], H)
 
 
 def fourier(v, n=16):
@@ -234,7 +238,7 @@ class EvTween(nn.Module):
         self.log_c = nn.Parameter(torch.tensor(math.log(c_init)))   # ON threshold
         self.log_r = nn.Parameter(torch.tensor(math.log(r_init)))   # C_off / C_on
         self.log_k = nn.Parameter(torch.tensor(math.log(4.0)))      # inverse-Gaussian shape (timing regularity)
-        self.log_nu = nn.Parameter(torch.tensor(math.log(0.05)))    # background events per pixel per gap
+        self.log_nu = nn.Parameter(torch.tensor(math.log(0.2)))     # background events per pixel per second
 
     @property
     def c(self):

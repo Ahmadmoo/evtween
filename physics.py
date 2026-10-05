@@ -16,62 +16,72 @@ def first_root(a, b, c, lo, hi):
 
 
 class Simulator:
-    def __init__(self, model, mismatch=0.03, refractory=1e-4, noise_rate=0.1,
-                 min_steps=4, max_steps=256, seed=0, max_events=64):
-        self.m, self.mismatch, self.refractory, self.noise_rate = model, mismatch, refractory, noise_rate
+    # samples the sensor model the likelihood is trained on (losses.event_nll), with the learned C_on, r, k, nu:
+    # per pixel ref = L at the last event, thresholds X*C with X ~ IG(1, k), exact crossing of the local quadratic
+    # of L, background events at rate nu that also reset the pixel. mismatch / refractory are optional extras (not learned)
+    def __init__(self, model, noise=1.0, mismatch=0.0, refractory=0.0, min_steps=4, max_steps=256, seed=0, max_events=64):
+        self.m, self.noise, self.mismatch, self.refractory = model, noise, mismatch, refractory
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
         self.gen = torch.Generator().manual_seed(seed)
         self.ref = None
 
-    def _rand(self, like):
-        return torch.randn(like.shape, generator=self.gen).to(like.device)
+    def _u(self, shape):
+        return torch.rand(shape, generator=self.gen, dtype=torch.float64).to(self.dev).clamp(min=1e-12)
+
+    def _ig(self, shape):
+        # inverse Gaussian, mean 1, shape k (Michael, Schucany & Haas)
+        k = self.k
+        y = torch.randn(shape, generator=self.gen, dtype=torch.float64).to(self.dev) ** 2
+        x = 1 + y / (2 * k) - torch.sqrt(4 * k * y + y * y) / (2 * k)
+        return torch.where(self._u(shape) <= 1 / (1 + x), x, 1 / x).float()
 
     @torch.no_grad()
     def run(self, s, t0, t1):
-        # all events of one frame interval [t0, t1] in seconds; pixel state carries over between calls
-        # per sub-step: L follows the quadratic through L_a, dL_a, L_b; crossings are solved exactly
-        dev, c, dt = s["d"].device, self.m.c, t1 - t0
-        tau = lambda v: torch.full((1,), v, device=dev)
-        La, Da, _ = self.m.render(s, tau(0.0))
+        # all events of one frame interval [t0, t1] (seconds); pixel state carries over between calls
+        m, dt = self.m, t1 - t0
+        self.dev, self.k, self.nu = s["d"].device, m.log_k.exp().item(), m.log_nu.exp().item() * self.noise
+        tau = lambda v: torch.full((1,), v, device=self.dev)
+        La, Da, _ = m.render(s, tau(0.0))
         if self.ref is None:
-            self.c_on = (c * (1 + self.mismatch * self._rand(La))).clamp(min=0.01)
-            self.c_off = (c * self.m.r * (1 + self.mismatch * self._rand(La))).clamp(min=0.01)
-            self.ref = La + (torch.rand(La.shape, generator=self.gen).to(dev) - 0.5) * self.c_on
+            shape = (2, *La.shape)
+            spread = (1 + self.mismatch * torch.randn(shape, generator=self.gen).to(self.dev)).clamp(min=0.1)
+            self.c = torch.stack([m.c, m.c * m.r]).view(2, 1, 1, 1, 1) * spread
+            self.ref = La.clone()
+            self.x = (self._u(shape) / self._ig(shape)).float()  # stationary start: uniform part of a size-biased wait
             self.last = torch.full_like(La, -math.inf, dtype=torch.float64)
+            self.next_noise = t0 - self._u(La.shape).log() / max(self.nu, 1e-12)
 
-        speed = max(self.m.render(s, tau(v))[1].abs().flatten().quantile(0.999).item() for v in (0.0, 0.5, 1.0))
-        S = int(min(max(math.ceil(2 * speed / c.item()), self.min_steps), self.max_steps))
+        speed = max(m.render(s, tau(v))[1].abs().flatten().quantile(0.999).item() for v in (0.0, 0.5, 1.0))
+        S = int(min(max(math.ceil(2 * speed / self.c.min().item()), self.min_steps), self.max_steps))
         H, out = 1.0 / S, []
         for i in range(S):
-            Lb, Db, _ = self.m.render(s, tau((i + 1) * H))
-            alpha = (Lb - La - Da * H) / H ** 2
-            self._cross(La, Da, alpha, H, t0 + dt * i * H, dt, out)
+            Lb, Db, _ = m.render(s, tau((i + 1) * H))
+            self._cross(La, Da, (Lb - La - Da * H) / H ** 2, H, t0 + dt * i * H, dt, out)
             La, Da = Lb, Db
-        out.append(self._noise(La.shape[-2:], t0, dt, dev))
-        t, x, y, p = (torch.cat(v).cpu().numpy() for v in zip(*out))
+        t, x, y, p = (torch.cat(v).cpu().numpy() for v in zip(*out)) if out else ([np.zeros(0)] * 4)
         o = np.argsort(t, kind="stable")
         return dict(t=t[o], x=x[o].astype(np.int16), y=y[o].astype(np.int16), p=p[o].astype(np.int8))
 
     def _cross(self, La, Da, alpha, H, ta, dt, out):
         h_last = torch.zeros_like(La)
         for _ in range(self.max_events):
-            r_on = first_root(alpha, Da, La - self.ref - self.c_on, h_last, H)
-            r_off = first_root(alpha, Da, La - self.ref + self.c_off, h_last, H)
-            h = torch.minimum(r_on, r_off)
+            r_on = first_root(alpha, Da, La - self.ref - self.x[0] * self.c[0], h_last, H)
+            r_off = first_root(alpha, Da, La - self.ref + self.x[1] * self.c[1], h_last, H)
+            h_noise = ((self.next_noise - ta) / dt).float()
+            r_noise = torch.where((h_noise > h_last) & (h_noise <= H), h_noise, torch.full_like(h_noise, math.inf))
+            h = torch.minimum(torch.minimum(r_on, r_off), r_noise)
             fire = torch.isfinite(h)
             if not fire.any():
                 break
-            pol = torch.where(r_on <= r_off, 1, -1)
-            self.ref = torch.where(fire, self.ref + torch.where(pol > 0, self.c_on, -self.c_off), self.ref)
+            noise = fire & (r_noise < torch.minimum(r_on, r_off))
+            coin = torch.where(self._u(La.shape) < 0.5, 1, -1)
+            pol = torch.where(noise, coin, torch.where(r_on <= r_off, 1, -1))
             h_last = torch.where(fire, h, h_last)
-            t = ta + dt * h.double()
+            self.ref = torch.where(fire, La + Da * h_last + alpha * h_last ** 2, self.ref)
+            self.x = torch.where(fire, self._ig(self.x.shape), self.x)
+            self.next_noise = torch.where(noise, self.next_noise - self._u(La.shape).log() / max(self.nu, 1e-12), self.next_noise)
+            t = ta + dt * h_last.double()
             keep = fire & (t - self.last >= self.refractory)
             self.last = torch.where(keep, t, self.last)
             i = keep.nonzero(as_tuple=True)
             out.append((t[i], i[3], i[2], pol[i]))
-
-    def _noise(self, hw, t0, dt, dev):
-        n = int(torch.poisson(torch.tensor(float(self.noise_rate * dt * hw[0] * hw[1])), generator=self.gen))
-        r = lambda hi: torch.randint(hi, (n,), generator=self.gen).to(dev)
-        t = t0 + dt * torch.rand(n, generator=self.gen, dtype=torch.float64).to(dev)
-        return t, r(hw[1]), r(hw[0]), r(2) * 2 - 1

@@ -27,14 +27,14 @@ TEST
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
 | Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
-| Sensor | `C_on`, `r = C_off / C_on`, timing regularity `k` and background rate `ν` are learned |
-| Events | Per pixel, exact crossing of the local quadratic of `L` with `ref ± C`, plus threshold mismatch, refractory period and noise |
+| Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on`, `k`, `ν` are learned |
+| Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. Mismatch and refractory are optional extras (off by default, not learned) |
 
 ### Losses
 
 | Loss | Meaning |
 |---|---|
-| `nll` | Point-process likelihood of the real event **times**. Clocks `∫relu(±dL/dτ)/C` per polarity; waits in clock units are inverse-Gaussian; ON/OFF compete and reset together; no-event stretches enter through survival terms; unexplained events fall on a noise floor `ν` |
+| `nll` | Likelihood of the real event **times** under the sensor model above: signal hazard + background rate at each event, survival of both thresholds between events, after the last event and in silent pixels; the first wait per pixel starts from the stationary state |
 | `photo` | `L(τ)` must match the real hidden frames |
 | `cmax` | Contrast maximization: real events moved along the model flow to τ=0 and τ=1 must stack into sharp edges (scale-normalized) |
 | `sigreg` | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to model later) |
@@ -154,7 +154,7 @@ python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out r
 
 ```bash
 python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz
-python generate.py --ckpt ... --seq ... --set noise_rate=0 mismatch=0.05 refractory=5e-4
+python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5e-4
 ```
 
 `my_video/` needs only `frames/` and `frame_ts.npy`. Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
@@ -165,25 +165,26 @@ python generate.py --ckpt ... --seq ... --set noise_rate=0 mismatch=0.05 refract
 
 | Key | Effect |
 |---|---|
-| `data.skip` | Hidden frames in the gap. Larger gaps are where the world model should matter |
-| `data.context` | Frames per side for the student (even for V-JEPA 2.1, 2-frame tubelets) |
+| `data.skip` | Hidden frames in the gap. Choose `(skip+1)/fps` close to the frame interval of the videos you will convert |
+| `data.context` | Frames per side for the student, taken at the gap's own stride, so training sees the same frame spacing as generation (even for V-JEPA 2.1) |
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
 | `model.z_dim` | Size of the path code per patch |
 | `model.K` | Polynomial order of the path in time |
 | `loss.grid` | τ steps for the likelihood clocks |
-| `sensor.*` | Generation only: mismatch, refractory, noise, step limits |
+| `sensor.*` | Generation only: `noise` scales the learned background rate; `mismatch`, `refractory` are optional extras; step limits |
 
 ---
 
 ## 8. Status
 
 Verified here (CPU, toy data):
-- `dL/dτ` matches finite differences of the model; inverse-Gaussian terms match numerical integration.
+- `dL/dτ` matches finite differences of the model, also when samples leave the image; inverse-Gaussian terms match numerical integration.
+- Simulator and likelihood are the same model: on simulated events the likelihood is lowest at the true `k`, `ν`, `C_on`, `r` and the true motion.
 - Teacher generalizes on held-out toy scenes: `nll` < `nll_zero` < `nll_shuffled`. Student lands in between.
 - All four stages, generation, V-JEPA 2.1 wrapper (official code, random weights), 2-process DDP.
 
 Not tested here: real data on GPU, pretrained weight downloads, the LeVJEPA wrapper (Hugging Face is blocked in this sandbox).
 
 Known limits:
-- The likelihood uses time-rescaled clocks; it is approximate when `L` goes up and down between two events, and it ignores refractory time and low-light bandwidth.
+- The sensor model ignores refractory time and low-light bandwidth; the likelihood reads `L` on a τ grid (`loss.grid`) with linear interpolation.
 - The student is deterministic, so ambiguous gaps (same endpoints, different timing) get an average code. A stochastic student `p(z | video)` is the next step.

@@ -29,20 +29,23 @@ class PairDataset(torch.utils.data.Dataset):
     def __init__(self, root, crop=256, skip=7, context=4, bins=16, min_events=2000, train=True):
         roots = sorted(os.path.dirname(p) for p in glob.glob(os.path.join(root, "*", "frame_ts.npy")))
         self.seqs = [Sequence(r) for r in (roots or [root])]
-        self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range(context - 1, len(s) - skip - context)]
+        g = skip + 1
+        self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)]
         self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, skip, context, bins, min_events, train
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, n):
-        # keyframes I0, I1, the hidden frames between them, context frames for the student,
-        # the real events of the gap (time-binned for the teacher, exact list for the likelihood)
+        # keyframes I0, I1, the hidden frames between them, the real events of the gap (time-binned for the teacher,
+        # exact list for the likelihood), and context frames at the gap's own stride: the student sees exactly
+        # the frames a video at this frame rate would give
         k, i = self.index[n]
-        s, j, c = self.seqs[k], i + self.skip + 1, self.context
+        s, j, c, g = self.seqs[k], i + self.skip + 1, self.context, self.skip + 1
         t0, t1 = s.ts[i], s.ts[j]
         ev = s.events(t0, t1)
-        full = {q: s.frame(q) for q in range(i - c + 1, j + c)}
+        ctx = [i - q * g for q in reversed(range(c))] + [j + q * g for q in range(c)]
+        full = {q: s.frame(q) for q in {*ctx, *range(i, j + 1)}}
         H, W = full[i].shape[1:]
         h, w = min(self.crop, H), min(self.crop, W)
 
@@ -67,7 +70,6 @@ class PairDataset(torch.utils.data.Dataset):
         voxel = np.bincount(cell, minlength=2 * self.bins * h * w).reshape(2 * self.bins, h, w).astype(np.float32)
 
         cut = lambda q: full[q][:, y0:y0 + h, x0:x0 + w].flip(-1) if flip else full[q][:, y0:y0 + h, x0:x0 + w]
-        ctx = [*range(i - c + 1, i + 1), *range(j, j + c)]
         return dict(i0=cut(i), i1=cut(j),
                     mid=torch.stack([cut(q) for q in range(i + 1, j)]) if self.skip else torch.zeros(0, 3, h, w),
                     mid_tau=torch.from_numpy((s.ts[i + 1:j] - t0) / (t1 - t0)).float(),

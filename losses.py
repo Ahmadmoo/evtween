@@ -20,41 +20,57 @@ def ig_logs(x, k):
     return logpdf.float(), logsf.float(), logsf_eq.float()
 
 
-def event_nll(model, s, ev, steps=32):
-    # point-process NLL of the real event times, per pixel
-    # clocks: L_on = int relu(dL/dtau)/C_on, L_off = int relu(-dL/dtau)/C_off; waits in clock units ~ IG(1, k)
-    # ON and OFF compete and both reset after any event; the no-event stretches enter through the survival terms;
-    # events the trajectory cannot explain fall on a background noise floor nu
+def event_nll(model, s, ev, dt, steps=32):
+    # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
+    # after every event the pixel sets ref = L and draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k);
+    # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
+    # background events (nu per second, half per polarity) compete with the signal and also reset the pixel;
+    # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown)
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
-    D = torch.stack([model.render(s, t.expand(B))[1][:, 0] for t in taus], 1).flatten(2)
-    rate = torch.stack([F.relu(D) / model.c, F.relu(-D) / (model.c * model.r)], 1)
-    clock = F.pad(torch.cumsum((rate[:, :, 1:] + rate[:, :, :-1]) / (2 * steps), 2), (0, 0, 1, 0))
-    j = (tau * steps).clamp(0, steps - 1e-4)
-    j0, w = j.long(), (j - j.floor())[:, None]
-    at = lambda v: v[b, :, j0, pix] * (1 - w) + v[b, :, j0 + 1, pix] * w
-    lam, clk = at(rate), at(clock)
+    out = [model.render(s, t.expand(B)) for t in taus]
+    Lg = torch.stack([o[0][:, 0] for o in out], 1).flatten(2)
+    Dg = torch.stack([o[1][:, 0] for o in out], 1).flatten(2)
+    c, k, nu = torch.stack([model.c, model.c * model.r]), model.log_k.exp(), model.log_nu.exp() * dt
 
     key = b * H * W + pix
     first = torch.ones_like(key, dtype=torch.bool)
     first[1:] = key[1:] != key[:-1]
     last = torch.ones_like(first)
     last[:-1] = key[1:] != key[:-1]
-    x = clk - torch.where(first[:, None], torch.zeros_like(clk), clk.roll(1, 0))
-    own = (pol < 0).long()[:, None]
-    k = model.log_k.exp()
-    logpdf, logsf, logsf_eq = ig_logs(x, k)
-    f_own = torch.where(first[:, None], logsf, logpdf).gather(1, own)[:, 0]
-    s_other = torch.where(first[:, None], logsf_eq, logsf).gather(1, 1 - own)[:, 0]
-    log_ev = torch.logaddexp(lam.gather(1, own)[:, 0].clamp(min=1e-12).log() + f_own + s_other, model.log_nu)
+    tprev = torch.where(first, torch.zeros_like(tau), tau.roll(1))
 
-    end = clock[:, :, -1]
-    tail = ig_logs(end[b, :, pix] - clk, k)[1].sum(1)
+    def at(v, t):
+        j = (t * steps).clamp(0, steps - 1e-4)
+        j0, w = j.long(), j - j.floor()
+        return v[b, j0, pix] * (1 - w) + v[b, j0 + 1, pix] * w
+
+    def reach(row, inner, ref):  # running max of +-(L - ref)/C over the grid points inside an interval
+        hi = torch.where(inner, row, torch.full_like(row, -math.inf)).amax(1).maximum(ref)
+        lo = torch.where(inner, row, torch.full_like(row, math.inf)).amin(1).minimum(ref)
+        return torch.stack([hi - ref, ref - lo], 1) / c
+
+    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, tprev), at(Dg, tau)
+    before = reach(row, (taus > tprev[:, None]) & (taus < tau[:, None]), Lp)
+    now = torch.stack([Li - Lp, Lp - Li], 1) / c
+    M = torch.maximum(before, now)
+    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 0.05)  # only at a new max
+
+    logpdf, logsf, logsf_eq = ig_logs(M, k)
+    log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
+    log_s = torch.where(first[:, None], logsf_eq, logsf)
+    own = (pol < 0).long()[:, None]
+    signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
+    log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
+
+    tail = ig_logs(reach(row, taus[None] > tau[:, None], Li), k)[1].sum(1)
     seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
     seen[key] = True
-    silent = ig_logs(end.transpose(1, 2).reshape(-1, 2)[~seen], k)[2].sum(1)
-    ll = log_ev.sum() + tail[last].sum() + silent.sum() - model.log_nu.exp() * B * H * W
+    L0 = Lg[:, :1]
+    whole = (torch.stack([Lg.amax(1) - L0[:, 0], L0[:, 0] - Lg.amin(1)], 1) / c[:, None]).transpose(1, 2).reshape(-1, 2)
+    silent = ig_logs(whole[~seen], k)[2].sum(1)
+    ll = log_ev.sum() + tail[last].sum() + silent.sum() - (nu * H * W).sum()
     return -ll / (B * H * W)
 
 
@@ -116,14 +132,14 @@ def compute(model, batch, w, stage):
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
         s = model.decode(p, z)
-        terms.update(nll=event_nll(model, s, ev, w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=SIGREG.to(z.device)(z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, w["grid"]))
+        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"]))
         if stage == "student":
             terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
     weight = dict(w, nll_student=w["nll"])
@@ -136,7 +152,7 @@ def diagnostics(model, batch, w, student=True):
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     p = model.prepare(batch["i0"], batch["i1"])
     z = model.encode(p, batch["voxel"])
-    nll = lambda code: event_nll(model, model.decode(p, code), ev, w["grid"]).item()
+    nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"]).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
     if student:
         out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]))

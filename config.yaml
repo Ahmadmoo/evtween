@@ -2,8 +2,8 @@ data:
   root: data/hsergb/train      # folder of sequences in the canonical layout (see README)
   val_root: null               # optional, same layout
   crop: 256                    # multiple of 16
-  skip: 7                      # frames hidden between I0 and I1 (the gap)
-  context: 4                   # frames per side for the student (even for vjepa2_1: 2-frame tubelets)
+  skip: 7                      # frames hidden between I0 and I1; pick (skip+1)/fps close to the frame interval of the target video
+  context: 4                   # frames per side for the student, taken at the gap's stride (even for vjepa2_1: 2-frame tubelets)
   bins: 16                     # time bins of the teacher's event input
   min_events: 2000             # retry crops with fewer events
   workers: 8
@@ -33,10 +33,10 @@ loss:
   jepa: 1.0                    # student code vs teacher code
   grid: 32                     # tau steps for the likelihood clocks
 
-sensor:                        # only used by generate.py
-  mismatch: 0.03
-  refractory: 1.0e-4           # seconds
-  noise_rate: 0.1              # background events per pixel per second
+sensor:                        # generate.py only; thresholds, timing law and noise rate come from the trained model
+  noise: 1.0                   # scale on the learned background rate
+  mismatch: 0.0                # optional per-pixel threshold spread (not learned)
+  refractory: 0.0              # optional, seconds (not learned)
   min_steps: 4
   max_steps: 256
   seed: 0
