@@ -1,8 +1,8 @@
 data:
-  root: data/hsergb/train      # folder of sequences in the canonical layout (see README)
-  val_root: null               # optional, same layout
+  root: data/hqevfi/train      # folder (searched recursively) or list of folders, see README
+  val_root: data/hqevfi/test   # optional, same layout
   crop: 256                    # multiple of 16
-  skip: 7                      # frames hidden between I0 and I1; pick (skip+1)/fps close to the frame interval of the target video
+  skip: 4                      # frames hidden between I0 and I1; pick (skip+1)/fps close to the frame interval of the target video
   context: 4                   # frames per side for the student, taken at the gap's stride (even for vjepa2_1: 2-frame tubelets)
   bins: 16                     # time bins of the teacher's event input
   min_events: 2000             # retry crops with fewer events

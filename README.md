@@ -53,7 +53,8 @@ TEST
 | `data.py` | Sequence reader, training samples, collate |
 | `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
 | `generate.py` | RGB video → events `.npz` (student path) |
-| `convert.py` | Converts per-interval npz datasets (HS-ERGB, BS-ERGB, TimeLens style) |
+| `prepare.py` | Converts HQ-EVFI, ERF-X170FPS, BS-ERGB, HS-ERGB to the training layout |
+| `download.sh` | Downloads HQ-EVFI and ERF-X170FPS |
 | `toy_data.py` | Synthetic dataset for smoke tests |
 | `config.yaml` | All settings |
 
@@ -78,7 +79,51 @@ pip install -r requirements.txt
 
 ## 4. Data
 
-One folder per sequence:
+### Which datasets
+
+| Role | Dataset | Why | Access |
+|---|---|---|---|
+| Main training | **HQ-EVFI** (TimeLens-XL) | Beam splitter + flickering-checkerboard calibration (best pixel alignment), Prophesee EVK4-HD, 142 fps RGB, 71 sequences | Google Drive (`download.sh`) |
+| Extra training, large motion | **ERF-X170FPS** (CBMNet) | Beam splitter, 170 fps, 1440×975, very large motion | Google Drive (`download.sh`) |
+| Test on real low-fps video | **BS-ERGB** (Time Lens++) | Beam splitter, 28 fps: long real gaps; TIDES reports on it | [request form](https://rpg.ifi.uzh.ch/timelens/timelens++download.html) |
+| Test vs TIDES | **HS-ERGB** (Time Lens) | Standard benchmark, TIDES reports on it. Two-camera rig, not a beam splitter, so `close` scenes can have parallax | [request form](http://rpg.ifi.uzh.ch/timelensdownload.html) |
+
+- The method needs pixel-aligned RGB and events, and high-fps RGB for the hidden frames. That is why the two beam-splitter, high-fps sets are for training.
+- Sensor parameters (`C`, `r`, `k`, `ν`) are learned once per model. Different cameras or bias settings have different values, so train on one dataset first; mixing sets averages them.
+- Set `data.skip` so that `(skip+1)/fps` matches the frame interval of the videos you will convert (HQ-EVFI at 142 fps: `skip=4` ≈ 28 fps, `skip=6` ≈ 20 fps).
+
+### Download
+
+```bash
+bash download.sh hqevfi        # -> raw/hqevfi
+bash download.sh erf           # -> raw/erf/{train,test}
+# HS-ERGB and BS-ERGB: fill the forms above, extract to raw/hsergb and raw/bsergb
+```
+
+### Preprocess
+
+`prepare.py` reads the official layouts (one image per frame, one event file per frame interval) and writes `out/<split>/<sequence>/`:
+
+```bash
+git clone https://github.com/OpenImagingLab/TimeLens-XL raw/TimeLens-XL   # official HQ-EVFI ranges and test split
+python prepare.py hqevfi --raw raw/hqevfi --out data/hqevfi --timelensxl raw/TimeLens-XL
+python prepare.py erf    --raw raw/erf    --out data/erf
+python prepare.py bsergb --raw raw/bsergb --out data/bsergb
+python prepare.py hsergb --raw raw/hsergb --out data/hsergb
+```
+
+| Preset | Images | Events | Keys | x, y scale | Frame times |
+|---|---|---|---|---|---|
+| `hqevfi` | `visual_RGB` | `RGB-EVS` (or `RGB-EVS_EVSneg3ms`, images shifted by one, as in TimeLens-XL) | x, y, t, p | 1 | event-file boundaries |
+| `erf` | `processed_images` | `processed_events` | x, y, t, p | 1/128 | event-file boundaries |
+| `bsergb` | `images` | `events` | x, y, timestamp, polarity | 1/32 | event-file boundaries |
+| `hsergb` | `images_corrected` | `events_aligned` | x, y, t, p | 1 | `timestamp.txt` |
+
+- Time units are detected automatically. **Check the printed fps per sequence** (142, 170, 28, …).
+- If event times restart in every file, the script stops and asks for `--fps`.
+- Sequences are cut at unreadable event files and at the BS-ERGB files the TimeLens-XL loader skips. PNG frames are symlinked (`--copy` to copy).
+
+Output layout per sequence:
 
 ```
 seq/
@@ -89,18 +134,7 @@ seq/
   ev_p.npy                # (M,) int8, +1 / -1
 ```
 
-`data.root` points to a folder holding many `seq/` folders. Convert HS-ERGB:
-
-```bash
-python convert.py \
-  --images  hsergb/close/test/baloon_popping/images_corrected \
-  --timestamps hsergb/close/test/baloon_popping/images_corrected/timestamp.txt \
-  --events  hsergb/close/test/baloon_popping/events_aligned \
-  --out     data/hsergb/train/baloon_popping \
-  --xy_scale 32 --t_scale 1e-6
-```
-
-> Check the printed time ranges. Frames and events must both be in seconds (`--t_scale`, `--ts_scale`).
+`data.root` is a folder (searched recursively) or a list: `data.root=[data/hqevfi/train,data/erf/train]`.
 
 ---
 

@@ -27,8 +27,9 @@ class Sequence:
 
 class PairDataset(torch.utils.data.Dataset):
     def __init__(self, root, crop=256, skip=7, context=4, bins=16, min_events=2000, train=True):
-        roots = sorted(os.path.dirname(p) for p in glob.glob(os.path.join(root, "*", "frame_ts.npy")))
-        self.seqs = [Sequence(r) for r in (roots or [root])]
+        roots = root if isinstance(root, list) else [root]  # one folder or a list, searched recursively
+        self.seqs = [Sequence(os.path.dirname(p)) for r in roots
+                     for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
         g = skip + 1
         self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)]
         self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, skip, context, bins, min_events, train
