@@ -53,8 +53,7 @@ TEST
 | `data.py` | Sequence reader, training samples, collate |
 | `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
 | `generate.py` | RGB video → events `.npz` (student path) |
-| `prepare.py` | Converts HQ-EVFI, ERF-X170FPS, BS-ERGB, HS-ERGB to the training layout |
-| `download.sh` | Downloads HQ-EVFI and ERF-X170FPS |
+| `HQ-EVFI/hqevfi.py` | Downloads HQ-EVFI and converts it to the training layout |
 | `toy_data.py` | Synthetic dataset for smoke tests |
 | `config.yaml` | All settings |
 
@@ -79,62 +78,29 @@ pip install -r requirements.txt
 
 ## 4. Data
 
-### Which datasets
-
-| Role | Dataset | Why | Access |
-|---|---|---|---|
-| Main training | **HQ-EVFI** (TimeLens-XL) | Beam splitter + flickering-checkerboard calibration (best pixel alignment), Prophesee EVK4-HD, 142 fps RGB, 71 sequences | Google Drive (`download.sh`) |
-| Extra training, large motion | **ERF-X170FPS** (CBMNet) | Beam splitter, 170 fps, 1440×975, very large motion | Google Drive (`download.sh`) |
-| Test on real low-fps video | **BS-ERGB** (Time Lens++) | Beam splitter, 28 fps: long real gaps; TIDES reports on it | [request form](https://rpg.ifi.uzh.ch/timelens/timelens++download.html) |
-| Test vs TIDES | **HS-ERGB** (Time Lens) | Standard benchmark, TIDES reports on it. Two-camera rig, not a beam splitter, so `close` scenes can have parallax | [request form](http://rpg.ifi.uzh.ch/timelensdownload.html) |
-
-- The method needs pixel-aligned RGB and events, and high-fps RGB for the hidden frames. That is why the two beam-splitter, high-fps sets are for training.
-- Sensor parameters (`C`, `r`, `k`, `ν`) are learned once per model. Different cameras or bias settings have different values, so train on one dataset first; mixing sets averages them.
-- Set `data.skip` so that `(skip+1)/fps` matches the frame interval of the videos you will convert (HQ-EVFI at 142 fps: `skip=4` ≈ 28 fps, `skip=6` ≈ 20 fps).
-
-### Download
+**HQ-EVFI** (TimeLens-XL, ECCV'24): beam splitter with checkerboard calibration (pixel-aligned RGB and events), Prophesee EVK4-HD, 142 fps RGB, 71 sequences.
+High-fps RGB gives the hidden frames; pixel alignment is needed by the per-pixel likelihood.
 
 ```bash
-bash download.sh hqevfi        # -> raw/hqevfi
-bash download.sh erf           # -> raw/erf/{train,test}
-# HS-ERGB and BS-ERGB: fill the forms above, extract to raw/hsergb and raw/bsergb
+python HQ-EVFI/hqevfi.py --out data/hqevfi                          # download + convert
+python HQ-EVFI/hqevfi.py --out data/hqevfi --raw path/to/extracted  # already downloaded
 ```
 
-### Preprocess
+The script downloads the archive (Google Drive), fetches the official ranges and test split from TimeLens-XL (`dataset_dict.py`), and writes `data/hqevfi/{train,test}/<sequence>/`. It uses the 3 ms corrected event folders with the one-frame image shift where TimeLens-XL does. Frame times come from the boundaries between event files. **Check the printed fps (≈142).**
 
-`prepare.py` reads the official layouts (one image per frame, one event file per frame interval) and writes `out/<split>/<sequence>/`:
-
-```bash
-git clone https://github.com/OpenImagingLab/TimeLens-XL raw/TimeLens-XL   # official HQ-EVFI ranges and test split
-python prepare.py hqevfi --raw raw/hqevfi --out data/hqevfi --timelensxl raw/TimeLens-XL
-python prepare.py erf    --raw raw/erf    --out data/erf
-python prepare.py bsergb --raw raw/bsergb --out data/bsergb
-python prepare.py hsergb --raw raw/hsergb --out data/hsergb
-```
-
-| Preset | Images | Events | Keys | x, y scale | Frame times |
-|---|---|---|---|---|---|
-| `hqevfi` | `visual_RGB` | `RGB-EVS` (or `RGB-EVS_EVSneg3ms`, images shifted by one, as in TimeLens-XL) | x, y, t, p | 1 | event-file boundaries |
-| `erf` | `processed_images` | `processed_events` | x, y, t, p | 1/128 | event-file boundaries |
-| `bsergb` | `images` | `events` | x, y, timestamp, polarity | 1/32 | event-file boundaries |
-| `hsergb` | `images_corrected` | `events_aligned` | x, y, t, p | 1 | `timestamp.txt` |
-
-- Time units are detected automatically. **Check the printed fps per sequence** (142, 170, 28, …).
-- If event times restart in every file, the script stops and asks for `--fps`.
-- Sequences are cut at unreadable event files and at the BS-ERGB files the TimeLens-XL loader skips. PNG frames are symlinked (`--copy` to copy).
-
-Output layout per sequence:
+Layout per sequence:
 
 ```
 seq/
-  frames/000000.png ...   # RGB, aligned with the event sensor
+  frames/000000.png ...   # RGB, aligned with the event sensor (symlinks, --copy to copy)
   frame_ts.npy            # (N,) float64, seconds
   ev_t.npy                # (M,) float64, seconds, sorted
   ev_x.npy  ev_y.npy      # (M,) int16
   ev_p.npy                # (M,) int8, +1 / -1
 ```
 
-`data.root` is a folder (searched recursively) or a list: `data.root=[data/hqevfi/train,data/erf/train]`.
+- `data.root` is a folder (searched recursively) or a list of folders.
+- `data.skip=4` hides 4 frames: the gap matches 142/5 ≈ 28 fps video. Choose `(skip+1)/fps` close to the videos you will convert.
 
 ---
 
