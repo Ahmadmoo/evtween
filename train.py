@@ -61,8 +61,12 @@ torch.manual_seed(T["seed"] + rank)
 torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 
 model = build_model(cfg).to(dev)
-if T.get("init"):
-    model.load_state_dict(torch.load(T["init"], map_location=dev, weights_only=False)["model"], strict=False)
+if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
+    sd, own = torch.load(T["init"], map_location=dev, weights_only=False)["model"], model.state_dict()
+    skip = sorted({k.split(".")[0] for k, v in sd.items() if k in own and own[k].shape != v.shape})
+    model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
+    if rank == 0 and skip:
+        print("init: size changed, not loaded:", skip, flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n)
 params = [p for p in model.parameters() if p.requires_grad]
