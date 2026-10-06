@@ -85,7 +85,9 @@ loader = DataLoader(data, T["batch"], shuffle=sampler is None, sampler=sampler, 
                     pin_memory=True, drop_last=True, persistent_workers=D["workers"] > 0)
 val = None
 if D.get("val_root") and rank == 0:
-    val = DataLoader(make(D["val_root"], False), T["batch"], num_workers=D["workers"], collate_fn=collate)
+    vd = make(D["val_root"], False)  # fixed samples spread over all val sequences
+    vd = torch.utils.data.Subset(vd, torch.linspace(0, len(vd) - 1, T["val_batches"] * T["batch"]).long().tolist())
+    val = DataLoader(vd, T["batch"], num_workers=D["workers"], collate_fn=collate)
 
 
 def lr_at(step):

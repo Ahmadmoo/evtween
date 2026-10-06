@@ -15,7 +15,7 @@ model:
   z_dim: 32                    # path code per 16x16 patch
   flow_prior: raft             # raft | none
   flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
-  gamma: 2.2                   # PNG -> linear light
+  gamma: 1.0                   # PNG -> linear light (HQ-EVFI: 1.0 beat 2.2, val nll 0.35 vs 0.67)
   eps: 0.01                    # L = log(Y + eps)
   c_init: 0.25                 # contrast threshold (learned)
   r_init: 1.0                  # C_off / C_on (learned)

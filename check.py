@@ -1,24 +1,22 @@
 import sys
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from data import PairDataset, collate
 from losses import event_nll
 from model import build_model
 
-# python check.py runs/teacher_nocmax/last.pt  -> train vs test diagnostics, code / path size, time alignment
+# python check.py runs/teacher/last.pt [batches]  -> train vs test diagnostics, code / path size, time alignment
 ck = torch.load(sys.argv[1], map_location="cuda", weights_only=False)
 cfg, D, dev = ck["cfg"], ck["cfg"]["data"], "cuda"
 model = build_model(cfg).to(dev).eval()
 model.load_state_dict(ck["model"], strict=False)
-root = D["root"].rsplit("/", 1)[0]
+root, nb = D["root"].rsplit("/", 1)[0], int(sys.argv[2]) if len(sys.argv) > 2 else 25
 
 for split in ("train", "test"):
     ds = PairDataset(f"{root}/{split}", D["crop"], D["skip"], D["context"], D["bins"], 0, train=False)
-    loader = DataLoader(ds, 8, shuffle=True, collate_fn=collate, generator=torch.Generator().manual_seed(0))
+    ds = Subset(ds, torch.linspace(0, len(ds) - 1, nb * 8).long().tolist())  # fixed samples over all sequences, as in train.py
     acc, shift_acc, n = {}, {}, 0
-    for i, b in enumerate(loader):
-        if i == 6:
-            break
+    for b in DataLoader(ds, 8, collate_fn=collate, num_workers=4):
         b = {k: v.to(dev) for k, v in b.items()}
         with torch.no_grad():
             p = model.prepare(b["i0"], b["i1"])
