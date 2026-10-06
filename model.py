@@ -291,8 +291,9 @@ class EvTween(nn.Module):
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
         a, b, d = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1], 1)
-        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=d,
-                    a=self.flow_scale * a.reshape(B, self.K, 2, H, W), b=self.flow_scale * b.reshape(B, self.K, 2, H, W))
+        bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
+        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0),
+                    a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
 
     def flows(self, s, tau):
         # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:

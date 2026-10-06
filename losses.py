@@ -29,9 +29,8 @@ def event_nll(model, s, ev, dt, steps=32):
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
-    out = [model.render(s, t.expand(B)) for t in taus]
-    Lg = torch.stack([o[0][:, 0] for o in out], 1).flatten(2)
-    Dg = torch.stack([o[1][:, 0] for o in out], 1).flatten(2)
+    Lg = torch.stack([model.render(s, t.expand(B))[0][:, 0] for t in taus], 1).flatten(2)
+    Dg = F.pad((Lg[:, 1:] - Lg[:, :-1]) * steps, (0, 0, 0, 1), mode="replicate")  # slope of the same piecewise-linear L
     c, k, nu = torch.stack([model.c, model.c * model.r]), model.log_k.exp(), model.log_nu.exp() * dt
 
     key = b * H * W + pix
@@ -46,12 +45,14 @@ def event_nll(model, s, ev, dt, steps=32):
         j0, w = j.long(), j - j.floor()
         return v[b, j0, pix] * (1 - w) + v[b, j0 + 1, pix] * w
 
+    slope = lambda t: Dg[b, (t * steps).clamp(0, steps - 1e-4).long(), pix]
+
     def reach(row, inner, ref):  # running max of +-(L - ref)/C over the grid points inside an interval
         hi = torch.where(inner, row, torch.full_like(row, -math.inf)).amax(1).maximum(ref)
         lo = torch.where(inner, row, torch.full_like(row, math.inf)).amin(1).minimum(ref)
         return torch.stack([hi - ref, ref - lo], 1) / c
 
-    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, tprev), at(Dg, tau)
+    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, tprev), slope(tau)
     before = reach(row, (taus > tprev[:, None]) & (taus < tau[:, None]), Lp)
     now = torch.stack([Li - Lp, Lp - Li], 1) / c
     M = torch.maximum(before, now)

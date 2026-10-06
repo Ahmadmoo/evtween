@@ -14,7 +14,7 @@ model:
   K: 3                         # polynomial order of the path in time
   z_dim: 32                    # path code per 16x16 patch
   flow_prior: raft             # raft | none
-  flow_scale: 8.0
+  flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
   gamma: 2.2                   # PNG -> linear light
   eps: 0.01                    # L = log(Y + eps)
   c_init: 0.25                 # contrast threshold (learned)
