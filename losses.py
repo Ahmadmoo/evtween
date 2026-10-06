@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import lejepa
 from model import luminance
 
@@ -29,7 +30,9 @@ def event_nll(model, s, ev, dt, steps=32):
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
-    Lg = torch.stack([model.render(s, t.expand(B))[0][:, 0] for t in taus], 1).flatten(2)
+    frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
+    grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
+    Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
     Dg = F.pad((Lg[:, 1:] - Lg[:, :-1]) * steps, (0, 0, 0, 1), mode="replicate")  # slope of the same piecewise-linear L
     c, k, nu = torch.stack([model.c, model.c * model.r]), model.log_k.exp(), model.log_nu.exp() * dt
 
@@ -56,7 +59,7 @@ def event_nll(model, s, ev, dt, steps=32):
     before = reach(row, (taus > tprev[:, None]) & (taus < tau[:, None]), Lp)
     now = torch.stack([Li - Lp, Lp - Li], 1) / c
     M = torch.maximum(before, now)
-    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 0.05)  # only at a new max
+    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3)  # only at a new max (a wider gate biases c low when k is small)
 
     logpdf, logsf, logsf_eq = ig_logs(M, k)
     log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)

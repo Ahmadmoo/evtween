@@ -31,7 +31,7 @@ loss:
   smooth: 0.01
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
-  grid: 32                     # tau steps for the likelihood clocks
+  grid: 128                    # tau steps of the likelihood path (32 sends sub-grid edges / texture into the noise rate)
 
 sensor:                        # generate.py only; thresholds, timing law and noise rate come from the trained model
   noise: 1.0                   # scale on the learned background rate
