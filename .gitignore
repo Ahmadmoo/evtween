@@ -6,3 +6,9 @@ __pycache__/
 raw/
 HQ-EVFI/*.zip
 HQ-EVFI/raw/
+BS-ERGB/*/
+BS-ERGB/*.zip
+EDS/*/
+EDS/*.tar*
+CED/*/
+CED/*.zip

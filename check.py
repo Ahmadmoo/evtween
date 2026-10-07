@@ -5,15 +5,17 @@ from data import PairDataset, collate
 from losses import event_nll
 from model import build_model
 
-# python check.py runs/teacher/last.pt [batches]  -> train vs test diagnostics, code / path size, time alignment
+# python check.py runs/teacher/last.pt [batches] [data_dir] [skip]  -> train vs test diagnostics, code / path size, time alignment
+# (data_dir holds train/ and test/; default: the checkpoint's data; skip: frames hidden per gap for that data)
 ck = torch.load(sys.argv[1], map_location="cuda", weights_only=False)
 cfg, D, dev = ck["cfg"], ck["cfg"]["data"], "cuda"
 model = build_model(cfg).to(dev).eval()
 model.load_state_dict(ck["model"], strict=False)
-root, nb = D["root"].rsplit("/", 1)[0], int(sys.argv[2]) if len(sys.argv) > 2 else 25
+arg = lambda i, default: sys.argv[i] if len(sys.argv) > i else default
+root, nb, skip = arg(3, D["root"].rsplit("/", 1)[0]), int(arg(2, 25)), int(arg(4, D["skip"]))
 
 for split in ("train", "test"):
-    ds = PairDataset(f"{root}/{split}", D["crop"], D["skip"], D["context"], D["bins"], 0, train=False)
+    ds = PairDataset(f"{root}/{split}", D["crop"], skip, D["context"], D["bins"], 0, train=False)
     ds = Subset(ds, torch.linspace(0, len(ds) - 1, nb * 8).long().tolist())  # fixed samples over all sequences, as in train.py
     acc, shift_acc, n = {}, {}, 0
     for b in DataLoader(ds, 8, collate_fn=collate, num_workers=4):
