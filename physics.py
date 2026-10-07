@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import torch
+import yaml
 
 
 def first_root(a, b, c, lo, hi):
@@ -15,13 +16,33 @@ def first_root(a, b, c, lo, hi):
     return torch.minimum(torch.where(ok(r1), r1, inf), torch.where(ok(r2), r2, inf))
 
 
+def profile(model):
+    # the learned sensor in physical units (v2e names where v2e has the parameter);
+    # sigma_thres (fixed per-pixel threshold spread) is not learned, 0.03 as in v2e
+    return dict(pos_thres=model.c.item(), neg_thres=(model.c * model.r).item(), sigma_event=model.log_k.exp().item() ** -0.5,
+                sigma_thres=0.03, shot_noise_rate_hz=model.log_nu.exp().item(), refractory_period_s=model.R.item())
+
+
+def resolve(model, name="learned", overrides=None):
+    # learned | clean | profile YAML (any subset of keys), then overrides: a number, or "x1.5" = 1.5 x the profile value
+    p = profile(model)
+    if name == "clean":  # like v2e --dvs_params clean: no noise, small threshold spread
+        p.update(sigma_event=0.03, sigma_thres=0.0, shot_noise_rate_hz=0.0)
+    elif name != "learned":
+        p.update(yaml.safe_load(open(name)))
+    for k, v in (overrides or {}).items():
+        assert k in p, f"unknown sensor parameter {k}; use one of {list(p)}"
+        p[k] = p[k] * float(v[1:]) if isinstance(v, str) and v.startswith("x") else float(v)
+    return p
+
+
 class Simulator:
-    # samples the sensor model the likelihood is trained on (losses.event_nll), with the learned C_on, r, k, nu, R:
-    # thresholds X*C with X ~ IG(1, k), exact crossing of the local quadratic of L, background events at rate nu;
-    # after any event the pixel is blind for R and takes ref = L at the end of it. mismatch is an optional extra (not learned),
-    # refractory=None uses the learned R
-    def __init__(self, model, noise=1.0, mismatch=0.0, refractory=None, min_steps=4, max_steps=256, seed=0, max_events=64):
-        self.m, self.noise, self.mismatch, self.refractory = model, noise, mismatch, refractory
+    # samples the sensor model the likelihood is trained on (losses.event_nll) with a sensor profile (default: the learned one):
+    # thresholds X*C with X ~ IG(1, sigma_event^-2), exact crossing of the local quadratic of L, background events;
+    # after any event the pixel is blind for the refractory time and takes ref = L at the end of it;
+    # sigma_thres adds a fixed per-pixel threshold offset (sampler only)
+    def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
+        self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
         self.gen = torch.Generator().manual_seed(seed)
         self.ref = None
@@ -40,14 +61,14 @@ class Simulator:
     def run(self, s, t0, t1):
         # all events of one frame interval [t0, t1] (seconds); pixel state carries over between calls
         m, dt = self.m, t1 - t0
-        self.dev, self.k, self.nu = s["d"].device, m.log_k.exp().item(), m.log_nu.exp().item() * self.noise
-        self.R = m.R.item() if self.refractory is None else self.refractory
+        p = self.p
+        self.dev, self.k, self.nu, self.R = s["d"].device, max(p["sigma_event"], 1e-3) ** -2, p["shot_noise_rate_hz"], p["refractory_period_s"]
         tau = lambda v: torch.full((1,), v, device=self.dev)
         La, Da, _ = m.render(s, tau(0.0))
         if self.ref is None:
             shape = (2, *La.shape)
-            spread = (1 + self.mismatch * torch.randn(shape, generator=self.gen).to(self.dev)).clamp(min=0.1)
-            self.c = torch.stack([m.c, m.c * m.r]).view(2, 1, 1, 1, 1) * spread
+            spread = (1 + p["sigma_thres"] * torch.randn(shape, generator=self.gen).to(self.dev)).clamp(min=0.1)
+            self.c = torch.tensor([p["pos_thres"], p["neg_thres"]], device=self.dev).view(2, 1, 1, 1, 1) * spread
             self.ref = La.clone()
             self.x = (self._u(shape) / self._ig(shape)).float()  # stationary start: uniform part of a size-biased wait
             self.wake = torch.full_like(La, -math.inf, dtype=torch.float64)  # end of the blind time

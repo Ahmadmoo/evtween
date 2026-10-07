@@ -33,10 +33,10 @@ loss:
   jepa: 1.0                    # student code vs teacher code
   grid: 128                    # tau steps of the likelihood path (32 sends sub-grid edges / texture into the noise rate)
 
-sensor:                        # generate.py only; thresholds, timing law and noise rate come from the trained model
-  noise: 1.0                   # scale on the learned background rate
-  mismatch: 0.0                # optional per-pixel threshold spread (not learned)
-  refractory: null             # seconds; null = the learned value
+sensor:                        # generation only (generate.py / physics.Simulator)
+  profile: learned             # learned | clean | profile.yaml; generate.py --sensor / --set override it
+  set: {}                      # e.g. {pos_thres: 0.3, shot_noise_rate_hz: x0.5}; keys: pos_thres neg_thres sigma_event
+                               # sigma_thres shot_noise_rate_hz refractory_period_s (x = relative to the profile)
   min_steps: 4
   max_steps: 256
   seed: 0
