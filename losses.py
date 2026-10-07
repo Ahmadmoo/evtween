@@ -21,20 +21,24 @@ def ig_logs(x, k):
     return logpdf.float(), logsf.float(), logsf_eq.float()
 
 
-def event_nll(model, s, ev, dt, steps=32):
+SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # path time shifts (grid steps) averaged per pixel with the predicted uncertainty
+
+
+def event_nll(model, s, ev, dt, steps=128):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
     # background events (nu per second, half per polarity) compete with the signal and also reset the pixel;
     # after any event the pixel is blind for the refractory time R and takes ref = L at its end (not at the event);
-    # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown)
+    # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown).
+    # With an uncertainty map s["sig"] (gap units) the whole path of a pixel may be shifted in time by d ~ N(0, sig^2)
+    # and the pixel's likelihood is averaged over shifts: a shift moves all its events together, threshold noise does not
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
     frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
     grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
     Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
-    Dg = F.pad((Lg[:, 1:] - Lg[:, :-1]) * steps, (0, 0, 0, 1), mode="replicate")  # slope of the same piecewise-linear L
     c, k, nu = torch.stack([model.c, model.c * model.r]), model.log_k.exp(), model.log_nu.exp() * dt
 
     key = b * H * W + pix
@@ -42,46 +46,64 @@ def event_nll(model, s, ev, dt, steps=32):
     first[1:] = key[1:] != key[:-1]
     last = torch.ones_like(first)
     last[:-1] = key[1:] != key[:-1]
+    seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
+    seen[key] = True
     tprev = torch.where(first, torch.zeros_like(tau), tau.roll(1))
     Rt, wR = model.R / dt[b], 1e-5 / dt[b]  # refractory time and the width of its soft edge, in gap units
     wake = torch.where(first, tprev, torch.minimum(tprev + Rt, tau))  # end of the blind time: ref is taken here
     awake = torch.where(first, torch.ones_like(tau), torch.sigmoid((tau - tprev - Rt) / wR))
-
-    def at(v, t):
-        j = (t * steps).clamp(0, steps - 1e-4)
-        j0, w = j.long(), j - j.floor()
-        return v[b, j0, pix] * (1 - w) + v[b, j0 + 1, pix] * w
-
-    slope = lambda t: Dg[b, (t * steps).clamp(0, steps - 1e-4).long(), pix]
-
-    def reach(row, inner, ref):  # running max of +-(L - ref)/C over the grid points inside an interval
-        hi = torch.where(inner, row, torch.full_like(row, -math.inf)).amax(1).maximum(ref)
-        lo = torch.where(inner, row, torch.full_like(row, math.inf)).amin(1).minimum(ref)
-        return torch.stack([hi - ref, ref - lo], 1) / c
-
-    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, wake), slope(tau)
-    before = reach(row, (taus > wake[:, None]) & (taus < tau[:, None]), Lp)
-    now = torch.stack([Li - Lp, Lp - Li], 1) / c
-    M = torch.maximum(before, now)
-    # signal only at a new max (a wider gate biases c low when k is small) and never while blind
-    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
-
-    logpdf, logsf, logsf_eq = ig_logs(M, k)
-    log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
-    log_s = torch.where(first[:, None], logsf_eq, logsf)
     own = (pol < 0).long()[:, None]
-    signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
-    log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
 
-    end = (tau + Rt).clamp(max=1)
-    tail = ig_logs(reach(row, taus[None] > end[:, None], at(Lg, end)), k)[1].sum(1)
-    seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
-    seen[key] = True
-    L0 = Lg[:, :1]
-    whole = (torch.stack([Lg.amax(1) - L0[:, 0], L0[:, 0] - Lg.amin(1)], 1) / c[:, None]).transpose(1, 2).reshape(-1, 2)
-    silent = ig_logs(whole[~seen], k)[2].sum(1)
-    ll = log_ev.sum() + tail[last].sum() + silent.sum() - (nu * H * W).sum()
-    return -ll / (B * H * W)
+    def pixel_ll(Lg, d):
+        # log-likelihood per pixel with the path delayed by d (gap units): events see L(t - d), L held constant outside [0, 1]
+        def at(t):
+            j = (t * steps).clamp(0, steps - 1e-4)
+            j0, w = j.long(), j - j.floor()
+            return Lg[b, j0, pix] * (1 - w) + Lg[b, j0 + 1, pix] * w
+
+        def slope(t):
+            j = (t * steps).floor().clamp(0, steps - 1).long()
+            return (Lg[b, j + 1, pix] - Lg[b, j, pix]) * steps * ((t >= 0) & (t < 1))
+
+        def reach(lo, hi, ref):  # running max / min of +-(L - ref)/C over the grid points strictly inside (lo, hi)
+            with torch.no_grad():  # only to find where the max / min sits; the value is gathered with gradient
+                row, inner = Lg[b, :, pix], (taus > lo[:, None]) & (taus < hi[:, None])
+                imax = torch.where(inner, row, -math.inf).argmax(1)
+                imin = torch.where(inner, row, math.inf).argmin(1)
+                has = inner.any(1)
+            top = torch.where(has, Lg[b, imax, pix], ref).maximum(ref)
+            bot = torch.where(has, Lg[b, imin, pix], ref).minimum(ref)
+            return torch.stack([top - ref, ref - bot], 1) / c
+
+        t, tw = tau - d, wake - d
+        Li, Lp, Di = at(t), at(tw), slope(t)
+        before = reach(tw, t, Lp)
+        now = torch.stack([Li - Lp, Lp - Li], 1) / c
+        M = torch.maximum(before, now)
+        # signal only at a new max (a wider gate biases c low when k is small) and never while blind
+        rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
+        logpdf, logsf, logsf_eq = ig_logs(M, k)
+        log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
+        log_s = torch.where(first[:, None], logsf_eq, logsf)
+        signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
+        log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
+
+        end = (tau + Rt).clamp(max=1) - d
+        tail = ig_logs(reach(end, torch.full_like(end, 1 - d + 0.5 / steps), at(end)), k)[1].sum(1)
+        q = round(d * steps)
+        win = Lg[:, max(0, -q):steps + 1 - max(0, q)]  # the path seen inside the window
+        L0 = win[:, 0]
+        whole = (torch.stack([win.amax(1) - L0, L0 - win.amin(1)], 1) / c[:, None]).transpose(1, 2).reshape(-1, 2)
+        ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
+        return torch.where(seen, ll, ig_logs(whole, k)[2].sum(1))
+
+    shifts = SHIFTS if "sig" in s else (0,)
+    lls = torch.stack([checkpoint(pixel_ll, Lg, q / steps, use_reentrant=False) if grad else pixel_ll(Lg, q / steps) for q in shifts])
+    if len(shifts) > 1:
+        d = torch.tensor(shifts, device=tau.device, dtype=torch.float32) / steps
+        logw = (-0.5 * (d[:, None] / s["sig"].flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
+        lls = torch.logsumexp(logw + lls, 0, keepdim=True)
+    return -(lls[0].sum() - (nu * H * W).sum()) / (B * H * W)
 
 
 def photo_loss(model, s, mid, mid_tau):

@@ -23,6 +23,7 @@ model:
   pred_dim: 384                # student transformer width
   pred_depth: 4
   amp: true                    # bf16 on CUDA
+  uncertainty: true            # decoder also predicts how unsure the path is about arrival times
 
 loss:
   nll: 1.0                     # exact-time event likelihood

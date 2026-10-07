@@ -225,13 +225,15 @@ class Decoder(nn.Module):
 
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
-                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True):
+                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
+                 uncertainty=True):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
         self.flow = FlowPrior(flow_prior)
         self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
-        self.decoder = Decoder(z_dim, 5 * K + 1, width, depth)
+        self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty), width, depth)
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -296,10 +298,13 @@ class EvTween(nn.Module):
             out = self.decoder(p["x"], z)
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
-        a, b, d = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1], 1)
+        a, b, d, u = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
-        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0),
-                    a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
+        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0),
+                 a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
+        if self.uncertainty:
+            s["sig"] = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
+        return s
 
     def flows(self, s, tau):
         # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:
