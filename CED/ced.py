@@ -154,8 +154,9 @@ def summary(bag):
 
 def detect(raw, color):
     # Bayer pattern of a mono image_raw: the one whose measured sites match image_color best (rank correlation: any gamma)
-    col = {(s, n): rgb(enc, img, None) for s, n, enc, img in color}
-    pairs = [(img[..., 0], col[s, n]) for s, n, _, img in raw if (s, n) in col]
+    rt = np.array([s + n * 1e-9 for s, n, _, _ in raw])
+    pairs = [(raw[j][3][..., 0], rgb(enc, img, None)) for s, n, enc, img in color
+             for j in [np.abs(rt - s - n * 1e-9).argmin()] if abs(rt[j] - s - n * 1e-9) < 2e-3]  # same frame: times within 2 ms
     pairs = pairs[::max(1, len(pairs) // 10)][:10]
     rank = lambda v: np.argsort(np.argsort(v.ravel())).astype(np.float64)
     score = lambda p: np.mean([np.corrcoef(rank(r[q // 2::2, q % 2::2]), rank(c[q // 2::2, q % 2::2, "rgb".index(ch)]))[0, 1]
@@ -165,15 +166,19 @@ def detect(raw, color):
     return max(scores, key=scores.get) if top[1] > 0.8 and top[1] - top[0] > 0.1 else None, scores  # unclear: image_color
 
 
-def read(bag):
-    info, ev, ims = {"bad": 0}, [], {}
+def read(bag, every=20):
+    # keeps every `every`-th image_color frame (enough to find the Bayer pattern); reads again keeping all if frames come from it
+    info, ev, ims, n = {"bad": 0}, [], {}, 0
     for topic, typ, t, raw in messages(bag, info):
+        name = topic.rsplit("/", 1)[-1]
         if typ.endswith("EventArray"):
             ev.append(events(raw))
-        elif typ == "sensor_msgs/Image" and topic.rsplit("/", 1)[-1] in ("image_raw", "image_color"):
-            ims.setdefault(topic.rsplit("/", 1)[-1], []).append(image(raw))
+        elif typ == "sensor_msgs/Image" and name in ("image_raw", "image_color"):
+            n += name == "image_color"
+            if name == "image_raw" or (n - 1) % every == 0:
+                ims.setdefault(name, []).append(image(raw))
     size, end, index = info.get("size", 1), info.get("end", 0), info.get("index", 0)
-    print(f"{os.path.basename(bag)}: {size / 2 ** 30:.2f} GB, "
+    every > 1 and print(f"{os.path.basename(bag)}: {size / 2 ** 30:.2f} GB, "
           f"index {'missing' if index == 0 else 'beyond the file end' if index >= size else 'present'}"
           + ("" if end >= size else f", index damaged (all data read)" if 0 < index <= end
              else f", ! file cut off: read up to {100 * end / size:.1f}%")
@@ -182,10 +187,14 @@ def read(bag):
         raise ValueError("no events")
     raw_enc = ims["image_raw"][0][2].lower() if "image_raw" in ims else ""
     pattern = raw_enc.split("_")[1][:4] if raw_enc.startswith("bayer_") else a.bayer if raw_enc else None
-    if raw_enc and not pattern and "image_color" in ims and ims["image_raw"][0][3].shape[2] == 1:
+    if every > 1 and raw_enc and not pattern and "image_color" in ims and ims["image_raw"][0][3].shape[2] == 1:
         pattern, scores = detect(ims["image_raw"], ims["image_color"])
-        print("  Bayer pattern from image_raw vs image_color: " + ", ".join(f"{p} {v:.3f}" for p, v in scores.items()))
+        print("  Bayer pattern from image_raw vs image_color: "
+              + (", ".join(f"{p} {v:.3f}" for p, v in scores.items()) if scores else "no frames with matching times")
+              + ("" if pattern else " -> unclear, frames from image_color"))
     name = "image_raw" if pattern else "image_color"
+    if name == "image_color" and every > 1:
+        return read(bag, 1)
     if name not in ims:
         raise ValueError(f"no usable frames (image_raw encoding {raw_enc or 'none'}, no image_color); try --bayer")
     return np.concatenate(ev), ims[name], pattern
