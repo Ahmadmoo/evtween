@@ -239,6 +239,8 @@ class EvTween(nn.Module):
         self.log_r = nn.Parameter(torch.tensor(math.log(r_init)))   # C_off / C_on
         self.log_k = nn.Parameter(torch.tensor(math.log(4.0)))      # inverse-Gaussian shape (timing regularity)
         self.log_nu = nn.Parameter(torch.tensor(math.log(0.2)))     # background events per pixel per second
+        self.log_R = nn.Parameter(torch.tensor(math.log(5e-5)))     # refractory time (s); grows from below to the real floor
+        self.R_max = 2e-3                                            # soft cap: with few events per pixel R is weakly pinned
 
     @property
     def c(self):
@@ -247,6 +249,10 @@ class EvTween(nn.Module):
     @property
     def r(self):
         return self.log_r.exp()
+
+    @property
+    def R(self):
+        return self.R_max * torch.tanh(self.log_R.exp() / self.R_max)
 
     def frozen(self, name):
         return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")

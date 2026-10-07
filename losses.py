@@ -23,9 +23,10 @@ def ig_logs(x, k):
 
 def event_nll(model, s, ev, dt, steps=32):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
-    # after every event the pixel sets ref = L and draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k);
+    # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
     # background events (nu per second, half per polarity) compete with the signal and also reset the pixel;
+    # after any event the pixel is blind for the refractory time R and takes ref = L at its end (not at the event);
     # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown)
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
@@ -42,6 +43,9 @@ def event_nll(model, s, ev, dt, steps=32):
     last = torch.ones_like(first)
     last[:-1] = key[1:] != key[:-1]
     tprev = torch.where(first, torch.zeros_like(tau), tau.roll(1))
+    Rt, wR = model.R / dt[b], 1e-5 / dt[b]  # refractory time and the width of its soft edge, in gap units
+    wake = torch.where(first, tprev, torch.minimum(tprev + Rt, tau))  # end of the blind time: ref is taken here
+    awake = torch.where(first, torch.ones_like(tau), torch.sigmoid((tau - tprev - Rt) / wR))
 
     def at(v, t):
         j = (t * steps).clamp(0, steps - 1e-4)
@@ -55,11 +59,12 @@ def event_nll(model, s, ev, dt, steps=32):
         lo = torch.where(inner, row, torch.full_like(row, math.inf)).amin(1).minimum(ref)
         return torch.stack([hi - ref, ref - lo], 1) / c
 
-    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, tprev), slope(tau)
-    before = reach(row, (taus > tprev[:, None]) & (taus < tau[:, None]), Lp)
+    row, Li, Lp, Di = Lg[b, :, pix], at(Lg, tau), at(Lg, wake), slope(tau)
+    before = reach(row, (taus > wake[:, None]) & (taus < tau[:, None]), Lp)
     now = torch.stack([Li - Lp, Lp - Li], 1) / c
     M = torch.maximum(before, now)
-    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3)  # only at a new max (a wider gate biases c low when k is small)
+    # signal only at a new max (a wider gate biases c low when k is small) and never while blind
+    rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
 
     logpdf, logsf, logsf_eq = ig_logs(M, k)
     log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
@@ -68,7 +73,8 @@ def event_nll(model, s, ev, dt, steps=32):
     signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
     log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
 
-    tail = ig_logs(reach(row, taus[None] > tau[:, None], Li), k)[1].sum(1)
+    end = (tau + Rt).clamp(max=1)
+    tail = ig_logs(reach(row, taus[None] > end[:, None], at(Lg, end)), k)[1].sum(1)
     seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
     seen[key] = True
     L0 = Lg[:, :1]

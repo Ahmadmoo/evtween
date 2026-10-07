@@ -139,7 +139,7 @@ while step < T["steps"]:
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
             print(f"[{stage}] step {step} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
-                  f"k {model.log_k.exp().item():.2f} gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
+                  f"k {model.log_k.exp().item():.2f} nu {model.log_nu.exp().item():.2f} R {model.R.item() * 1e6:.0f}us gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
             torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
             if val is not None:
