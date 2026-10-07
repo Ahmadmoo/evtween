@@ -342,4 +342,5 @@ class EvTween(nn.Module):
 
 
 def build_model(cfg):
-    return EvTween(**cfg["model"], bins=cfg["data"]["bins"])
+    # configs from before the uncertainty output have no "uncertainty" key: build those checkpoints without it
+    return EvTween(**{"uncertainty": False, **cfg["model"]}, bins=cfg["data"]["bins"])
