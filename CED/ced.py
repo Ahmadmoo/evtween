@@ -19,7 +19,7 @@ ap.add_argument("--out", default="data/ced")
 ap.add_argument("--raw", default=HERE, help="folder holding the .bag files")
 ap.add_argument("--bayer", default=None, help="pattern of a mono8 image_raw, e.g. rggb (read from the encoding if given there)")
 ap.add_argument("--offset-ms", type=float, default=0.0, help="added to frame times (e.g. half the exposure, after check.py)")
-ap.add_argument("--dry", action="store_true", help="only print topics, image encoding and sizes (first 2 s of each bag)")
+ap.add_argument("--dry", action="store_true", help="only print topics, message counts, time spans, image encodings (from the bag index)")
 a = ap.parse_args()
 u32 = lambda b, o=0: int.from_bytes(b[o:o + 4], "little")
 
@@ -114,34 +114,77 @@ def demosaic(m, pattern):
     return rgb.clip(0, 255).astype(np.uint8)
 
 
+def summary(bag):
+    # whole bag from the index at the end of the file (no data chunk is read): every topic, its message count and time span,
+    # whether the file is stored in time order, and the encoding of the first image of each image topic
+    stamp = lambda b: u32(b) + u32(b, 4) * 1e-9
+    with open(bag, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        ip, conns, chunks = int.from_bytes(next(records(m, 13))[0].get("index_pos", b""), "little"), {}, []
+        try:
+            for h, d, _ in records(m, ip) if 0 < ip < len(m) else []:
+                if h["op"] == b"\x07":
+                    conns[u32(h["conn"])] = (h["topic"].decode(), fields(d, 0, len(d))["type"].decode())
+                elif h["op"] == b"\x06":
+                    chunks.append((int.from_bytes(h["chunk_pos"], "little"), stamp(h["start_time"]), stamp(h["end_time"]),
+                                   {u32(d, 8 * i): u32(d, 8 * i + 4) for i in range(u32(h["count"]))}))
+        except Exception:
+            chunks = []
+        if not chunks:
+            print(f"{os.path.basename(bag)}: {len(m) / 2 ** 30:.2f} GB, index missing or damaged (run without --dry to check it)")
+            return
+        chunks.sort()
+        starts = np.array([c[1] for c in chunks])
+        back, T0 = (np.maximum.accumulate(starts) - starts).max(), starts.min()
+        print(f"{os.path.basename(bag)}: {len(m) / 2 ** 30:.2f} GB, {len(chunks)} chunks, "
+              + ("stored in time order" if back < 1 else f"NOT stored in time order (jumps back {back:.0f} s)"))
+        for k, (topic, typ) in sorted(conns.items(), key=lambda kv: kv[1]):
+            ch = [c for c in chunks if k in c[3]]
+            if not ch:
+                continue
+            line = (f"  {topic:20s} {typ:20s} {sum(c[3][k] for c in ch):6d} msgs, "
+                    f"{min(c[1] for c in ch) - T0:6.1f} to {max(c[2] for c in ch) - T0:6.1f} s")
+            if typ == "sensor_msgs/Image":
+                h, d, _ = next(records(m, ch[0][0]))
+                d2 = next(d2 for h2, d2, _ in records(unpack(h["compression"].decode(), d, {"bad": 0}))
+                          if h2.get("op") == b"\x02" and u32(h2["conn"]) == k)
+                _, _, enc, img = image(d2)
+                line += f", {enc} {img.shape[1]}x{img.shape[0]}x{img.shape[2]}"
+            print(line)
+
+
+def detect(raw, color):
+    # Bayer pattern of a mono image_raw: the one whose measured sites match image_color best (rank correlation: any gamma)
+    col = {(s, n): rgb(enc, img, None) for s, n, enc, img in color}
+    pairs = [(img[..., 0], col[s, n]) for s, n, _, img in raw if (s, n) in col]
+    pairs = pairs[::max(1, len(pairs) // 10)][:10]
+    rank = lambda v: np.argsort(np.argsort(v.ravel())).astype(np.float64)
+    score = lambda p: np.mean([np.corrcoef(rank(r[q // 2::2, q % 2::2]), rank(c[q // 2::2, q % 2::2, "rgb".index(ch)]))[0, 1]
+                               for r, c in pairs for q, ch in enumerate(p)])
+    scores = {p: score(p) for p in ("rggb", "grbg", "gbrg", "bggr")} if pairs else {}
+    top = sorted(scores.values())[-2:] if scores else [0, 0]
+    return max(scores, key=scores.get) if top[1] > 0.8 and top[1] - top[0] > 0.1 else None, scores  # unclear: image_color
+
+
 def read(bag):
-    info, ev, ims, seen, t1 = {"bad": 0}, [], {}, {}, None
+    info, ev, ims = {"bad": 0}, [], {}
     for topic, typ, t, raw in messages(bag, info):
-        seen[topic] = (typ, seen.get(topic, (0, 0))[1] + 1)
         if typ.endswith("EventArray"):
             ev.append(events(raw))
         elif typ == "sensor_msgs/Image" and topic.rsplit("/", 1)[-1] in ("image_raw", "image_color"):
             ims.setdefault(topic.rsplit("/", 1)[-1], []).append(image(raw))
-        t1 = t1 or t
-        if a.dry and t - t1 > 2:
-            break
     size, end, index = info.get("size", 1), info.get("end", 0), info.get("index", 0)
     print(f"{os.path.basename(bag)}: {size / 2 ** 30:.2f} GB, "
           f"index {'missing' if index == 0 else 'beyond the file end' if index >= size else 'present'}"
-          + ("" if a.dry or end >= size else f", index damaged (all data read)" if 0 < index <= end
+          + ("" if end >= size else f", index damaged (all data read)" if 0 < index <= end
              else f", ! file cut off: read up to {100 * end / size:.1f}%")
           + (f", ! {info['bad']} unreadable chunks skipped" if info["bad"] else ""))
-    if a.dry:
-        for topic, (typ, n) in seen.items():
-            print(f"  {topic}  {typ}  {n} msgs in the first 2 s")
-        for name, fr in ims.items():
-            print(f"  {name}: encoding {fr[0][2]}, {fr[0][3].shape[1]}x{fr[0][3].shape[0]}x{fr[0][3].shape[2]}")
-        print(f"  events: {sum(map(len, ev))} in the first 2 s")
-        return None
     if not ev:
         raise ValueError("no events")
     raw_enc = ims["image_raw"][0][2].lower() if "image_raw" in ims else ""
-    pattern = raw_enc.split("_")[1][:4] if raw_enc.startswith("bayer_") else (a.bayer if raw_enc else None)
+    pattern = raw_enc.split("_")[1][:4] if raw_enc.startswith("bayer_") else a.bayer if raw_enc else None
+    if raw_enc and not pattern and "image_color" in ims and ims["image_raw"][0][3].shape[2] == 1:
+        pattern, scores = detect(ims["image_raw"], ims["image_color"])
+        print("  Bayer pattern from image_raw vs image_color: " + ", ".join(f"{p} {v:.3f}" for p, v in scores.items()))
     name = "image_raw" if pattern else "image_color"
     if name not in ims:
         raise ValueError(f"no usable frames (image_raw encoding {raw_enc or 'none'}, no image_color); try --bayer")
@@ -162,7 +205,7 @@ test = {b for group in cats.values() for b in group[2::5]}
 print(f"{len(bags)} bags, {len(test)} test")
 for bag in bags:
     try:
-        out = read(bag)
+        out = summary(bag) if a.dry else read(bag)
     except Exception as e:
         print(f"{os.path.basename(bag)}: skipped ({type(e).__name__}: {e})")
         continue
@@ -176,7 +219,7 @@ for bag in bags:
     if keep.sum() < 2:
         print(f"{os.path.basename(bag)}: skipped (fewer than 2 frames inside the event stream)")
         continue
-    frames, ts = [f for f, k in zip(frames, keep) if k], ts[keep]
+    n_all, frames, ts = len(frames), [f for f, k in zip(frames, keep) if k], ts[keep]
     t0, o = ts[0], np.argsort(t, kind="stable")
     dst = os.path.join(a.out, "test" if bag in test else "train", os.path.splitext(os.path.basename(bag))[0])
     os.makedirs(os.path.join(dst, "frames"), exist_ok=True)
@@ -190,5 +233,5 @@ for bag in bags:
     if pattern:
         open(os.path.join(dst, "bayer.txt"), "w").write(pattern + "\n")
     H, W = frames[0][3].shape[:2]
-    print(f"  -> {dst}: {len(frames)} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {len(t)} events, "
+    print(f"  -> {dst}: {len(frames)}/{n_all} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {len(t)} events, "
           f"frames from {'image_raw (' + pattern + ')' if pattern else 'image_color'}")
