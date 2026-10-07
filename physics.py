@@ -17,8 +17,9 @@ def first_root(a, b, c, lo, hi):
 
 
 def profile(model):
-    # the learned sensor in physical units (v2e names where v2e has the parameter);
-    # sigma_thres (fixed per-pixel threshold spread) is not learned, 0.03 as in v2e
+    # the learned sensor in physical units (v2e names and meanings where v2e has the parameter);
+    # sigma_event: per-event threshold noise as a fraction of the threshold;
+    # sigma_thres: fixed per-pixel threshold spread in log units, as in v2e (not learned, v2e's default 0.03)
     return dict(pos_thres=model.c.item(), neg_thres=(model.c * model.r).item(), sigma_event=model.log_k.exp().item() ** -0.5,
                 sigma_thres=0.03, shot_noise_rate_hz=model.log_nu.exp().item(), refractory_period_s=model.R.item())
 
@@ -67,8 +68,8 @@ class Simulator:
         La, Da, _ = m.render(s, tau(0.0))
         if self.ref is None:
             shape = (2, *La.shape)
-            spread = (1 + p["sigma_thres"] * torch.randn(shape, generator=self.gen).to(self.dev)).clamp(min=0.1)
-            self.c = torch.tensor([p["pos_thres"], p["neg_thres"]], device=self.dev).view(2, 1, 1, 1, 1) * spread
+            spread = p["sigma_thres"] * torch.randn(shape, generator=self.gen).to(self.dev)
+            self.c = (torch.tensor([p["pos_thres"], p["neg_thres"]], device=self.dev).view(2, 1, 1, 1, 1) + spread).clamp(min=0.01)
             self.ref = La.clone()
             self.x = (self._u(shape) / self._ig(shape)).float()  # stationary start: uniform part of a size-biased wait
             self.wake = torch.full_like(La, -math.inf, dtype=torch.float64)  # end of the blind time
