@@ -51,7 +51,11 @@ TEST
 | `losses.py` | Likelihood, photometric, contrast max, SIGReg, stage logic, validation diagnostics |
 | `physics.py` | Quadratic root solver and event `Simulator` |
 | `data.py` | Sequence reader, training samples, collate, dataset list (`data.sets`) and the weighted mixing sampler |
-| `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
+| `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume (the one training loop) |
+| `run_training.py` | Command line for `train.py`: datasets, data fraction, weights, seeds, steps, logging, resume, final test |
+| `experiment.py` | Experiment folder, dataset / batch reports, metric CSVs, checkpoints, provenance |
+| `scripts/train.sbatch` | Slurm job for Rails: one GPU, saves before the time limit, requeues and resumes |
+| `notebooks/inspect_training.ipynb` | Plots of an experiment folder (losses, per-dataset losses, validation, sampling, lr, memory) |
 | `generate.py` | RGB video → events `.npz` (student path) |
 | `HQ-EVFI/hqevfi.py` | Extracts the HQ-EVFI zip and converts it to the training layout |
 | `BS-ERGB/bsergb.py` | Same for BS-ERGB (zip or extracted folders) |
@@ -136,7 +140,53 @@ data:
 
 ## 5. Train
 
-Run the stages in order. Every command accepts dotted overrides; add `torchrun --nproc_per_node 4` for multi-GPU.
+### `run_training.py` (recommended)
+
+A command line over the same training loop (`train.run`); every run gets its own experiment folder.
+
+```bash
+# dry run: dataset report + one real batch per dataset + one mixed batch; no model, no optimizer step
+python run_training.py --stage teacher --dry-run --exp runs/dryrun --raw hqevfi=HQ-EVFI/raw eds=EDS/EDS
+# 1% of the data, 20 steps
+python run_training.py --stage teacher --fraction 1% --steps 20 --batch 4 --log-every 1 --val-every 10 --save-every 10 \
+    --val-batches 2 --exp runs/smoke_1pct
+# 10% pilot, EDS at 25%, BS-ERGB sampled twice as often
+python run_training.py --stage teacher --fraction 10% --dataset-fraction eds=25% --weights bsergb=2 --steps 10000 --exp runs/pilot_10pct
+# full data, then the student from the teacher's best checkpoint
+python run_training.py --stage teacher --steps 200000 --exp runs/teacher_full
+python run_training.py --stage student --init runs/teacher_full/checkpoints/best.pt --exp runs/student_full
+# continue an interrupted run (refused if learning settings or the data selection changed; --force-resume to accept)
+python run_training.py --exp runs/teacher_full --stage teacher --steps 200000 --resume
+# held-out test split, once, on request (never used during training)
+python run_training.py --final-test runs/teacher_full/checkpoints/best.pt
+# Slurm (Rails): submits, saves before the time limit, requeues and resumes by itself
+sbatch scripts/train.sbatch runs/teacher_full --stage teacher --steps 200000
+```
+
+`python run_training.py --help` lists every flag; anything else: `--set section.key=value`.
+
+| Topic | Behaviour |
+|---|---|
+| Splits | train = `root`; validation = the official `val_root` (BS-ERGB) or whole training **recordings** held out (`val_frac`, 10%, picked by `--data-seed`; pieces of one recording stay together); test = `test_root`, read only by `--final-test` |
+| `--fraction` | share of the **eligible** training samples per dataset (after the split and after dropping sequences too short for one sample). Each sample gets a hash of (data seed, dataset, sequence, frame) and the lowest `ceil(f*N)` are kept: reproducible, and 1% ⊂ 5% ⊂ 10% … `--select sequence` keeps whole sequences instead. Only indices are kept; nothing is loaded |
+| `--weights` | share of drawn samples per dataset (default equal); `size` = proportional to the selected samples. Batches are mixed: each sample picks its dataset independently |
+| Seeds | `--seed`: augmentation, sampling order, initialization. `--data-seed`: validation split and data selection |
+| Augmentation | online only: random crop (re-drawn up to 10 times to reach `min_events`), horizontal flip; validation: centre crop. The number of samples does not change |
+| Logs | console + `training.log`: every `--log-every` steps the interval means of every loss term, lr, grad norm, GPU memory, s/step, samples/s, and per dataset the share of samples and its losses (`N/A` where a term does not apply, e.g. `photo` without hidden frames; `sigreg` is a whole-batch statistic, no per-dataset value) |
+| Guards | non-finite loss or gradient: the step is not taken, `nonfinite_step*_rank*.json` names the batch's sequences and frames, the run stops. An existing experiment folder is never overwritten (use `--resume`) |
+| Checkpoints | `checkpoints/last.pt` (every `--save-every` steps, written atomically), `step_*.pt` (last `--keep`), `best.pt` (lowest mean validation `nll`, or `nll_student` for student / joint). They hold the trainable weights, optimizer, step, sample counts, config, data selection and the random states of every GPU; resume continues the same sample order |
+
+Experiment folder: `config.yaml`, `dataset_report.json`, `train_metrics.csv`, `val_metrics.csv`, `training.log`,
+`checkpoints/`, `summary.json`, `env_*.json` (host, GPUs, versions, Slurm job, git commit / branch / status) and
+`git_diff_*.patch` if the code had uncommitted changes. `notebooks/inspect_training.ipynb` plots them (no training).
+
+Monitor on Rails: `squeue -u $USER`, `tail -f runs/<exp>/training.log`, `sacct -j <job> -o JobID,State,Elapsed,ExitCode`,
+`nvidia-smi` on the node (`srun --jobid <job> --pty nvidia-smi`).
+
+### `train.py` with dotted overrides
+
+The same loop, configured only from `config.yaml` and `key=value`; the experiment folder is `train.out`.
+Run the stages in order; add `torchrun --nproc_per_node 4` for multi-GPU.
 
 ```bash
 # 0. probe (1-2 days): can the backbone predict event counts in the gap? compare backbones
@@ -148,10 +198,10 @@ python train.py train.stage=probe model.backbone=none     train.out=runs/probe_n
 python train.py train.stage=teacher train.out=runs/teacher
 
 # 2. student (teacher and decoder frozen)
-python train.py train.stage=student train.init=runs/teacher/last.pt train.out=runs/student
+python train.py train.stage=student train.init=runs/teacher/checkpoints/best.pt train.out=runs/student
 
 # 3. optional joint fine-tune (small lr)
-python train.py train.stage=joint train.init=runs/student/last.pt train.lr=2e-5 train.out=runs/joint
+python train.py train.stage=joint train.init=runs/student/checkpoints/best.pt train.lr=2e-5 train.out=runs/joint
 ```
 
 ### What to watch (validation line)
@@ -164,7 +214,7 @@ python train.py train.stage=joint train.init=runs/student/last.pt train.lr=2e-5 
 | `nll_student` | Student code | Between `nll` and `nll_zero` |
 | `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
 
-The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT and backbone weights.
+An existing `train.out` is not overwritten: continue it with `train.resume=true`. Checkpoints leave out the frozen RAFT and backbone weights.
 
 ### Smoke test (CPU, a few minutes)
 
@@ -174,8 +224,8 @@ S="data.root=data/toy/train data.val_root=data/toy/val data.crop=64 data.gap=nul
    model.flow_prior=none model.backbone=none model.width=16 model.depth=[1,1,1] model.pred_dim=64 model.pred_depth=2 \
    loss.grid=16 train.batch=4 train.lr=1e-3 train.warmup=20 train.log_every=100 train.val_batches=8"
 python train.py $S train.stage=teacher train.steps=1000 train.save_every=500 train.out=runs/teacher
-python train.py $S train.stage=student train.init=runs/teacher/last.pt train.steps=600 train.save_every=300 train.out=runs/student
-python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out runs/student/events.npz
+python train.py $S train.stage=student train.init=runs/teacher/checkpoints/last.pt train.steps=600 train.save_every=300 train.out=runs/student
+python generate.py --ckpt runs/student/checkpoints/last.pt --seq data/toy/val/seq100 --out runs/student/events.npz
 ```
 
 ---
@@ -183,7 +233,7 @@ python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out r
 ## 6. Generate
 
 ```bash
-python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz
+python generate.py --ckpt runs/student/checkpoints/best.pt --seq my_video/ --out events.npz
 python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5e-4
 ```
 

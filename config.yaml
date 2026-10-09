@@ -1,11 +1,17 @@
 data:
-  sets:                        # one entry per dataset (README section 4); root / val_root: folder (searched recursively) or list.
-                               # optional per set: weight (sampling share, default 1), gap or skip, gamma, min_events
-    - {name: hqevfi, root: data/hqevfi/train, val_root: data/hqevfi/test}   # EVK4-HD, 142 fps
-    - {name: bsergb, root: data/bsergb/train, val_root: data/bsergb/test}   # Gen4M, 28 fps
-    - {name: ced,    root: data/ced/train,    val_root: data/ced/test}      # Color DAVIS346 (346x260), gamma.txt per sequence
-    - {name: eds,    root: data/eds/train,    val_root: data/eds/test}      # Gen3.1 VGA, up to 75 fps
+  sets:                        # one entry per dataset (README section 4). root: training folder; test_root: held-out test
+                               # (only read by run_training.py --final-test); val_root: an official validation folder.
+                               # optional per set: weight (sampling share, default 1), fraction, gap or skip, gamma,
+                               # min_events, val (official | carve | none), val_frac
+    - {name: hqevfi, root: data/hqevfi/train, test_root: data/hqevfi/test}  # EVK4-HD, 142 fps; val carved from train
+    - {name: bsergb, root: data/bsergb/train, val_root: data/bsergb/val, test_root: data/bsergb/test}  # Gen4M, 28 fps; official val
+    - {name: ced,    root: data/ced/train,    test_root: data/ced/test}     # Color DAVIS346 (346x260); val carved from train
+    - {name: eds,    root: data/eds/train,    test_root: data/eds/test}     # Gen3.1 VGA, up to 75 fps; val carved from train
   use: null                    # names of the sets to train on, e.g. [hqevfi, eds] (null: all)
+  val_frac: 0.1                # sets without an official validation folder: share of training recordings held out (whole
+                               # recordings, chosen by --data-seed; the test split is never touched)
+  fraction: 1.0                # share of the eligible training samples used (per set too); deterministic, nested
+  select: sample               # sample | sequence: what the fraction picks
   crop: 256                    # multiple of 16, at most the smallest frame side of every set (CED: 260)
   gap: 0.035                   # seconds between I0 and I1; skip per sequence = round(gap * fps) - 1 (142 fps -> 4, 75 -> 2, 28 -> 0).
                                # pick it close to the frame interval of the target video; null -> fixed skip below
@@ -52,7 +58,7 @@ sensor:                        # generation only (generate.py / physics.Simulato
 
 train:
   stage: teacher               # probe | teacher | student | joint
-  init: null                   # checkpoint to start from (e.g. runs/teacher/last.pt for the student stage)
+  init: null                   # checkpoint to start from (e.g. runs/teacher/checkpoints/best.pt for the student stage)
   out: runs/teacher
   batch: 8                     # per GPU
   lr: 2.0e-4
@@ -60,7 +66,10 @@ train:
   steps: 200000
   warmup: 2000
   clip: 1.0
-  log_every: 50
-  save_every: 2000
+  log_every: 50                # console line + train_metrics.csv row (interval means)
+  val_every: 2000              # validation on the validation split, one row per dataset in val_metrics.csv
+  save_every: 2000             # checkpoints/last.pt and a step_*.pt snapshot
+  keep: 2                      # step_*.pt snapshots kept (last.pt and best.pt always)
   val_batches: 50
+  inspect_samples: 32          # samples per dataset for the startup crop statistics
   seed: 0

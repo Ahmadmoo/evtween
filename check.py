@@ -5,7 +5,7 @@ from data import PairDataset, collate
 from losses import event_nll
 from model import build_model
 
-# python check.py runs/teacher/last.pt [batches] [data_dir] [skip]  -> train vs test diagnostics, code / path size, time alignment
+# python check.py runs/teacher/checkpoints/best.pt [batches] [data_dir] [skip]  -> train vs test diagnostics, code / path size, time alignment
 # (data_dir holds train/ and test/; default: the checkpoint's data; skip: frames hidden per gap for that data)
 ck = torch.load(sys.argv[1], map_location="cuda", weights_only=False)
 cfg, D, dev = ck["cfg"], ck["cfg"]["data"], "cuda"

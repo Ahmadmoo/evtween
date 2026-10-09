@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import math
 import os
 import numpy as np
@@ -37,29 +38,95 @@ class Sequence:
         return {k: np.asarray(v[a:b]) for k, v in self.ev.items()}
 
 
+def seq_dirs(root):
+    # converted sequence folders (holding frame_ts.npy) under one folder or a list of folders, searched recursively
+    roots = root if isinstance(root, (list, tuple)) else [root]
+    return [os.path.dirname(p) for r in roots for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
+
+
+def recording(seq_dir):
+    # the original recording behind a converted sequence: converters that split a recording into pieces (HQ-EVFI ranges,
+    # BS-ERGB broken files) symlink the frames to the original images, so the pieces share the folder the links point to
+    f = sorted(glob.glob(os.path.join(seq_dir, "frames", "*.png")))[:1]
+    if f and os.path.islink(f[0]):
+        return os.path.dirname(os.path.dirname(os.path.realpath(f[0])))
+    return os.path.realpath(seq_dir)
+
+
+def stable_hash(*parts):
+    # deterministic across runs, machines and Python versions (unlike hash())
+    return int.from_bytes(hashlib.blake2b("|".join(map(str, parts)).encode(), digest_size=8).digest(), "big")
+
+
 class PairDataset(torch.utils.data.Dataset):
     # skip: frames hidden between I0 and I1. gap (seconds) instead picks the skip per sequence from its own frame rate,
     # skip = max(0, round(gap * fps) - 1), so datasets at 28, 75 and 142 fps all give about the same gap in seconds.
     # gamma: frame gamma sent with every sample: this value if given, else the sequence's gamma.txt, else default_gamma
     # (None everywhere: no gamma in the batch, the model uses its own). ds: dataset id in the batch.
+    # Sequences that cannot give a sample are kept out and listed in self.excluded with the reason.
     def __init__(self, root, crop=256, skip=7, context=4, bins=16, min_events=2000, train=True, gap=None, gamma=None, ds=0,
                  name=None, default_gamma=None):
-        roots = root if isinstance(root, (list, tuple)) else [root]  # one folder or a list, searched recursively
-        self.seqs = [Sequence(os.path.dirname(p)) for r in roots
-                     for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
-        self.seqs = [s for s in self.seqs if len(s) >= 2]
+        roots = root if isinstance(root, (list, tuple)) else [root]  # folders searched recursively, or sequence folders
         self.name = name or ",".join(map(str, roots))
-        assert self.seqs, f"{self.name}: no sequences (frame_ts.npy) under {roots}"
-        small = [f"{os.path.basename(s.root)} {W}x{H}" for s in self.seqs for W, H in [s.size] if min(W, H) < crop]
+        self.excluded = []
+        seqs = []
+        for d in seq_dirs(roots):
+            s = Sequence(d)
+            if len(s) < 2:
+                self.excluded.append((os.path.basename(d), f"{len(s)} frame(s)"))
+            elif s.ev is None:
+                self.excluded.append((os.path.basename(d), "no event files (ev_t.npy ...)"))
+            else:
+                seqs.append(s)
+        assert seqs, f"{self.name}: no usable sequences under {roots}" + (f"; excluded: {self.excluded[:5]}" if self.excluded else "")
+        small = [f"{os.path.basename(s.root)} {W}x{H}" for s in seqs for W, H in [s.size] if min(W, H) < crop]
         assert not small, (f"{self.name}: frames smaller than data.crop={crop} cannot be batched with the other datasets: "
                            f"{', '.join(small[:5])}{' ...' if len(small) > 5 else ''}; lower data.crop")
-        self.skips = [max(0, round(gap * s.fps) - 1) if gap else skip for s in self.seqs]
+        skips = [max(0, round(gap * s.fps) - 1) if gap else skip for s in seqs]
+        self.seqs, self.skips = [], []
+        for s, sk in zip(seqs, skips):  # a sample needs its context frames on both sides
+            need = (2 * context - 1) * (sk + 1) + 1
+            if len(s) < need:
+                self.excluded.append((os.path.basename(s.root), f"too short: {len(s)} frames, a sample needs {need} "
+                                                                 f"(skip {sk}, context {context})"))
+            else:
+                self.seqs.append(s)
+                self.skips.append(sk)
+        assert self.seqs, f"{self.name}: no sequence long enough for one sample; excluded: {self.excluded[:5]}"
         self.index = [(k, i) for k, (s, sk) in enumerate(zip(self.seqs, self.skips))
                       for i in range((context - 1) * (sk + 1), len(s) - context * (sk + 1))]
+        self.eligible = len(self.index)
+        self.selection = dict(level="all", fraction=1.0, seed=None, eligible=self.eligible, selected=self.eligible,
+                              sequences=len(self.seqs))
         self.crop, self.context, self.bins, self.min_events, self.train = crop, context, bins, min_events, train
         self.gammas = [gamma if gamma is not None else s.gamma if s.gamma is not None else default_gamma for s in self.seqs]
         assert len({g is None for g in self.gammas}) == 1, f"{self.name}: set data gamma (some sequences have gamma.txt)"
         self.ds = ds
+
+    def select(self, fraction, seed=0, level="sample"):
+        # keep a deterministic fraction of the eligible samples. Every sample (or, at level "sequence", every sequence) gets
+        # a hash of (seed, dataset, sequence, frame); the ceil(fraction * N) lowest are kept. The same seed gives the same
+        # selection on any machine, and smaller fractions are subsets of larger ones (1% in 5% in 10% ...)
+        assert 0 < fraction <= 1, f"{self.name}: fraction {fraction} not in (0, 1]"
+        assert level in ("sample", "sequence"), level
+        name = lambda k: os.path.basename(self.seqs[k].root)
+        if fraction < 1:
+            if level == "sample":
+                h = np.array([stable_hash(seed, self.name, name(k), i) for k, i in self.index], dtype=np.uint64)
+                keep = np.sort(np.argsort(h, kind="stable")[:math.ceil(fraction * len(self.index))])
+                self.index = [self.index[j] for j in keep]
+            else:
+                ks = sorted(range(len(self.seqs)), key=lambda k: stable_hash(seed, self.name, name(k)))
+                use = set(ks[:math.ceil(fraction * len(ks))])
+                self.index = [(k, i) for k, i in self.index if k in use]
+        self.selection = dict(level=level, fraction=fraction, seed=seed, eligible=self.eligible, selected=len(self.index),
+                              sequences=len({k for k, _ in self.index}))
+        return self.selection
+
+    def sample_id(self, n):
+        # (sequence name, I0 frame index) of sample n
+        k, i = self.index[n]
+        return os.path.basename(self.seqs[k].root), i
 
     def summary(self):
         fps, sk = np.array([s.fps for s in self.seqs]), np.array(self.skips)
@@ -85,7 +152,7 @@ class PairDataset(torch.utils.data.Dataset):
         H, W = full[i].shape[1:]
         h, w = min(self.crop, H), min(self.crop, W)
 
-        for _ in range(10):
+        for tries in range(1, 11):
             if self.train:
                 y0, x0 = int(torch.randint(H - h + 1, ())), int(torch.randint(W - w + 1, ()))
             else:
@@ -93,6 +160,7 @@ class PairDataset(torch.utils.data.Dataset):
             m = (ev["x"] >= x0) & (ev["x"] < x0 + w) & (ev["y"] >= y0) & (ev["y"] < y0 + h)
             if m.sum() >= self.min_events or not self.train:
                 break
+        reached = bool(m.sum() >= self.min_events)
 
         flip = self.train and bool(torch.rand(()) < 0.5)
         # where this sample came from (dataloader_visualization.ipynb traces it back to the original files)
@@ -114,7 +182,10 @@ class PairDataset(torch.utils.data.Dataset):
                    ctx=torch.stack([cut(q) for q in ctx]), ctx_tau=torch.from_numpy((s.ts[ctx] - t0) / (t1 - t0)).float(),
                    dt=torch.tensor(t1 - t0, dtype=torch.float32), voxel=torch.from_numpy(voxel),
                    ev_pix=torch.from_numpy(pix), ev_tau=torch.from_numpy(tau), ev_pol=torch.from_numpy(pol),
-                   ds=torch.tensor(self.ds))
+                   ds=torch.tensor(self.ds),
+                   # bookkeeping, not model input: sample index n in this dataset, and the crop that was used
+                   # (y0, x0, flipped, tries, min_events reached)
+                   sid=torch.tensor(n), crop_info=torch.tensor([y0, x0, int(flip), tries, int(reached)]))
         if self.gammas[k] is not None:
             out["gamma"] = torch.tensor(float(self.gammas[k]))
         return out
@@ -139,6 +210,9 @@ def collate(items):
     return out
 
 
+DATA_KEYS = ("skip", "gap", "gamma", "min_events", "weight", "fraction", "select", "val", "val_frac")
+
+
 def data_sets(D, model_gamma=None):
     # the dataset list of the config: data.sets (one entry per dataset, any data.* key can be overridden per set), or
     # the single data.root / data.val_root of older configs
@@ -150,21 +224,58 @@ def data_sets(D, model_gamma=None):
         missing = sorted(set(use) - {s.get("name") for s in sets})
         assert not missing, f"data.use: no set named {missing}; sets: {[s.get('name') for s in sets]}"
         sets = [s for s in sets if s.get("name") in use]
-    keys = ("skip", "gap", "gamma", "min_events", "weight")
     base = dict(skip=D.get("skip", 4), gap=D.get("gap"), gamma=D.get("gamma"), min_events=D.get("min_events", 0), weight=1.0,
-                default_gamma=model_gamma)
+                fraction=D.get("fraction", 1.0), select=D.get("select", "sample"), val=D.get("val"),
+                val_frac=D.get("val_frac", 0.1), default_gamma=model_gamma)
     out = []
     for n, s in enumerate(sets):
-        o = dict(base, **{k: v for k, v in s.items() if k in keys or k in ("name", "root", "val_root")}, ds=n)
+        o = dict(base, **{k: v for k, v in s.items() if k in DATA_KEYS or k in ("name", "root", "val_root", "test_root", "raw")},
+                 ds=n)
         if "skip" in s and "gap" not in s:  # a skip given for this set beats the global gap
             o["gap"] = None
         o.setdefault("name", f"set{n}")
+        if o["val"] is None:  # official validation folder if the set has one, else held-out training recordings
+            o["val"] = "official" if o.get("val_root") else "carve"
         out.append(o)
     return out
 
 
-def make_dataset(D, s, train):
-    return PairDataset(s["root"] if train else s["val_root"], D["crop"], s["skip"], D["context"], D["bins"],
+def resolve_split(s, split_seed=0, min_recordings=4):
+    # sequence folders of train / val / test for one set. val = "official": the set's val_root; "carve": whole original
+    # recordings held out of train (ceil(val_frac * recordings), picked by a hash of split_seed and the recording, so the
+    # split does not move with the training seed); "none": no validation. The test folders are never changed.
+    train = seq_dirs(s["root"])
+    test = seq_dirs(s["test_root"]) if s.get("test_root") else []
+    val, note = [], ""
+    if s["val"] == "official":
+        val = seq_dirs(s["val_root"]) if s.get("val_root") else []
+        note = f"official validation folder {s.get('val_root')}"
+    elif s["val"] == "carve":
+        groups = {}
+        for d in train:
+            groups.setdefault(recording(d), []).append(d)
+        if len(groups) >= min_recordings:
+            order = sorted(groups, key=lambda g: stable_hash(split_seed, s["name"], os.path.basename(g)))
+            held = set(order[:max(1, math.ceil(s["val_frac"] * len(groups)))])
+            val = [d for g in held for d in groups[g]]
+            train = [d for d in train if recording(d) not in held]
+            note = (f"{len(held)} of {len(groups)} training recordings held out (val_frac {s['val_frac']}, "
+                    f"split seed {split_seed})")
+        else:
+            note = f"no validation: only {len(groups)} training recordings (< {min_recordings})"
+    elif s["val"] == "none":
+        note = "no validation (val: none)"
+    else:
+        raise ValueError(f"{s['name']}: val must be official, carve or none, not {s['val']}")
+    rec = lambda ds_: {recording(d) for d in ds_}
+    shared = sorted(os.path.basename(r) for r in rec(train) & rec(test))
+    return dict(train=train, val=sorted(val), test=test, val_note=note, train_test_shared_recordings=shared)
+
+
+def make_dataset(D, s, train, dirs=None):
+    # dirs: sequence folders (from resolve_split); default: the set's root (train) or val_root
+    root = dirs if dirs is not None else (s["root"] if train else s["val_root"])
+    return PairDataset(root, D["crop"], s["skip"], D["context"], D["bins"],
                        s["min_events"] if train else 0, train, gap=s["gap"], gamma=s["gamma"], ds=s["ds"],
                        name=s["name"] + ("" if train else " (val)"), default_gamma=s["default_gamma"])
 
@@ -172,8 +283,9 @@ def make_dataset(D, s, train):
 class MixSampler(torch.utils.data.Sampler):
     # samples a ConcatDataset of several datasets: first a dataset by its weight, then a sample uniformly inside it, so a
     # large dataset does not drown a small one. Works with DDP (each rank takes its own share of one shared draw).
+    # start: samples of this rank's share to skip in the current epoch (resume continues the same order)
     def __init__(self, sizes, weights, num_samples=None, rank=0, world=1, seed=0):
-        self.sizes, self.rank, self.world, self.seed, self.epoch = list(sizes), rank, world, seed, 0
+        self.sizes, self.rank, self.world, self.seed, self.epoch, self.start = list(sizes), rank, world, seed, 0, 0
         w = np.array([wt if n else 0.0 for wt, n in zip(weights, self.sizes)], dtype=np.float64)
         assert w.sum() > 0, "all datasets are empty or have weight 0"
         self.p = w / w.sum()
@@ -184,10 +296,10 @@ class MixSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
     def __len__(self):
-        return self.n
+        return self.n - self.start
 
     def __iter__(self):
         rng = np.random.default_rng((self.seed, self.epoch))
         which = rng.choice(len(self.sizes), self.n * self.world, p=self.p)
         idx = self.offsets[which] + (rng.random(len(which)) * np.array(self.sizes)[which]).astype(np.int64)
-        return iter(idx[self.rank::self.world].tolist())
+        return iter(idx[self.rank::self.world][self.start:].tolist())

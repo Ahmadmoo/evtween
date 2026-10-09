@@ -24,7 +24,7 @@ def ig_logs(x, k):
 SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # path time shifts (grid steps) averaged per pixel with the predicted uncertainty
 
 
-def event_nll(model, s, ev, dt, steps=128):
+def event_nll(model, s, ev, dt, steps=128, per=None, key="nll"):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
@@ -33,6 +33,7 @@ def event_nll(model, s, ev, dt, steps=128):
     # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown).
     # With an uncertainty map s["sig"] (gap units) the whole path of a pixel may be shifted in time by d ~ N(0, sig^2)
     # and the pixel's likelihood is averaged over shifts: a shift moves all its events together, threshold noise does not
+    # per: optional dict that receives the same NLL per sample, per[key] (B,); its mean is the returned value
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
@@ -103,23 +104,32 @@ def event_nll(model, s, ev, dt, steps=128):
         d = torch.tensor(shifts, device=tau.device, dtype=torch.float32) / steps
         logw = (-0.5 * (d[:, None] / s["sig"].flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
         lls = torch.logsumexp(logw + lls, 0, keepdim=True)
+    if per is not None:
+        per[key] = (-(lls[0].view(B, H * W).sum(1) - nu * H * W) / (H * W)).detach()
     return -(lls[0].sum() - (nu * H * W).sum()) / (B * H * W)
 
 
-def photo_loss(model, s, mid, mid_tau, mask=None):
+def photo_loss(model, s, mid, mid_tau, mask=None, per=None, key="photo"):
     # mask (B, M): which hidden frames are real (mixed datasets hide different numbers of frames; the rest is padding)
+    # per: optional dict that receives per-sample error sums and hidden-frame counts, per[key + "_sum"], per[key + "_cnt"]
+    # (a sample without hidden frames has count 0: no photometric term, not a zero error)
     if mid.shape[1] == 0:
+        if per is not None:
+            per[key + "_sum"] = per[key + "_cnt"] = mid.new_zeros(mid.shape[0])
         return mid.new_zeros(())
     g = s.get("gamma", model.gamma)
     err = torch.stack([(model.render(s, mid_tau[:, j])[0] - torch.log(luminance(mid[:, j], g) + model.eps)).abs().mean((1, 2, 3))
                        for j in range(mid.shape[1])], 1)
+    if per is not None:
+        m = torch.ones_like(err) if mask is None else mask.to(err.dtype)
+        per[key + "_sum"], per[key + "_cnt"] = (err * m).sum(1).detach(), m.sum(1)
     if mask is None:
         return err.mean()
     m = mask.to(err.dtype)
     return (err * m).sum() / m.sum().clamp(min=1)
 
 
-def cmax_loss(model, s, ev):
+def cmax_loss(model, s, ev, per=None):
     # contrast maximization: real events moved along the model's flow to tau=0 and tau=1 should stack into sharp edges
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
@@ -143,25 +153,36 @@ def cmax_loss(model, s, ev):
         return iwe.var(1) / (iwe.mean(1) ** 2 + 1e-6)
 
     base = contrast(x, y).detach() + 1e-6  # contrast of the unwarped events, sets the scale to ~1
-    return -sum((contrast(x + f[:, 0, 0, 0], y + f[:, 1, 0, 0]) / base).mean() for f in (F0, F1)) / 2
+    r = [contrast(x + f[:, 0, 0, 0], y + f[:, 1, 0, 0]) / base for f in (F0, F1)]
+    if per is not None:
+        per["cmax"] = (-sum(v.view(B, 2).mean(1) for v in r) / 2).detach()
+    return -sum(v.mean() for v in r) / 2
 
 
-def smooth_loss(s, img):
+def smooth_loss(s, img, per=None):
     # edge-aware first-order smoothness of the path coefficients
     x = torch.cat([s["a"].flatten(1, 2), s["b"].flatten(1, 2), s["d"]], 1)
     dx = lambda t: t[..., :, 1:] - t[..., :, :-1]
     dy = lambda t: t[..., 1:, :] - t[..., :-1, :]
     wx = torch.exp(-10 * dx(img).abs().mean(1, keepdim=True))
     wy = torch.exp(-10 * dy(img).abs().mean(1, keepdim=True))
-    return (dx(x).abs() * wx).mean() + (dy(x).abs() * wy).mean()
+    ex, ey = dx(x).abs() * wx, dy(x).abs() * wy
+    if per is not None:
+        per["smooth"] = (ex.mean((1, 2, 3)) + ey.mean((1, 2, 3))).detach()
+    return ex.mean() + ey.mean()
 
 
-def compute(model, batch, w, stage):
+def compute(model, batch, w, stage, per=None):
     # stage: probe | teacher | student | joint
+    # per: optional dict that receives per-sample values of the terms that are means over samples (for per-dataset logs);
+    # the returned loss and terms are the same with or without it. sigreg is a statistic of the whole batch: not per sample
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     if stage == "probe":
         target = torch.log1p(F.avg_pool2d(batch["voxel"], 16) * 256)
-        loss = F.mse_loss(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts"), target)
+        pred = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts")
+        loss = F.mse_loss(pred, target)
+        if per is not None:
+            per["probe"] = ((pred - target) ** 2).mean((1, 2, 3)).detach()
         return loss, dict(probe=loss)
 
     p = model.prepare(batch["i0"], batch["i1"], batch.get("gamma"))
@@ -169,16 +190,19 @@ def compute(model, batch, w, stage):
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
         s = model.decode(p, z)
-        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask")),
-                     cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], per),
+                     photo=photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask"), per),
+                     cmax=cmax_loss(model, s, ev, per), smooth=smooth_loss(s, batch["i0"], per),
                      sigreg=SIGREG.to(z.device)(z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"]))
+        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], per, "nll_student"))
+        if per is not None:
+            per["jepa"] = ((zh - zt) ** 2).mean((1, 2, 3)).detach()
         if stage == "student":
-            terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask"))
+            terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask"), per)
     weight = dict(w, nll_student=w["nll"])
     return sum(weight[k] * v for k, v in terms.items()), terms
 
