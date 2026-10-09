@@ -153,7 +153,8 @@ def summary(bag):
 
 
 def detect(raw, color):
-    # Bayer pattern of a mono image_raw: the one whose measured sites match image_color best (rank correlation: any gamma)
+    # Bayer pattern of a mono image_raw: the one whose measured sites match image_color best (rank correlation: any gamma);
+    # the right one is ~1 (measured values survive demosaicing), wrong ones stay ~0.9-0.98 on smooth real scenes
     rt = np.array([s + n * 1e-9 for s, n, _, _ in raw])
     pairs = [(raw[j][3][..., 0], rgb(enc, img, None)) for s, n, enc, img in color
              for j in [np.abs(rt - s - n * 1e-9).argmin()] if abs(rt[j] - s - n * 1e-9) < 2e-3]  # same frame: times within 2 ms
@@ -163,7 +164,7 @@ def detect(raw, color):
                                for r, c in pairs for q, ch in enumerate(p)])
     scores = {p: score(p) for p in ("rggb", "grbg", "gbrg", "bggr")} if pairs else {}
     top = sorted(scores.values())[-2:] if scores else [0, 0]
-    return max(scores, key=scores.get) if top[1] > 0.8 and top[1] - top[0] > 0.1 else None, scores  # unclear: image_color
+    return max(scores, key=scores.get) if top[1] > 0.98 and top[1] - top[0] > 0.01 else None, scores  # unclear: image_color
 
 
 def read(bag, every=20):
