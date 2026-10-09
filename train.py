@@ -70,7 +70,8 @@ OPTS = dict(exp=None, resume=False, force_resume=False, dry_run=False, allow_no_
 def run(cfg, **opts):
     # one training run (or, with dry_run, only the dataset and DataLoader reports) in the experiment folder opts["exp"]
     # (default: train.out). Returns "completed", "dry_run", "nonfinite" or "signal".
-    o = dict(OPTS, inspect_samples=cfg["train"].get("inspect_samples", 32), **opts)
+    o = dict(OPTS, inspect_samples=cfg["train"].get("inspect_samples", 32))
+    o.update(opts)
     D, T, stage = cfg["data"], cfg["train"], cfg["train"]["stage"]
     T.setdefault("val_every", T["save_every"])
     T.setdefault("keep", 2)
