@@ -2,7 +2,7 @@
 
   python run_training.py --stage teacher --fraction 0.1 --steps 5000 --exp runs/pilot
   torchrun --nproc_per_node 4 run_training.py --stage teacher --exp runs/teacher_full
-  python run_training.py --exp runs/teacher_full --resume
+  python run_training.py --exp runs/teacher_full --resume            (settings from runs/teacher_full/config.yaml)
   python run_training.py --final-test runs/teacher_full/checkpoints/best.pt
 
 Anything without a flag: --set section.key=value (same as train.py's dotted overrides)."""
@@ -34,7 +34,7 @@ def pairs(items, conv, what):
 
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--config", default="config.yaml")
+ap.add_argument("--config", default=None, help="default: config.yaml; with --resume: the experiment's own config.yaml")
 ap.add_argument("--exp", help="experiment folder (must not exist, unless --resume)")
 ap.add_argument("--resume", action="store_true", help="continue --exp from its checkpoints/last.pt")
 ap.add_argument("--force-resume", action="store_true", help="resume even if settings differ from the checkpoint")
@@ -69,13 +69,17 @@ a = ap.parse_args()
 import train  # noqa: E402  (after argparse: --help works without torch)
 
 if a.final_test:
-    cfg = yaml.safe_load(open(a.config))
+    cfg = yaml.safe_load(open(a.config or "config.yaml"))
     out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(a.final_test))),
                        "test_" + os.path.splitext(os.path.basename(a.final_test))[0])
     train.final_test(a.final_test, out, a.test_samples, workers=a.workers or 4)
     sys.exit(0)
 
-cfg = train.load_cfg([a.config] + a.set)
+saved = os.path.join(a.exp or "", "config.yaml")
+if a.config is None and a.resume and a.exp and os.path.exists(saved):
+    a.config = saved  # resume: the run's own settings; flags given now are applied on top (and checked)
+    print(f"resume: settings from {saved}")
+cfg = train.load_cfg([a.config or "config.yaml"] + a.set)
 D, T = cfg["data"], cfg["train"]
 if a.stage:
     T["stage"] = a.stage

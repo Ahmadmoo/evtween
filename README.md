@@ -155,8 +155,8 @@ python run_training.py --stage teacher --fraction 10% --dataset-fraction eds=25%
 # full data, then the student from the teacher's best checkpoint
 python run_training.py --stage teacher --steps 200000 --exp runs/teacher_full
 python run_training.py --stage student --init runs/teacher_full/checkpoints/best.pt --exp runs/student_full
-# continue an interrupted run (refused if learning settings or the data selection changed; --force-resume to accept)
-python run_training.py --exp runs/teacher_full --stage teacher --steps 200000 --resume
+# continue an interrupted run with its own saved settings (refused if learning settings or the data selection changed)
+python run_training.py --exp runs/teacher_full --resume
 # held-out test split, once, on request (never used during training)
 python run_training.py --final-test runs/teacher_full/checkpoints/best.pt
 # Slurm (Rails): submits, saves before the time limit, requeues and resumes by itself
@@ -179,6 +179,8 @@ sbatch scripts/train.sbatch runs/teacher_full --stage teacher --steps 200000
 Experiment folder: `config.yaml`, `dataset_report.json`, `train_metrics.csv`, `val_metrics.csv`, `training.log`,
 `checkpoints/`, `summary.json`, `env_*.json` (host, GPUs, versions, Slurm job, git commit / branch / status) and
 `git_diff_*.patch` if the code had uncommitted changes. `notebooks/inspect_training.ipynb` plots them (no training).
+
+Check a finished (or running) experiment: `python scripts/check_run.py runs/<exp> --full-steps 200000` prints PASS / WARN / FAIL for files, finite losses, per-dataset losses and sampling shares, validation rows, checkpoint contents, memory and the projected GPU time.
 
 Monitor on Rails: `squeue -u $USER`, `tail -f runs/<exp>/training.log`, `sacct -j <job> -o JobID,State,Elapsed,ExitCode`,
 `nvidia-smi` on the node (`srun --jobid <job> --pty nvidia-smi`).
