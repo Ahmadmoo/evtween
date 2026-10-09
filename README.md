@@ -58,6 +58,7 @@ TEST
 | `CED/ced.py` | Same for CED (ROS1 bags, read without ROS; zips of bags accepted) |
 | `EDS/eds.py` | Same for EDS (per-sequence archives); aligns the RGB frames to the event camera |
 | `toy_data.py` | Synthetic dataset for smoke tests |
+| `dataloader_visualization.ipynb` | Per dataset, chosen loader samples next to the original files (frames, events, timing) with exact checks; needs `jupyter` and `matplotlib` |
 | `config.yaml` | All settings |
 
 ### Code used as-is from other projects

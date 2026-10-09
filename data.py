@@ -95,6 +95,8 @@ class PairDataset(torch.utils.data.Dataset):
                 break
 
         flip = self.train and bool(torch.rand(()) < 0.5)
+        # where this sample came from (dataloader_visualization.ipynb traces it back to the original files)
+        self.last = dict(seq=s.root, i=i, j=j, ctx=ctx, t0=t0, t1=t1, y0=y0, x0=x0, h=h, w=w, flip=flip, skip=skip)
         x = ev["x"][m].astype(np.int64) - x0
         x = w - 1 - x if flip else x
         pix = (ev["y"][m].astype(np.int64) - y0) * w + x
