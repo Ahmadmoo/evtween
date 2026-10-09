@@ -219,6 +219,7 @@ def run(cfg, **opts):
         return {k: v / max(n, 1) for k, v in sums.items()}
 
     def checkpoint_obj():
+        prog["step"] = step  # the loop counts in the local step
         return dict(model=model.state(), opt=opt.state_dict(), cfg=cfg, progress=dict(prog), names=names,
                     selection={p.name: p.selection for p in parts})
 
@@ -287,6 +288,7 @@ def run(cfg, **opts):
                 break
             opt.step()
             step += 1
+            prog["step"] = step
             prog["in_epoch"] += 1
             prog["samples"] += T["batch"] * world
 
@@ -390,6 +392,7 @@ def run(cfg, **opts):
             prog["epoch"] += 1
             prog["in_epoch"] = 0
     status = status or "completed"
+    prog["step"] = step
 
     if rank == 0:
         obs = np.array(prog["seen"], float) / max(1, sum(prog["seen"]))

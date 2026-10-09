@@ -291,11 +291,13 @@ def rng_state():
 
 
 def set_rng_state(st):
+    # generator states must be CPU byte tensors (a checkpoint loaded with map_location="cuda" moves them to the GPU)
+    cpu = lambda t: t.detach().to("cpu", torch.uint8) if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.uint8)
     random.setstate(st["python"])
     np.random.set_state(st["numpy"])
-    torch.set_rng_state(st["torch"])
+    torch.set_rng_state(cpu(st["torch"]))
     if st.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(st["cuda"])
+        torch.cuda.set_rng_state(cpu(st["cuda"]))
 
 
 def save(path, obj):
