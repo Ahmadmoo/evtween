@@ -4,14 +4,20 @@ import numpy as np
 import torch
 from PIL import Image
 
+RGB = {"r": 0, "g": 1, "b": 2}
+
 
 class Sequence:
-    # one recording: frames/*.png, frame_ts.npy (s), and optional ev_t/x/y/p.npy sorted by time
+    # one recording: frames/*.png, frame_ts.npy (s), optional ev_t/x/y/p.npy sorted by time,
+    # optional bayer.txt: color filter of the event pixels (colors of the top-left 2x2 block in reading order, e.g. rggb)
     def __init__(self, root):
+        self.root = root
         self.files = sorted(glob.glob(os.path.join(root, "frames", "*.png")))
         self.ts = np.load(os.path.join(root, "frame_ts.npy")).astype(np.float64)
         has_ev = os.path.exists(os.path.join(root, "ev_t.npy"))
         self.ev = {k: np.load(os.path.join(root, f"ev_{k}.npy"), mmap_mode="r") for k in "txyp"} if has_ev else None
+        bayer = os.path.join(root, "bayer.txt")
+        self.cfa = open(bayer).read().strip().lower() if os.path.exists(bayer) else None
 
     def __len__(self):
         return len(self.files)
@@ -25,14 +31,23 @@ class Sequence:
         return {k: np.asarray(v[a:b]) for k, v in self.ev.items()}
 
 
+def cfa_block(pattern, y0, x0, w, flip):
+    # color filter of the crop pixels with row / column parity (i, j): 0 r, 1 g, 2 b; all -1: no filter (pixels see all colors)
+    if not pattern:
+        return torch.full((2, 2), -1, dtype=torch.long)
+    col = lambda j: (x0 + (w - 1 - j if flip else j)) % 2
+    return torch.tensor([[RGB[pattern[(y0 + i) % 2 * 2 + col(j)]] for j in (0, 1)] for i in (0, 1)])
+
+
 class PairDataset(torch.utils.data.Dataset):
-    def __init__(self, root, crop=256, skip=7, context=4, bins=16, min_events=2000, train=True):
+    def __init__(self, root, crop=256, skip=7, context=4, bins=16, min_events=2000, train=True, ds=0):
         roots = root if isinstance(root, list) else [root]  # one folder or a list, searched recursively
         self.seqs = [Sequence(os.path.dirname(p)) for r in roots
                      for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
         g = skip + 1
         self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)]
         self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, skip, context, bins, min_events, train
+        self.ds = ds  # dataset id carried by every sample (joint training: position in data.sets)
 
     def __len__(self):
         return len(self.index)
@@ -76,7 +91,47 @@ class PairDataset(torch.utils.data.Dataset):
                     mid_tau=torch.from_numpy((s.ts[i + 1:j] - t0) / (t1 - t0)).float(),
                     ctx=torch.stack([cut(q) for q in ctx]), ctx_tau=torch.from_numpy((s.ts[ctx] - t0) / (t1 - t0)).float(),
                     dt=torch.tensor(t1 - t0, dtype=torch.float32), voxel=torch.from_numpy(voxel),
+                    ds=torch.tensor(self.ds), cfa=cfa_block(s.cfa, y0, x0, w, flip),
+                    where=torch.tensor([k, i, y0, x0, flip]),  # sequence, I0 frame, crop corner, flip: to find a sample again
                     ev_pix=torch.from_numpy(pix), ev_tau=torch.from_numpy(tau), ev_pol=torch.from_numpy(pol))
+
+
+def datasets(D, split, train):
+    # one PairDataset per entry of data.sets (name: root holding train/ val/ test/, skip, weight); "val" falls back to "test".
+    # the dataset id is the position in data.sets, also for entries set to null (left out, ids of the others unchanged)
+    out = {}
+    for d, (name, s) in enumerate(D["sets"].items()):
+        if not s:
+            continue
+        root = os.path.join(s["root"], split)
+        root = os.path.join(s["root"], "test") if split == "val" and not os.path.isdir(root) else root
+        out[name] = PairDataset(root, D["crop"], s["skip"], D["context"], D["bins"], D["min_events"] if train else 0, train, d)
+    return out
+
+
+class JointDataset(torch.utils.data.Dataset):
+    # several PairDatasets; an item is a (dataset, sample) pair chosen by JointBatches
+    def __init__(self, sets):
+        self.sets = sets
+
+    def __len__(self):
+        return sum(map(len, self.sets))
+
+    def __getitem__(self, key):
+        return self.sets[key[0]][key[1]]
+
+
+class JointBatches(torch.utils.data.Sampler):
+    # endless batches, each from one dataset (same skip: same number of hidden frames); dataset d with probability ~ weight[d]
+    def __init__(self, sizes, weights, batch, seed=0):
+        w = np.array([wt if n > 0 else 0.0 for wt, n in zip(weights, sizes)], dtype=np.float64)
+        self.sizes, self.batch, self.seed, self.p = sizes, batch, seed, w / w.sum()
+
+    def __iter__(self):
+        g = np.random.default_rng(self.seed)
+        while True:
+            d = int(g.choice(len(self.p), p=self.p))
+            yield [(d, int(n)) for n in g.choice(self.sizes[d], self.batch, replace=self.sizes[d] < self.batch)]
 
 
 def collate(items):

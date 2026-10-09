@@ -1,25 +1,35 @@
 import argparse
 import glob
+import json
 import os
+import re
+import shutil
+import tarfile
+import zipfile
 import h5py
 import numpy as np
 from PIL import Image
 
-# EDS (Event-aided Direct Sparse Odometry, CVPR'22): beam splitter, Prophesee Gen3 640x480 + RGB camera.
-# Archive layout per sequence: events.h5, images/frame_*.png, images_timestamps.txt, times.txt, imu.csv, stamped_groundtruth.txt.
-# No official split: every 4th sequence (02, 06, 10, 14) is test. Time units and h5 key names are found from the files.
-# RGB frames are 640x480 like the events; check.py tells whether they are pixel-aligned and whether --mid-exposure helps.
+# EDS (Event-aided Direct Sparse Odometry, CVPR'22): beam splitter, Prophesee Gen3 640x480 events + 640x480 RGB at 75 Hz
+# (exposure ~10 ms). Input: the per-sequence "Archive file" downloads (or the folders they were extracted to):
+# <seq>/events.h5 (x, y, t in us, p), images/frame_*.png, images_timestamps.txt (us), times.txt (id, timestamp [s],
+# exposure [ms], gain, file), imu.csv, stamped_groundtruth.txt. Archives are unpacked one at a time to --work and removed.
+# Calibration recordings are skipped. No official split: sequences 02, 06, 10, 14 (every 4th) are test.
+URL = "https://rpg.ifi.uzh.ch/eds.html"
+ARCHIVE = r"\.(zip|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$"
 SCALES = (1.0, 1e-3, 1e-6, 1e-9)
+STEP = 50_000_000  # events copied at a time (a sequence holds up to ~1e9)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ap = argparse.ArgumentParser(description="EDS sequences (folders in this directory) -> evtween layout: <out>/{train,test}/<sequence>/")
+ap = argparse.ArgumentParser(description="EDS archives or extracted folders -> <out>/{train,test}/<sequence>/")
+ap.add_argument("--src", nargs="+", default=sorted(glob.glob(os.path.join(HERE, "*"))), help="archives and/or folders")
 ap.add_argument("--out", default="data/eds")
-ap.add_argument("--raw", default=HERE, help="folder holding the sequence folders (00_peanuts_dark, ...)")
-ap.add_argument("--copy", action="store_true", help="copy PNG frames instead of symlinking them")
-ap.add_argument("--dry", action="store_true", help="only print the h5 layout, timestamp files, image size and time spans")
-ap.add_argument("--offset-ms", type=float, default=0.0, help="added to frame times (after check.py)")
+ap.add_argument("--work", default=None, help="archives are unpacked one at a time into <work>/.tmp (default work: <out>)")
 ap.add_argument("--mid-exposure", action="store_true", help="frame time = stamp + half the exposure in times.txt (stamp = exposure start)")
+ap.add_argument("--offset-ms", type=float, default=0.0, help="added to frame times")
+ap.add_argument("--dry", action="store_true", help="only list the sequences and their split")
 a = ap.parse_args()
+work = os.path.join(a.work or a.out, ".tmp")  # only this subfolder is created and removed
 
 
 def columns(f):
@@ -27,16 +37,8 @@ def columns(f):
     found = {}
     f.visititems(lambda n, o: None if not isinstance(o, h5py.Dataset) else found.setdefault(n.rsplit("/", 1)[-1], o) and None)
     pick = lambda *names: next(found[n] for n in names if n in found)
-    off = found["t_offset"][()] if "t_offset" in found else 0
+    off = np.int64(found["t_offset"][()]) if "t_offset" in found else np.int64(0)
     return pick("x"), pick("y"), pick("t", "ts", "timestamp", "timestamps"), pick("p", "polarity", "polarities"), off
-
-
-def frame_times(seq):
-    t = np.loadtxt(os.path.join(seq, "images_timestamps.txt"), comments="#", ndmin=2)[:, -1].astype(np.float64)
-    ts = t * next(s for s in SCALES if 5e-4 <= np.median(np.diff(t)) * s <= 1.0) + a.offset_ms * 1e-3
-    if a.mid_exposure:  # times.txt: id, timestamp [s], exposure [ms], gain [dB], filename
-        ts = ts + np.loadtxt(os.path.join(seq, "times.txt"), comments="#", usecols=2, ndmin=1)[:len(ts)] * 0.5e-3
-    return ts, t
 
 
 def first(t, v):
@@ -48,28 +50,15 @@ def first(t, v):
     return lo
 
 
-seqs = sorted(d for d in glob.glob(os.path.join(a.raw, "*")) if os.path.exists(os.path.join(d, "events.h5")))
-test = set(seqs[2::4])
-print(f"{len(seqs)} sequences, {len(test)} test: {[os.path.basename(s) for s in sorted(test)]}")
-for seq in seqs:
-    name, imgs = os.path.basename(seq), sorted(glob.glob(os.path.join(seq, "images", "*.png")))
-    ts, ts_raw = frame_times(seq)
+def convert(seq, dst, move):
+    imgs = sorted(glob.glob(os.path.join(seq, "images", "*.png")))
+    t_img = np.loadtxt(os.path.join(seq, "images_timestamps.txt"), comments="#", ndmin=2)[:, -1].astype(np.float64)
+    ts = t_img * next(s for s in SCALES if 5e-4 <= np.median(np.diff(t_img)) * s <= 1.0) + a.offset_ms * 1e-3
+    if a.mid_exposure:
+        ts = ts + np.loadtxt(os.path.join(seq, "times.txt"), comments="#", usecols=2, ndmin=1)[:len(ts)] * 0.5e-3
+    os.makedirs(os.path.join(dst, "frames"))
     with h5py.File(os.path.join(seq, "events.h5"), "r") as f:
-        if a.dry:
-            print(f"{name}:")
-            f.visititems(lambda n, o: print(f"  h5 {n}: {getattr(o, 'shape', '')} {getattr(o, 'dtype', '')}"
-                                            + (f" attrs {dict(o.attrs)}" if len(o.attrs) else "")))
         x, y, t, p, off = columns(f)
-        if a.dry:
-            for txt in ("images_timestamps.txt", "times.txt"):
-                lines = open(os.path.join(seq, txt)).read().splitlines()
-                print(f"  {txt}: {len(lines)} lines, first: {lines[:3]}")
-            im = Image.open(imgs[0])
-            print(f"  images: {len(imgs)} x {im.size[0]}x{im.size[1]} {im.mode}, timestamps {ts_raw[0]:.0f} .. {ts_raw[-1]:.0f} "
-                  f"-> {ts[-1] - ts[0]:.1f} s @ {1 / np.median(np.diff(ts)):.1f} fps")
-            print(f"  events: {len(t)}, t {t[0] + off} .. {t[-1] + off}, x max {x[:1000000].max()}, y max {y[:1000000].max()}, "
-                  f"p values {np.unique(p[:1000000])}")
-            continue
         sample = t[::max(1, len(t) // 1000)].astype(np.float64) + off
         se = min(SCALES, key=lambda s: abs(np.log((np.median(sample) * s + 1e-12) / np.median(ts))))  # event unit -> seconds
         n = min(len(imgs), len(ts))
@@ -77,26 +66,69 @@ for seq in seqs:
         fr, ts = [imgs[i] for i in np.flatnonzero(keep)], ts[:n][keep]
         base = int(round(ts[0] / se)) - off  # first kept frame in raw event units: times stay exact integers until here
         lo, hi = first(t, base), first(t, int(np.ceil(ts[-1] / se)) - off)
-        dst = os.path.join(a.out, "test" if seq in test else "train", name)
-        os.makedirs(os.path.join(dst, "frames"), exist_ok=True)
         np.save(os.path.join(dst, "frame_ts.npy"), ts - ts[0])
         out = {k: np.lib.format.open_memmap(os.path.join(dst, f"ev_{k}.npy"), "w+", dt, (hi - lo,))
-               for k, dt in (("t", np.float64), ("x", np.int16), ("y", np.int16), ("p", np.int8))}
-        for i in range(lo, hi, 50_000_000):  # 50M events at a time
-            j, o = min(i + 50_000_000, hi), slice(i - lo, min(i + 50_000_000, hi) - lo)
+               for k, dt in zip("txyp", (np.float64, np.int16, np.int16, np.int8))}
+        for i in range(lo, hi, STEP):
+            j, o = min(i + STEP, hi), slice(i - lo, min(i + STEP, hi) - lo)
             out["t"][o] = (t[i:j] - base) * se
             out["x"][o], out["y"][o] = x[i:j], y[i:j]
             out["p"][o] = np.where(p[i:j] > 0, 1, -1)
-        for m in out.values():
-            m.flush()
+        for v in out.values():
+            v.flush()
         del out
-        gap = (t[lo] - base) * se * 1e3
     for k, src in enumerate(fr):
-        out = os.path.join(dst, "frames", f"{k:06d}.png")
-        if a.copy:
-            Image.open(src).convert("RGB").save(out)
+        target = os.path.join(dst, "frames", f"{k:06d}.png")
+        if move:
+            os.replace(src, target)
         else:
-            os.path.lexists(out) or os.symlink(os.path.abspath(src), out)
-    W, H = Image.open(fr[0]).size
+            try:
+                os.link(os.path.realpath(src), target)
+            except OSError:
+                shutil.copy(src, target)
+    open(os.path.join(dst, "done"), "w").close()
+    W, H = Image.open(os.path.join(dst, "frames", "000000.png")).size
     print(f"  -> {dst}: {len(fr)}/{n} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {hi - lo} events, "
-          f"event time unit {se:g} s, first event {gap:.2f} ms after the first frame")
+          f"event time unit {se:g} s", flush=True)
+
+
+items = {}  # sequence name -> archive or folder (first one found wins)
+for path in a.src:
+    if os.path.isdir(path):
+        for h in sorted(glob.glob(os.path.join(path, "**", "events.h5"), recursive=True)):
+            items.setdefault(os.path.basename(os.path.dirname(h)), os.path.dirname(h))
+    elif re.search(ARCHIVE, path):
+        items.setdefault(re.sub(ARCHIVE, "", os.path.basename(path)), path)
+os.makedirs(a.out, exist_ok=True)
+json.dump(dict(name="EDS", paper="Event-aided Direct Sparse Odometry (CVPR 2022)", url=URL,
+               events="Prophesee Gen3 640x480, beam splitter", frames="RGB 640x480, 75 Hz, ~10 ms exposure", cfa=None,
+               frame_time="stamp + half exposure" if a.mid_exposure else "stamp as released",
+               splits="every 4th sequence (02, 06, 10, 14) is test", converter="EDS/eds.py"),
+          open(os.path.join(a.out, "info.json"), "w"), indent=1)
+for name, path in sorted(items.items()):
+    if re.search("calib|hand_eye", name):
+        continue
+    split = "test" if name[:2].isdigit() and int(name[:2]) % 4 == 2 else "train"
+    dst = os.path.join(a.out, split, name)
+    if os.path.exists(os.path.join(dst, "done")):
+        continue
+    if a.dry:
+        print(f"  {split}: {name} ({'archive' if os.path.isfile(path) else 'folder'})")
+        continue
+    shutil.rmtree(dst, ignore_errors=True)
+    tmp, move = os.path.join(work, name), os.path.isfile(path)  # frames are moved only out of our own unpacked copy
+    try:
+        if move:
+            shutil.rmtree(tmp, ignore_errors=True)
+            print(f"{name}: unpacking {os.path.basename(path)}", flush=True)
+            if zipfile.is_zipfile(path):
+                zipfile.ZipFile(path).extractall(tmp)
+            else:
+                with tarfile.open(path) as tf:
+                    tf.extractall(tmp, filter="data")
+            path = os.path.dirname(glob.glob(os.path.join(tmp, "**", "events.h5"), recursive=True)[0])
+        convert(path, dst, move)
+    except Exception as e:
+        print(f"  ! {dst}: failed ({type(e).__name__}: {e})", flush=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+shutil.rmtree(work, ignore_errors=True)

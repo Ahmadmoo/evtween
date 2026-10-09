@@ -3,6 +3,7 @@ torchvision>=0.17
 numpy
 pyyaml
 pillow
+h5py
 timm
 einops
 transformers

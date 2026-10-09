@@ -7,8 +7,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from data import PairDataset, collate
+from torch.utils.data import DataLoader, Subset
+from data import JointBatches, JointDataset, collate, datasets
 from losses import compute, diagnostics
 from model import build_model
 
@@ -82,16 +82,20 @@ if os.path.exists(ckpt):
 net = Step(model, cfg["loss"], stage)
 net = DDP(net, device_ids=[torch.cuda.current_device()] if cuda else None) if ddp else net
 
-make = lambda root, train: PairDataset(root, D["crop"], D["skip"], D["context"], D["bins"], D["min_events"] if train else 0, train)
-data = make(D["root"], True)
-sampler = DistributedSampler(data) if ddp else None
-loader = DataLoader(data, T["batch"], shuffle=sampler is None, sampler=sampler, num_workers=D["workers"], collate_fn=collate,
-                    pin_memory=True, drop_last=True, persistent_workers=D["workers"] > 0)
-val = None
-if D.get("val_root") and rank == 0:
-    vd = make(D["val_root"], False)  # fixed samples spread over all val sequences
-    vd = torch.utils.data.Subset(vd, torch.linspace(0, len(vd) - 1, T["val_batches"] * T["batch"]).long().tolist())
-    val = DataLoader(vd, T["batch"], num_workers=D["workers"], collate_fn=collate)
+sets = datasets(D, "train", True)  # one per entry of data.sets; every batch comes from one of them
+data = JointDataset(list(sets.values()))
+batches = JointBatches([len(d) for d in data.sets], [D["sets"][name].get("weight", 1.0) for name in sets], T["batch"],
+                       T["seed"] + 1000 * rank + step)  # each rank its own stream, a new one after a resume
+loader = DataLoader(data, batch_sampler=batches, num_workers=D["workers"], collate_fn=collate, pin_memory=True,
+                    persistent_workers=D["workers"] > 0)
+vals = {}
+if rank == 0:
+    for (name, d), share in zip(sets.items(), batches.p):
+        print(f"data {name}: {len(d.seqs)} sequences, {len(d)} samples, skip {d.skip}, {100 * share:.0f}% of batches", flush=True)
+    for name, vd in datasets(D, "val", False).items():  # fixed samples spread over all val (or test) sequences
+        if len(vd):
+            vals[name] = DataLoader(Subset(vd, torch.linspace(0, len(vd) - 1, T["val_batches"] * T["batch"]).long().tolist()),
+                                    T["batch"], num_workers=D["workers"], collate_fn=collate)
 
 
 def lr_at(step):
@@ -102,12 +106,10 @@ def lr_at(step):
 
 
 @torch.no_grad()
-def validate():
+def validate(val):
     model.eval()
     sums, n = {}, 0
-    for b, batch in enumerate(val):
-        if b == T["val_batches"]:
-            break
+    for batch in val:
         batch = {k: v.to(dev) for k, v in batch.items()}
         if stage == "probe":
             out = dict(probe=compute(model, batch, cfg["loss"], stage)[0].item())
@@ -123,9 +125,7 @@ os.makedirs(T["out"], exist_ok=True)
 model.train()
 tic = time.time()
 while step < T["steps"]:
-    if sampler is not None:
-        sampler.set_epoch(step)
-    for batch in loader:
+    for batch in loader:  # endless
         batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
@@ -138,12 +138,12 @@ while step < T["steps"]:
 
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
-            print(f"[{stage}] step {step} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
+            print(f"[{stage}] step {step} {list(D['sets'])[int(batch['ds'][0])]} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
                   f"k {model.log_k.exp().item():.2f} nu {model.log_nu.exp().item():.2f} R {model.R.item() * 1e6:.0f}us gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
             torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
-            if val is not None:
-                print("val " + " ".join(f"{k} {v:.4f}" for k, v in validate().items()), flush=True)
+            for name, val in vals.items():
+                print(f"val {name} " + " ".join(f"{k} {v:.4f}" for k, v in validate(val).items()), flush=True)
         if step >= T["steps"]:
             break
 
