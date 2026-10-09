@@ -252,8 +252,11 @@ def score(counts, grads, shift=(0, 0)):
 
 # ---------------------------------------------------------------- main
 cal = yaml.safe_load(open(a.calib)) if a.calib else yaml.safe_load(CALIB)
+is_event_file = lambda f: os.path.basename(f).lower().startswith("events") and f.lower().endswith((".h5", ".hdf5", ".txt", ".txt.gz"))
+extracted = any(is_event_file(f) for f in glob.glob(os.path.join(a.raw, "**", "events*"), recursive=True))
 archives = []
-for p in a.archive if a.archive is not None else [HERE]:
+# without --archive, archives in this folder are used only while --raw holds no extracted sequences yet
+for p in a.archive if a.archive is not None else ([] if extracted else [HERE]):
     if os.path.isdir(p):
         archives += sorted(f for f in glob.glob(os.path.join(p, "*")) if f.lower().endswith(ARCH))
     elif os.path.isfile(p):
@@ -262,20 +265,25 @@ for p in a.archive if a.archive is not None else [HERE]:
         raise FileNotFoundError(p)
 for z in archives:
     dst = os.path.join(a.raw, stem(z))
-    if not os.path.isdir(dst):
+    if os.path.isdir(dst):
+        continue
+    if a.dry:  # --dry never writes anything
+        print(f"would extract {z} -> {dst}")
+    else:
         extract(z, dst)
-for z in sorted(glob.glob(os.path.join(a.raw, "**", "*"), recursive=True)):  # archives inside archives (e.g. images.zip)
-    if z.lower().endswith(ARCH) and not os.path.isdir(os.path.join(os.path.dirname(z), stem(z))):
-        extract(z, os.path.join(os.path.dirname(z), stem(z)))
+if not extracted and not a.dry:  # archives inside the freshly extracted ones (e.g. images.zip)
+    for z in sorted(glob.glob(os.path.join(a.raw, "**", "*"), recursive=True)):
+        if z.lower().endswith(ARCH) and not os.path.isdir(os.path.join(os.path.dirname(z), stem(z))):
+            extract(z, os.path.join(os.path.dirname(z), stem(z)))
 
 # a sequence = the folder holding an event file (its images may sit in a subfolder)
 evfiles = [f for f in glob.glob(os.path.join(a.raw, "**", "*"), recursive=True)
            if os.path.basename(f).lower().startswith("events") and f.lower().endswith((".h5", ".hdf5", ".txt", ".txt.gz"))]
 seqs = sorted({os.path.dirname(f) for f in evfiles}, key=natural)
+test = set([os.path.basename(s) for s in seqs][2::a.test_every])  # split from all sequences, so --only does not change it
 seqs = [s for s in seqs if not a.only or any(o in os.path.basename(s) for o in a.only)]
 print(f"{len(seqs)} sequences in {a.raw}")
 names = [os.path.basename(s) for s in seqs]
-test = set(names[2::a.test_every])
 
 for seq, name in zip(seqs, names):
     try:
