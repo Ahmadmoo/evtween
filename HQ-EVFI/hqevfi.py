@@ -20,6 +20,7 @@ SCALES = (1.0, 1e-3, 1e-6, 1e-9)
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser(description="HQ-EVFI zip (put in this folder) -> evtween layout: <out>/{train,test}/<sequence>/")
 ap.add_argument("--out", default="data/hqevfi")
+ap.add_argument("--archive", default=None, help="the HQ-EVFI zip (default: the zip in this folder)")
 ap.add_argument("--raw", default=os.path.join(HERE, "raw"), help="where the zip is extracted (skipped if it exists)")
 ap.add_argument("--lists", default=LISTS, help="TimeLens-XL dataset_dict.py (url or local path)")
 ap.add_argument("--copy", action="store_true", help="copy PNG frames instead of symlinking them")
@@ -35,8 +36,8 @@ def extract(z, dst):
 
 
 if not os.path.isdir(raw):
-    zips = glob.glob(os.path.join(HERE, "*.zip"))
-    assert zips, f"put the HQ-EVFI zip (https://drive.google.com/file/d/{DRIVE_ID}) in {HERE}"
+    zips = [a.archive] if a.archive else glob.glob(os.path.join(HERE, "*.zip"))
+    assert zips and os.path.isfile(zips[0]), f"pass --archive or put the HQ-EVFI zip (https://drive.google.com/file/d/{DRIVE_ID}) in {HERE}"
     extract(zips[0], raw)
 for z in sorted(glob.glob(os.path.join(raw, "**", "*.zip"), recursive=True)):  # the release holds one zip per sequence
     dst = z[:-4]

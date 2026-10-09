@@ -6,4 +6,6 @@ pillow
 timm
 einops
 transformers
+h5py          # EDS events.h5
+hdf5plugin    # EDS events.h5 (blosc)
 lejepa @ git+https://github.com/rbalestr-lab/lejepa

@@ -50,10 +50,13 @@ TEST
 | `model.py` | Backbones, teacher, student, gated decoder, flows, `render(s, τ) → L, dL/dτ` |
 | `losses.py` | Likelihood, photometric, contrast max, SIGReg, stage logic, validation diagnostics |
 | `physics.py` | Quadratic root solver and event `Simulator` |
-| `data.py` | Sequence reader, training samples, collate |
+| `data.py` | Sequence reader, training samples, collate, dataset list (`data.sets`) and the weighted mixing sampler |
 | `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
 | `generate.py` | RGB video → events `.npz` (student path) |
 | `HQ-EVFI/hqevfi.py` | Extracts the HQ-EVFI zip and converts it to the training layout |
+| `BS-ERGB/bsergb.py` | Same for BS-ERGB (zip or extracted folders) |
+| `CED/ced.py` | Same for CED (ROS1 bags, read without ROS; zips of bags accepted) |
+| `EDS/eds.py` | Same for EDS (per-sequence archives); aligns the RGB frames to the event camera |
 | `toy_data.py` | Synthetic dataset for smoke tests |
 | `config.yaml` | All settings |
 
@@ -78,17 +81,23 @@ pip install -r requirements.txt
 
 ## 4. Data
 
-**HQ-EVFI** (TimeLens-XL, ECCV'24): beam splitter with checkerboard calibration (pixel-aligned RGB and events), Prophesee EVK4-HD, 142 fps RGB, 71 sequences.
-High-fps RGB gives the hidden frames; pixel alignment is needed by the per-pixel likelihood.
+Four datasets, each converted once to the same layout, then mixed in training (`data.sets` in `config.yaml`).
+Every converter takes the downloaded archive directly (`--archive`), extracts it once to `--raw`, and writes
+`data/<name>/{train,test}/<sequence>/`. **Check the printed fps and event counts.**
 
-1. Download the zip from [Google Drive](https://drive.google.com/file/d/104ZMJ-M_frImOOCGfLk_HDb2FV1trveT) and put it in `HQ-EVFI/`.
-2. Run:
+| Dataset | Sensors | RGB | Split | Command |
+|---|---|---|---|---|
+| **HQ-EVFI** (TimeLens-XL, ECCV'24) | EVK4-HD, beam splitter, pixel-aligned | 142 fps | official (TimeLens-XL) | `python HQ-EVFI/hqevfi.py --archive HQ-EVFI.zip --out data/hqevfi` |
+| **BS-ERGB** (Time Lens++, CVPR'22) | Gen4M, beam splitter, aligned 970x625 | ≈28 fps | official train / val / test | `python BS-ERGB/bsergb.py --archive bs_ergb.zip --out data/bsergb` |
+| **CED** (CVPRW'19) | Color DAVIS346, same pixels | APS rate | every 5th per category | `python CED/ced.py --archive ced_*.zip --out data/ced` (or `--raw <folder of .bag>`) |
+| **EDS** (CVPR'22) | Gen3.1 VGA + FLIR, beam splitter, **not** aligned | up to 75 fps | every 5th sequence | `python EDS/eds.py --archive <folder of .tgz> --out data/eds` |
 
-```bash
-python HQ-EVFI/hqevfi.py --out data/hqevfi
-```
+Notes per dataset:
 
-The script extracts the zip to `HQ-EVFI/raw/` (once), fetches the official ranges and test split from TimeLens-XL (`dataset_dict.py`), and writes `data/hqevfi/{train,test}/<sequence>/`. It uses the 3 ms corrected event folders with the one-frame image shift where TimeLens-XL does. Frame times come from the boundaries between event files. **Check the printed fps (≈142).**
+- **HQ-EVFI**: zip from [Google Drive](https://drive.google.com/file/d/104ZMJ-M_frImOOCGfLk_HDb2FV1trveT) (or put it in `HQ-EVFI/` and leave out `--archive`). Fetches the official ranges and test split from TimeLens-XL (`dataset_dict.py`, `--lists` for a local copy), uses the 3 ms corrected event folders with the one-frame image shift where TimeLens-XL does. Frame times come from the boundaries between event files.
+- **BS-ERGB**: event x/y stored in 1/32 px are detected and rounded; event files TimeLens-XL marks as broken split their sequence. Without `--archive`, `--raw` (default `BS-ERGB/`) must hold `1_TEST`, `2_VALIDATION`, `3_TRAINING`.
+- **CED**: frames from `image_raw` when it is a Bayer mosaic (linear light, `gamma.txt` = 1.0, pattern in `bayer.txt`), else from `image_color` (sRGB, `gamma.txt` = 2.2). `--dry` lists topics and encodings without converting.
+- **EDS**: events stay at their own sensor pixels; RGB frames are warped into the event camera (undistort, rotate, distort with the [dataset calibration](https://github.com/uzh-rpg/bundles-eds/tree/master/config/data/dual_setup/03_calib), built in; `--calib` for another Kalibr camchain) and cropped to the region the RGB lens covers (≈495x360). The flip of the stored RGB images is picked from the data and printed with the residual misalignment; it should read `best residual shift dy,dx = (0, 0)`. Details in `<seq>/align.yaml`. Needs `h5py` and `hdf5plugin` for `events.h5`. `--dry` lists what was found in each sequence.
 
 Layout per sequence:
 
@@ -99,10 +108,28 @@ seq/
   ev_t.npy                # (M,) float64, seconds, sorted
   ev_x.npy  ev_y.npy      # (M,) int16
   ev_p.npy                # (M,) int8, +1 / -1
+  gamma.txt               # optional: frame gamma of this sequence (CED)
 ```
 
-- `data.root` is a folder (searched recursively) or a list of folders.
-- `data.skip=4` hides 4 frames: the gap matches 142/5 ≈ 28 fps video. Choose `(skip+1)/fps` close to the videos you will convert.
+### Mixing the datasets
+
+```yaml
+data:
+  sets:
+    - {name: hqevfi, root: data/hqevfi/train, val_root: data/hqevfi/test}
+    - {name: bsergb, root: data/bsergb/train, val_root: data/bsergb/test, weight: 2}
+    ...
+  use: null        # e.g. [hqevfi, eds] to train on a subset
+  gap: 0.035       # seconds between I0 and I1
+```
+
+- **Gap in seconds, not frames.** The datasets run at 28-142 fps, so `data.gap` sets the time between I0 and I1 and each sequence gets `skip = round(gap * fps) - 1` hidden frames (142 fps → 4, 75 → 2, 28 → 0). Pick it close to the frame interval of the videos you will convert. `data.gap: null` falls back to a fixed `data.skip`. Hidden frames are padded per batch (`mid_mask`); a dataset with skip 0 adds no photometric term.
+- **Weights.** Each step draws a dataset by `weight` (default 1 each), then a sample inside it, so the large sets do not drown the small ones. Works with DDP.
+- **Per set overrides:** `weight`, `gap` or `skip`, `gamma`, `min_events` (event density differs a lot between an EVK4-HD and a DAVIS346).
+- **Gamma** of the frames: the set's `gamma`, else the sequence's `gamma.txt`, else `model.gamma`. It is sent with every sample, so one batch can mix linear and sRGB frames.
+- **Validation** prints one line per dataset: `val[hqevfi] nll ...`.
+- `data.crop` must fit the smallest frames of every set (CED 346x260, so at most 256).
+- `data.root=<folder>` on the command line still trains on that one folder (the list is ignored).
 
 ---
 
@@ -142,7 +169,7 @@ The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT 
 
 ```bash
 python toy_data.py data/toy 24
-S="data.root=data/toy/train data.val_root=data/toy/val data.crop=64 data.skip=3 data.min_events=50 data.workers=2 data.bins=8 \
+S="data.root=data/toy/train data.val_root=data/toy/val data.crop=64 data.gap=null data.skip=3 data.min_events=50 data.workers=2 data.bins=8 \
    model.flow_prior=none model.backbone=none model.width=16 model.depth=[1,1,1] model.pred_dim=64 model.pred_depth=2 \
    loss.grid=16 train.batch=4 train.lr=1e-3 train.warmup=20 train.log_every=100 train.val_batches=8"
 python train.py $S train.stage=teacher train.steps=1000 train.save_every=500 train.out=runs/teacher
@@ -167,7 +194,9 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 
 | Key | Effect |
 |---|---|
-| `data.skip` | Hidden frames in the gap. Choose `(skip+1)/fps` close to the frame interval of the videos you will convert |
+| `data.gap` | Seconds between I0 and I1 (hidden frames per sequence follow from its fps). Choose it close to the frame interval of the videos you will convert |
+| `data.sets`, `data.use` | Datasets and their sampling weights; train on a subset with `data.use=[hqevfi,eds]` |
+| `data.skip` | Hidden frames in the gap when `data.gap` is null |
 | `data.context` | Frames per side for the student, taken at the gap's own stride, so training sees the same frame spacing as generation (even for V-JEPA 2.1) |
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
 | `model.z_dim` | Size of the path code per patch |
@@ -184,6 +213,10 @@ Verified here (CPU, toy data):
 - Simulator and likelihood are the same model: on simulated events the likelihood is lowest at the true `k`, `ν`, `C_on`, `r` and the true motion.
 - Teacher generalizes on held-out toy scenes: `nll` < `nll_zero` < `nll_shuffled`. Student lands in between.
 - All four stages, generation, V-JEPA 2.1 wrapper (official code, random weights), 2-process DDP.
+
+Multi-dataset branch: all four converters and the archive input checked on small fake data in each dataset's format
+(EDS: flip and alignment recovered exactly through the dataset calibration); the loader, mixing sampler and padded
+collate checked against those outputs without torch. A real `train.py` run over the four sets is the first GPU check.
 
 Not tested here: real data on GPU, pretrained weight downloads, the LeVJEPA wrapper (Hugging Face is blocked in this sandbox).
 

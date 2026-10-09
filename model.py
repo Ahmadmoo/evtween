@@ -271,15 +271,17 @@ class EvTween(nn.Module):
         y = F.pad(x.reshape(-1, *x.shape[-3:]), (0, -W % self.mult, 0, -H % self.mult), mode="replicate")
         return y.view(*x.shape[:-2], *y.shape[-2:])
 
-    def prepare(self, i0, i1):
-        # frame-only inputs shared by teacher and decoder, padded to the patch grid
+    def prepare(self, i0, i1, gamma=None):
+        # frame-only inputs shared by teacher and decoder, padded to the patch grid.
+        # gamma: (B,) per-sample frame gamma (mixed datasets); None -> the model's gamma
         H, W = i0.shape[-2:]
         i0, i1 = self._pad(i0), self._pad(i1)
         f01, f10 = self.flow(i0, i1)
-        y0, y1 = luminance(i0, self.gamma), luminance(i1, self.gamma)
+        g = self.gamma if gamma is None else gamma.view(-1, 1, 1, 1).to(i0.dtype)
+        y0, y1 = luminance(i0, g), luminance(i1, g)
         e0, e1 = (warp(y1, f01) - y0).abs(), (warp(y0, f10) - y1).abs()
         x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
-        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W)
+        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W, gamma=g)
 
     def encode(self, p, voxel):
         x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
@@ -300,7 +302,7 @@ class EvTween(nn.Module):
         crop = lambda t: t[..., :H, :W]
         a, b, d, u = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
-        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0),
+        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), gamma=p.get("gamma", self.gamma),
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
         if self.uncertainty:
             s["sig"] = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2

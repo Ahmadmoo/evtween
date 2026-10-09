@@ -12,7 +12,8 @@ cfg, D, dev = ck["cfg"], ck["cfg"]["data"], "cuda"
 model = build_model(cfg).to(dev).eval()
 model.load_state_dict(ck["model"], strict=False)
 arg = lambda i, default: sys.argv[i] if len(sys.argv) > i else default
-root, nb, skip = arg(3, D["root"].rsplit("/", 1)[0]), int(arg(2, 25)), int(arg(4, D["skip"]))
+root0 = D["root"] if D.get("root") else D["sets"][0]["root"]  # data.sets: the first dataset by default
+root, nb, skip = arg(3, root0.rsplit("/", 1)[0]), int(arg(2, 25)), int(arg(4, D.get("skip", 4)))
 
 for split in ("train", "test"):
     ds = PairDataset(f"{root}/{split}", D["crop"], skip, D["context"], D["bins"], 0, train=False)
@@ -21,7 +22,7 @@ for split in ("train", "test"):
     for b in DataLoader(ds, 8, collate_fn=collate, num_workers=4):
         b = {k: v.to(dev) for k, v in b.items()}
         with torch.no_grad():
-            p = model.prepare(b["i0"], b["i1"])
+            p = model.prepare(b["i0"], b["i1"], b.get("gamma"))
             z = model.encode(p, b["voxel"])
             ev = (b["ev_b"], b["ev_pix"], b["ev_tau"], b["ev_pol"])
             nll = lambda code, e=ev: event_nll(model, model.decode(p, code), e, b["dt"], cfg["loss"]["grid"]).item()

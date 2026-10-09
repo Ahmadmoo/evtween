@@ -1,6 +1,8 @@
 import argparse
 import glob
 import os
+import shutil
+import subprocess
 import numpy as np
 from PIL import Image
 
@@ -15,10 +17,32 @@ SCALES = (1.0, 1e-3, 1e-6, 1e-9)
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser(description="BS-ERGB (folders in this directory) -> evtween layout: <out>/{train,val,test}/<sequence>/")
 ap.add_argument("--out", default="data/bsergb")
-ap.add_argument("--raw", default=HERE, help="folder holding 1_TEST, 2_VALIDATION, 3_TRAINING")
+ap.add_argument("--archive", default=None, help="the BS-ERGB zip / tar, extracted once to --raw (default <this folder>/raw)")
+ap.add_argument("--raw", default=None, help="folder holding 1_TEST, 2_VALIDATION, 3_TRAINING, searched below it too "
+                "(default: this folder)")
 ap.add_argument("--copy", action="store_true", help="copy PNG frames instead of symlinking them")
 ap.add_argument("--min-frames", type=int, default=8, help="drop pieces shorter than this after splitting at broken files")
 a = ap.parse_args()
+
+
+def extract(z, dst):
+    print(f"extracting {os.path.basename(z)} -> {dst}")
+    os.makedirs(dst, exist_ok=True)
+    try:
+        shutil.unpack_archive(z, dst)
+    except (shutil.ReadError, ValueError):  # zip64 / large archives python cannot read
+        cmd = ["unzip", "-q", "-o", z, "-d", dst] if z.lower().endswith(".zip") else ["tar", "-xf", z, "-C", dst]
+        subprocess.run(cmd, check=True)
+
+
+if a.archive:
+    a.raw = a.raw or os.path.join(HERE, "raw")
+    os.path.isdir(a.raw) or extract(a.archive, a.raw)
+a.raw = a.raw or HERE
+found = sorted(glob.glob(os.path.join(a.raw, "**", "3_TRAINING"), recursive=True)) + \
+    sorted(glob.glob(os.path.join(a.raw, "**", "1_TEST"), recursive=True))
+assert found, f"no 1_TEST / 3_TRAINING folder under {a.raw}: pass --archive or --raw"
+a.raw = os.path.dirname(found[0])
 
 
 def load(f):

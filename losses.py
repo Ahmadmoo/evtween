@@ -106,12 +106,17 @@ def event_nll(model, s, ev, dt, steps=128):
     return -(lls[0].sum() - (nu * H * W).sum()) / (B * H * W)
 
 
-def photo_loss(model, s, mid, mid_tau):
+def photo_loss(model, s, mid, mid_tau, mask=None):
+    # mask (B, M): which hidden frames are real (mixed datasets hide different numbers of frames; the rest is padding)
     if mid.shape[1] == 0:
         return mid.new_zeros(())
-    err = [(model.render(s, mid_tau[:, j])[0] - torch.log(luminance(mid[:, j], model.gamma) + model.eps)).abs().mean()
-           for j in range(mid.shape[1])]
-    return sum(err) / len(err)
+    g = s.get("gamma", model.gamma)
+    err = torch.stack([(model.render(s, mid_tau[:, j])[0] - torch.log(luminance(mid[:, j], g) + model.eps)).abs().mean((1, 2, 3))
+                       for j in range(mid.shape[1])], 1)
+    if mask is None:
+        return err.mean()
+    m = mask.to(err.dtype)
+    return (err * m).sum() / m.sum().clamp(min=1)
 
 
 def cmax_loss(model, s, ev):
@@ -159,12 +164,12 @@ def compute(model, batch, w, stage):
         loss = F.mse_loss(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts"), target)
         return loss, dict(probe=loss)
 
-    p = model.prepare(batch["i0"], batch["i1"])
+    p = model.prepare(batch["i0"], batch["i1"], batch.get("gamma"))
     terms = {}
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
         s = model.decode(p, z)
-        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask")),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=SIGREG.to(z.device)(z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])))
     if stage in ("student", "joint"):
@@ -173,7 +178,7 @@ def compute(model, batch, w, stage):
         s = model.decode(p, zh)
         terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"]))
         if stage == "student":
-            terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
+            terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"], batch.get("mid_mask"))
     weight = dict(w, nll_student=w["nll"])
     return sum(weight[k] * v for k, v in terms.items()), terms
 
@@ -182,7 +187,7 @@ def compute(model, batch, w, stage):
 def diagnostics(model, batch, w, student=True):
     # does the decoder use z (shuffled / zero codes must hurt), and how much can the student predict (gap)?
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
-    p = model.prepare(batch["i0"], batch["i1"])
+    p = model.prepare(batch["i0"], batch["i1"], batch.get("gamma"))
     z = model.encode(p, batch["voxel"])
     nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"]).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))

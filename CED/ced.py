@@ -3,6 +3,8 @@ import bz2
 import glob
 import mmap
 import os
+import shutil
+import subprocess
 import numpy as np
 from PIL import Image
 
@@ -16,7 +18,9 @@ EV = np.dtype([("x", "<u2"), ("y", "<u2"), ("s", "<u4"), ("ns", "<u4"), ("p", "u
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser(description="CED bags (in this directory) -> evtween layout: <out>/{train,test}/<sequence>/")
 ap.add_argument("--out", default="data/ced")
-ap.add_argument("--raw", default=HERE, help="folder holding the .bag files")
+ap.add_argument("--archive", nargs="*", default=None, help="zip / tar files holding .bag files, extracted once to --raw "
+                "(default <this folder>/raw)")
+ap.add_argument("--raw", default=None, help="folder holding the .bag files, searched recursively (default: this folder)")
 ap.add_argument("--bayer", default=None, help="pattern of a mono8 image_raw, e.g. rggb (read from the encoding if given there)")
 ap.add_argument("--offset-ms", type=float, default=0.0, help="added to frame times (e.g. half the exposure, after check.py)")
 ap.add_argument("--dry", action="store_true", help="only print topics, message counts, time spans, image encodings (from the bag index)")
@@ -206,6 +210,19 @@ def rgb(enc, img, pattern):
     return img[..., [0, 0, 0]] if img.shape[2] == 1 else img[..., 2::-1] if enc.lower().startswith("bgr") else img[..., :3]
 
 
+if a.archive:
+    for z in a.archive:
+        dst = os.path.join(a.raw or os.path.join(HERE, "raw"), os.path.basename(z).split(".")[0])
+        if not os.path.isdir(dst):
+            print(f"extracting {os.path.basename(z)} -> {dst}")
+            os.makedirs(dst)
+            try:
+                shutil.unpack_archive(z, dst)
+            except (shutil.ReadError, ValueError):
+                cmd = ["unzip", "-q", "-o", z, "-d", dst] if z.lower().endswith(".zip") else ["tar", "-xf", z, "-C", dst]
+                subprocess.run(cmd, check=True)
+    a.raw = a.raw or os.path.join(HERE, "raw")
+a.raw = a.raw or HERE
 bags = sorted(glob.glob(os.path.join(a.raw, "**", "*.bag"), recursive=True))
 cats = {}
 for b in bags:
@@ -241,6 +258,8 @@ for bag in bags:
     np.save(os.path.join(dst, "ev_p.npy"), np.where(ev["p"][o] > 0, 1, -1).astype(np.int8))
     if pattern:
         open(os.path.join(dst, "bayer.txt"), "w").write(pattern + "\n")
+    # frame encoding for the loader: demosaiced image_raw is linear light, image_color is sRGB-encoded
+    open(os.path.join(dst, "gamma.txt"), "w").write("1.0\n" if pattern else "2.2\n")
     H, W = frames[0][3].shape[:2]
     print(f"  -> {dst}: {len(frames)}/{n_all} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {len(t)} events, "
           f"frames from {'image_raw (' + pattern + ')' if pattern else 'image_color'}")
