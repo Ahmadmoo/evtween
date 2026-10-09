@@ -16,6 +16,9 @@ root, nb, skip = arg(3, D["root"].rsplit("/", 1)[0]), int(arg(2, 25)), int(arg(4
 
 for split in ("train", "test"):
     ds = PairDataset(f"{root}/{split}", D["crop"], skip, D["context"], D["bins"], 0, train=False)
+    print(f"{split}: {len(ds.seqs)} sequences, {len(ds)} samples in {root}/{split}")
+    if len(ds) == 0:
+        continue
     ds = Subset(ds, torch.linspace(0, len(ds) - 1, nb * 8).long().tolist())  # fixed samples over all sequences, as in train.py
     acc, shift_acc, n = {}, {}, 0
     for b in DataLoader(ds, 8, collate_fn=collate, num_workers=4):
