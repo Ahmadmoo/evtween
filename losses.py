@@ -24,7 +24,7 @@ def ig_logs(x, k):
 SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # path time shifts (grid steps) averaged per pixel with the predicted uncertainty
 
 
-def event_nll(model, s, ev, dt, steps=128, per=None, key="nll"):
+def event_nll(model, s, ev, dt, steps=128, per=None, per_key="nll"):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
@@ -33,7 +33,7 @@ def event_nll(model, s, ev, dt, steps=128, per=None, key="nll"):
     # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown).
     # With an uncertainty map s["sig"] (gap units) the whole path of a pixel may be shifted in time by d ~ N(0, sig^2)
     # and the pixel's likelihood is averaged over shifts: a shift moves all its events together, threshold noise does not
-    # per: optional dict that receives the same NLL per sample, per[key] (B,); its mean is the returned value
+    # per: optional dict that receives the same NLL per sample, per[per_key] (B,); its mean is the returned value
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
@@ -105,7 +105,7 @@ def event_nll(model, s, ev, dt, steps=128, per=None, key="nll"):
         logw = (-0.5 * (d[:, None] / s["sig"].flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
         lls = torch.logsumexp(logw + lls, 0, keepdim=True)
     if per is not None:
-        per[key] = (-(lls[0].view(B, H * W).sum(1) - nu * H * W) / (H * W)).detach()
+        per[per_key] = (-(lls[0].view(B, H * W).sum(1) - nu * H * W) / (H * W)).detach()
     return -(lls[0].sum() - (nu * H * W).sum()) / (B * H * W)
 
 
