@@ -110,6 +110,8 @@ for root in a.roots:
     print(f"\n== {root}: {len(seqs)} sequences " + ", ".join(f"{sum(f'/{s}/' in q for q in seqs)} {s}" for s in ("train", "val", "test")))
     print(f"  {'sequence':38s} {'frames':>7s} {'size':>9s} {'fps':>6s} {'drops':>5s} {'events':>9s} {'ev/px/s':>7s} "
           f"{'ON':>4s} {'ev/gap':>7s}  notes")
+    if not seqs:
+        print(f"  ! no sequences: expected {root}/<train|val|test>/<sequence>/frame_ts.npy" + ("" if os.path.isdir(root) else f" ({root} does not exist)"))
     rows = []
     for seq in seqs:
         try:
