@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import numpy as np
 from PIL import Image
-
+#https://download.ifi.uzh.ch/rpg/web/data/timelens_pp/bs_ergb.zip
 # BS-ERGB (Time Lens++, CVPR'22): beam splitter, Prophesee Gen4M + FLIR RGB at ~28 fps, 970x625 after alignment.
 # Layout: {1_TEST,2_VALIDATION,3_TRAINING}/<seq>/images/*.png and events/*.npz (x, y in 1/32 px, timestamp, polarity);
 # events/i.npz holds the events between image i and i+1. Event files TimeLens-XL skips as broken split their sequence.
