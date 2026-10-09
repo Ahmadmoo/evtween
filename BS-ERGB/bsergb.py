@@ -35,13 +35,21 @@ def extract(z, dst):
         subprocess.run(cmd, check=True)
 
 
+splits = lambda d: sorted(glob.glob(os.path.join(d, "**", "3_TRAINING"), recursive=True)) + \
+    sorted(glob.glob(os.path.join(d, "**", "1_TEST"), recursive=True))
 if a.archive:
     a.raw = a.raw or os.path.join(HERE, "raw")
-    os.path.isdir(a.raw) or extract(a.archive, a.raw)
+    if splits(a.raw):
+        print(f"using the earlier extraction in {a.raw}")
+    else:  # missing, or holding something else (e.g. HS-ERGB close/far): extract into a folder of its own
+        if os.path.isdir(a.raw) and os.listdir(a.raw):
+            print(f"{a.raw} holds no 1_TEST / 3_TRAINING ({', '.join(sorted(os.listdir(a.raw))[:5])}), extracting next to it")
+            a.raw = os.path.join(a.raw, os.path.basename(a.archive).split(".")[0])
+        extract(a.archive, a.raw)
 a.raw = a.raw or HERE
-found = sorted(glob.glob(os.path.join(a.raw, "**", "3_TRAINING"), recursive=True)) + \
-    sorted(glob.glob(os.path.join(a.raw, "**", "1_TEST"), recursive=True))
-assert found, f"no 1_TEST / 3_TRAINING folder under {a.raw}: pass --archive or --raw"
+found = splits(a.raw)
+assert found, (f"no 1_TEST / 3_TRAINING folder under {a.raw}: not a BS-ERGB archive? (HS-ERGB, from the first TimeLens, has "
+               f"close/ far/ instead) check with: unzip -l <zip> | head")
 a.raw = os.path.dirname(found[0])
 
 
