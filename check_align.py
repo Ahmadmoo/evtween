@@ -7,7 +7,8 @@ from PIL import Image
 # all shifts (both maps blurred). Maps are cut to one central size (at most 480x640) so sequences of any size can be averaged
 root, n = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 20
 rng = np.random.default_rng(0)
-seqs = sorted(os.path.dirname(f) for f in glob.glob(os.path.join(root, "*", "*", "frame_ts.npy")))
+seqs = [root] if os.path.exists(os.path.join(root, "frame_ts.npy")) else \
+    sorted(os.path.dirname(f) for f in glob.glob(os.path.join(root, "*", "*", "frame_ts.npy")))  # a dataset or one sequence
 lum = lambda f: np.log(np.asarray(Image.open(f).convert("L"), dtype=np.float64) / 255 + 0.01)
 SCALES = [float(v) for v in sys.argv[3].split(",")] if len(sys.argv) > 3 else [0.8, 0.9, 1.0, 1.1, 1.25]
 TRANSFORMS = [(fl, s) for fl in ("none", "flip x", "flip y", "flip x+y") for s in SCALES]

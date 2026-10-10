@@ -27,6 +27,8 @@ ap.add_argument("--out", default="data/eds")
 ap.add_argument("--work", default=None, help="archives are unpacked one at a time into <work>/.tmp (default work: <out>)")
 ap.add_argument("--mid-exposure", action="store_true", help="frame time = stamp + half the exposure in times.txt (stamp = exposure start)")
 ap.add_argument("--offset-ms", type=float, default=0.0, help="added to frame times")
+ap.add_argument("--warp", default=None, help="s,dy,dx: frame pixel = s * (event pixel - center) + center + (dy, dx); frames are "
+                "resampled onto the event pixels and both are cut to the part the frames cover (check_align.py finds s, dy, dx)")
 ap.add_argument("--dry", action="store_true", help="only list the sequences and their split")
 a = ap.parse_args()
 work = os.path.join(a.work or a.out, ".tmp")  # only this subfolder is created and removed
@@ -48,6 +50,28 @@ def first(t, v):
         m = (lo + hi) // 2
         lo, hi = (m + 1, hi) if t[m] < v else (lo, m)
     return lo
+
+
+def out_xy(dst, x0, y0, x1, y1):
+    # keep the events inside the box the frames cover, coordinates relative to its corner (done in place, 50M at a time)
+    ev = {k: np.load(os.path.join(dst, f"ev_{k}.npy"), mmap_mode="r") for k in "txyp"}
+    n, m = len(ev["t"]), 0
+    out = {k: np.lib.format.open_memmap(os.path.join(dst, f"ev_{k}.tmp.npy"), "w+", v.dtype, (n,)) for k, v in ev.items()}
+    for i in range(0, n, STEP):
+        x, y = np.asarray(ev["x"][i:i + STEP]), np.asarray(ev["y"][i:i + STEP])
+        ok = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+        j = m + int(ok.sum())
+        out["t"][m:j], out["p"][m:j] = np.asarray(ev["t"][i:i + STEP])[ok], np.asarray(ev["p"][i:i + STEP])[ok]
+        out["x"][m:j], out["y"][m:j], m = x[ok] - x0, y[ok] - y0, j
+    for k in "txyp":
+        final = np.lib.format.open_memmap(os.path.join(dst, f"ev_{k}.new.npy"), "w+", out[k].dtype, (m,))
+        for i in range(0, m, STEP):
+            final[i:i + STEP] = out[k][i:min(i + STEP, m)]
+        final.flush()
+        del final, out[k]
+        os.replace(os.path.join(dst, f"ev_{k}.new.npy"), os.path.join(dst, f"ev_{k}.npy"))
+        os.remove(os.path.join(dst, f"ev_{k}.tmp.npy"))
+    return x1 - x0 + 1, y1 - y0 + 1, m / max(n, 1)
 
 
 def convert(seq, dst, move):
@@ -77,6 +101,19 @@ def convert(seq, dst, move):
         for v in out.values():
             v.flush()
         del out
+    if a.warp:  # RGB and event cameras see the scene at different scales: resample frames onto the event pixels
+        s, dy, dx = map(float, a.warp.split(","))
+        W, H = Image.open(fr[0]).size
+        cx, cy = W / 2 + dx - s * W / 2, H / 2 + dy - s * H / 2  # frame pixel = s * event pixel + (cx, cy)
+        x0, y0 = max(0, int(np.ceil(-cx / s))), max(0, int(np.ceil(-cy / s)))
+        x1, y1 = min(W - 1, int((W - 1 - cx) / s)), min(H - 1, int((H - 1 - cy) / s))
+        aff = (s, 0, s * x0 + cx + 0.5 - 0.5 * s, 0, s, s * y0 + cy + 0.5 - 0.5 * s)  # PIL maps pixel centers
+        ex, ey, keep = out_xy(dst, x0, y0, x1, y1)
+        for k, src in enumerate(fr):
+            Image.open(src).convert("RGB").transform((x1 - x0 + 1, y1 - y0 + 1), Image.AFFINE, aff, Image.BICUBIC).save(
+                os.path.join(dst, "frames", f"{k:06d}.png"))
+        fr = []
+        print(f"  warp s {s} dy {dy} dx {dx}: event pixels x {x0}..{x1}, y {y0}..{y1} kept ({100 * keep:.0f}% of the events)")
     for k, src in enumerate(fr):
         target = os.path.join(dst, "frames", f"{k:06d}.png")
         if move:
@@ -88,7 +125,7 @@ def convert(seq, dst, move):
                 shutil.copy(src, target)
     open(os.path.join(dst, "done"), "w").close()
     W, H = Image.open(os.path.join(dst, "frames", "000000.png")).size
-    print(f"  -> {dst}: {len(fr)}/{n} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {hi - lo} events, "
+    print(f"  -> {dst}: {len(glob.glob(os.path.join(dst, 'frames', '*.png')))}/{n} frames {W}x{H} @ {1 / np.median(np.diff(ts)):.1f} fps, {hi - lo} events, "
           f"event time unit {se:g} s", flush=True)
 
 
