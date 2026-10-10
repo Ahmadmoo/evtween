@@ -2,14 +2,15 @@ import glob, os, sys
 import numpy as np
 from PIL import Image
 
-# python check_align.py data/eds [pairs]: where do the events sit relative to the frames? For each flip and scale of the event
+# python check_align.py data/eds [pairs] [scales, e.g. 1.2,1.4,1.6]: where do the events sit relative to the frames? For each flip and scale of the event
 # coordinates (about the image center), the cross-correlation of |events| with |log change| between neighbouring frames over
 # all shifts (both maps blurred). Maps are cut to one central size (at most 480x640) so sequences of any size can be averaged
 root, n = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 20
 rng = np.random.default_rng(0)
 seqs = sorted(os.path.dirname(f) for f in glob.glob(os.path.join(root, "*", "*", "frame_ts.npy")))
 lum = lambda f: np.log(np.asarray(Image.open(f).convert("L"), dtype=np.float64) / 255 + 0.01)
-TRANSFORMS = [(fl, s) for fl in ("none", "flip x", "flip y", "flip x+y") for s in (0.8, 0.9, 1.0, 1.1, 1.25)]
+SCALES = [float(v) for v in sys.argv[3].split(",")] if len(sys.argv) > 3 else [0.8, 0.9, 1.0, 1.1, 1.25]
+TRANSFORMS = [(fl, s) for fl in ("none", "flip x", "flip y", "flip x+y") for s in SCALES]
 sizes = [Image.open(sorted(glob.glob(os.path.join(q, "frames", "*.png")))[0]).size for q in seqs]
 H, W = min(480, min(h for _, h in sizes)), min(640, min(w for w, _ in sizes))  # one map size for all pairs
 acc = {}
