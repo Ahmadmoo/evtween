@@ -226,7 +226,7 @@ class Decoder(nn.Module):
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True):
+                 uncertainty=True, gammas=None):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -237,12 +237,16 @@ class EvTween(nn.Module):
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
-        self.log_c = nn.Parameter(torch.tensor(math.log(c_init)))   # ON threshold
-        self.log_r = nn.Parameter(torch.tensor(math.log(r_init)))   # C_off / C_on
-        self.log_k = nn.Parameter(torch.tensor(math.log(4.0)))      # inverse-Gaussian shape (timing regularity)
-        self.log_nu = nn.Parameter(torch.tensor(math.log(0.2)))     # background events per pixel per second
-        self.log_R = nn.Parameter(torch.tensor(math.log(5e-5)))     # refractory time (s); grows from below to the real floor
-        self.R_max = 2e-3                                            # soft cap: with few events per pixel R is weakly pinned
+        # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample
+        n = len(gammas or [gamma])
+        full = lambda v: nn.Parameter(torch.full((n,), math.log(v)))
+        self.log_c, self.log_r = full(c_init), full(r_init)          # ON threshold, C_off / C_on
+        self.log_k = full(4.0)                                        # inverse-Gaussian shape (timing regularity)
+        self.log_nu = full(0.2)                                       # background events per pixel per second
+        self.log_R = full(5e-5)                                       # refractory time (s); grows from below to the real floor
+        self.R_max = 2e-3                                             # soft cap: with few events per pixel R is weakly pinned
+        self.w_rgb = nn.Parameter(torch.tensor([[0.299, 0.587, 0.114]]).log().repeat(n, 1))  # RGB weights (softmax), learned
+        self.register_buffer("gammas", torch.tensor(gammas or [gamma], dtype=torch.float32), persistent=False)  # from config
 
     @property
     def c(self):
@@ -255,6 +259,28 @@ class EvTween(nn.Module):
     @property
     def R(self):
         return self.R_max * torch.tanh(self.log_R.exp() / self.R_max)
+
+    def bright(self, img, ds=None, cfa=None):
+        # linear brightness the event pixels see: per dataset, learned RGB weights then PNG value^gamma;
+        # under a Bayer filter (cfa: 2x2 channel ids of the crop, -1 = none) each pixel sees only its own channel
+        B, _, H, W = img.shape
+        ds = torch.zeros(B, dtype=torch.long, device=img.device) if ds is None else ds
+        w = self.w_rgb[ds].softmax(-1)[:, :, None, None].expand(B, 3, H, W)
+        if cfa is not None and bool((cfa >= 0).any()):
+            tile = cfa.repeat(1, (H + 1) // 2, (W + 1) // 2)[:, :H, :W]
+            w = torch.where((tile >= 0)[:, None], F.one_hot(tile.clamp(min=0), 3).permute(0, 3, 1, 2).to(img.dtype), w)
+        return (img * w).sum(1, keepdim=True).clamp(1e-6, 1) ** self.gammas[ds].view(B, 1, 1, 1)
+
+    def sensor(self, ds):
+        # per sample: thresholds (C_on, C_off), IG shape k, background rate nu (1/s), refractory R (s)
+        c = self.log_c.exp()[ds]
+        return torch.stack([c, c * self.log_r.exp()[ds]], 1), self.log_k.exp()[ds], self.log_nu.exp()[ds], self.R[ds]
+
+    def load_state_dict(self, sd, strict=False):
+        # checkpoints from before per-dataset sensors hold one value per parameter: every dataset starts from it
+        own = self.state_dict()
+        sd = {k: v.expand_as(own[k]).clone() if k in own and v.dim() == 0 and own[k].dim() == 1 else v for k, v in sd.items()}
+        return super().load_state_dict(sd, strict=strict)
 
     def frozen(self, name):
         return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
@@ -271,15 +297,16 @@ class EvTween(nn.Module):
         y = F.pad(x.reshape(-1, *x.shape[-3:]), (0, -W % self.mult, 0, -H % self.mult), mode="replicate")
         return y.view(*x.shape[:-2], *y.shape[-2:])
 
-    def prepare(self, i0, i1):
-        # frame-only inputs shared by teacher and decoder, padded to the patch grid
+    def prepare(self, i0, i1, ds=None, cfa=None):
+        # frame-only inputs shared by teacher and decoder, padded to the patch grid; ds: dataset id per sample
         H, W = i0.shape[-2:]
         i0, i1 = self._pad(i0), self._pad(i1)
+        ds = torch.zeros(len(i0), dtype=torch.long, device=i0.device) if ds is None else ds
         f01, f10 = self.flow(i0, i1)
-        y0, y1 = luminance(i0, self.gamma), luminance(i1, self.gamma)
+        y0, y1 = self.bright(i0, ds, cfa), self.bright(i1, ds, cfa)
         e0, e1 = (warp(y1, f01) - y0).abs(), (warp(y0, f10) - y1).abs()
         x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
-        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W)
+        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W, ds=ds, cfa=cfa)
 
     def encode(self, p, voxel):
         x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
@@ -300,7 +327,7 @@ class EvTween(nn.Module):
         crop = lambda t: t[..., :H, :W]
         a, b, d, u = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
-        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0),
+        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
         if self.uncertainty:
             s["sig"] = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
@@ -342,5 +369,8 @@ class EvTween(nn.Module):
 
 
 def build_model(cfg):
-    # configs from before the uncertainty output have no "uncertainty" key: build those checkpoints without it
-    return EvTween(**{"uncertainty": False, **cfg["model"]}, bins=cfg["data"]["bins"])
+    # configs from before the uncertainty output have no "uncertainty" key: build those checkpoints without it.
+    # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
+    g = cfg["model"].get("gamma", 2.2)
+    gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
+    return EvTween(**{"uncertainty": False, **cfg["model"]}, bins=cfg["data"]["bins"], gammas=gammas)

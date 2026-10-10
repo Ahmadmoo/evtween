@@ -13,14 +13,17 @@ ap.add_argument("--out", default="events.npz")
 ap.add_argument("--sensor", default=None, help="learned | clean | profile.yaml (default: the checkpoint's config)")
 ap.add_argument("--set", nargs="*", default=[], help="sensor overrides, e.g. pos_thres=0.3 shot_noise_rate_hz=x0.5")
 ap.add_argument("--save-profile", default=None, help="write the final sensor profile to this YAML file")
+ap.add_argument("--dataset", default=None, help="whose learned sensor and brightness mapping to use (a name in data.sets; default: the first)")
 args = ap.parse_args()
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
 model = build_model(ck["cfg"]).to(dev).eval()
 model.load_state_dict(ck["model"], strict=False)
-S = ck["cfg"]["sensor"]
-prof = resolve(model, args.sensor or S.get("profile", "learned"), dict(S.get("set") or {}, **dict(a.split("=") for a in args.set)))
+S, names = ck["cfg"]["sensor"], [k for k, v in (ck["cfg"]["data"].get("sets") or {"data": 1}).items() if v]
+ds = list(ck["cfg"]["data"].get("sets") or {"data": 1}).index(args.dataset or names[0])
+print("dataset:", args.dataset or names[0])
+prof = resolve(model, args.sensor or S.get("profile", "learned"), dict(S.get("set") or {}, **dict(a.split("=") for a in args.set)), ds)
 print("sensor:", {k: float(f"{v:.4g}") for k, v in prof.items()})
 if args.save_profile:
     yaml.safe_dump(prof, open(args.save_profile, "w"), sort_keys=False)
@@ -33,7 +36,7 @@ with torch.no_grad():
         idx = [min(max(q, 0), N - 1) for q in [*range(i - c + 1, i + 1), *range(i + 1, i + 1 + c)]]
         ctx = torch.stack([seq.frame(q) for q in idx])[None].to(dev)
         tau = torch.tensor([(ts[q] - ts[i]) / (ts[i + 1] - ts[i]) for q in idx], device=dev)[None].float()
-        p = model.prepare(ctx[:, c - 1], ctx[:, c])
+        p = model.prepare(ctx[:, c - 1], ctx[:, c], torch.tensor([ds], device=dev))
         z = model.predict(ctx, tau, torch.tensor([ts[i + 1] - ts[i]], device=dev).float())
         parts.append(sim.run(model.decode(p, z), ts[i], ts[i + 1]))
         print(f"\r{i + 1}/{N - 1} frames, {sum(len(q['t']) for q in parts)} events", end="", flush=True)

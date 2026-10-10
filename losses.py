@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import lejepa
-from model import luminance
 
 SIGREG = lejepa.multivariate.SlicingUnivariateTest(univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=256)
 
@@ -39,7 +38,9 @@ def event_nll(model, s, ev, dt, steps=128):
     frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
     grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
     Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
-    c, k, nu = torch.stack([model.c, model.c * model.r]), model.log_k.exp(), model.log_nu.exp() * dt
+    C, K, nu, R = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
+    nu = nu * dt
+    c, k = C[b], K[b, None]  # per event
 
     key = b * H * W + pix
     first = torch.ones_like(key, dtype=torch.bool)
@@ -49,7 +50,7 @@ def event_nll(model, s, ev, dt, steps=128):
     seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
     seen[key] = True
     tprev = torch.where(first, torch.zeros_like(tau), tau.roll(1))
-    Rt, wR = model.R / dt[b], 1e-5 / dt[b]  # refractory time and the width of its soft edge, in gap units
+    Rt, wR = R[b] / dt[b], 1e-5 / dt[b]  # refractory time and the width of its soft edge, in gap units
     wake = torch.where(first, tprev, torch.minimum(tprev + Rt, tau))  # end of the blind time: ref is taken here
     awake = torch.where(first, torch.ones_like(tau), torch.sigmoid((tau - tprev - Rt) / wR))
     own = (pol < 0).long()[:, None]
@@ -93,9 +94,9 @@ def event_nll(model, s, ev, dt, steps=128):
         q = round(d * steps)
         win = Lg[:, max(0, -q):steps + 1 - max(0, q)]  # the path seen inside the window
         L0 = win[:, 0]
-        whole = (torch.stack([win.amax(1) - L0, L0 - win.amin(1)], 1) / c[:, None]).transpose(1, 2).reshape(-1, 2)
+        whole = (torch.stack([win.amax(1) - L0, L0 - win.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
         ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
-        return torch.where(seen, ll, ig_logs(whole, k)[2].sum(1))
+        return torch.where(seen, ll, ig_logs(whole, K.repeat_interleave(H * W)[:, None])[2].sum(1))
 
     shifts = SHIFTS if "sig" in s else (0,)
     lls = torch.stack([checkpoint(pixel_ll, Lg, q / steps, use_reentrant=False) if grad else pixel_ll(Lg, q / steps) for q in shifts])
@@ -109,7 +110,7 @@ def event_nll(model, s, ev, dt, steps=128):
 def photo_loss(model, s, mid, mid_tau):
     if mid.shape[1] == 0:
         return mid.new_zeros(())
-    err = [(model.render(s, mid_tau[:, j])[0] - torch.log(luminance(mid[:, j], model.gamma) + model.eps)).abs().mean()
+    err = [(model.render(s, mid_tau[:, j])[0] - torch.log(model.bright(mid[:, j], s["ds"], s["cfa"]) + model.eps)).abs().mean()
            for j in range(mid.shape[1])]
     return sum(err) / len(err)
 
@@ -159,7 +160,7 @@ def compute(model, batch, w, stage):
         loss = F.mse_loss(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts"), target)
         return loss, dict(probe=loss)
 
-    p = model.prepare(batch["i0"], batch["i1"])
+    p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     terms = {}
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
@@ -182,7 +183,7 @@ def compute(model, batch, w, stage):
 def diagnostics(model, batch, w, student=True):
     # does the decoder use z (shuffled / zero codes must hurt), and how much can the student predict (gap)?
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
-    p = model.prepare(batch["i0"], batch["i1"])
+    p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     z = model.encode(p, batch["voxel"])
     nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"]).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))

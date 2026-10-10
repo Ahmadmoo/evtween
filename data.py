@@ -45,7 +45,9 @@ class PairDataset(torch.utils.data.Dataset):
         self.seqs = [Sequence(os.path.dirname(p)) for r in roots
                      for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
         g = skip + 1
-        self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)]
+        cut = [np.searchsorted(s.ev["t"], s.ts) if s.ev is not None else None for s in self.seqs]  # events before each frame
+        self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)
+                      if cut[k] is None or cut[k][i + g] > cut[k][i]]  # gaps with no event at all are holes in the recording
         self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, skip, context, bins, min_events, train
         self.ds = ds  # dataset id carried by every sample (joint training: position in data.sets)
 

@@ -27,7 +27,7 @@ TEST
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
 | Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
-| Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on`, `k`, `ν` are learned |
+| Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on`, `k`, `ν`, refractory `R` are learned **per dataset** (each dataset is its own camera); brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. Mismatch and refractory are optional extras (off by default, not learned) |
 
 ### Losses
@@ -129,6 +129,7 @@ Joint training, `data.sets` in `config.yaml`:
 - Every batch comes from one dataset (same number of hidden frames); dataset d with probability ∝ `weight`.
 - Every sample carries `ds` (position in `data.sets`; stays the same when an entry is set to `null`) and `cfa` (2x2 color filter of the crop, -1 without a filter).
 - Validation: fixed samples per dataset (`val/`, else `test/`), one line per dataset.
+- Gaps (I0 → I1) without a single event are left out: holes in the recording, not still scenes.
 
 ---
 
@@ -181,7 +182,7 @@ python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out r
 ## 6. Generate
 
 ```bash
-python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz
+python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz --dataset bsergb   # whose sensor / brightness mapping
 python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5e-4
 ```
 
@@ -193,7 +194,7 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 
 | Key | Effect |
 |---|---|
-| `data.sets` | Datasets trained together: `root`, `skip` (hidden frames in the gap; `(skip+1)/fps` close to the frame interval of the videos you will convert), `weight` (share of batches) |
+| `data.sets` | Datasets trained together: `root`, `skip` (hidden frames in the gap; `(skip+1)/fps` close to the frame interval of the videos you will convert), `weight` (share of batches), `gamma` (PNG → linear light, from `check_data.py`) |
 | `data.context` | Frames per side for the student, taken at the gap's own stride, so training sees the same frame spacing as generation (even for V-JEPA 2.1) |
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
 | `model.z_dim` | Size of the path code per patch |

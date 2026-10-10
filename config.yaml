@@ -1,12 +1,14 @@
 data:
   sets:                        # datasets trained together (converted by <DATASET>/<name>.py); every batch comes from one of them
-    hqevfi: {root: data/hqevfi, skip: 4, weight: 1.0}   # 142 fps: 5 frame steps = 35 ms gaps
-    bsergb: {root: data/bsergb, skip: 0, weight: 1.0}   # 20-28 fps: 36-50 ms
-    eds:    {root: data/eds,    skip: 2, weight: 1.0}   # 75 fps: 40 ms
-    ced:    {root: data/ced,    skip: 0, weight: 1.0}   # 9-40 fps: 25-110 ms
+    hqevfi: {root: data/hqevfi, skip: 4, weight: 1.0, gamma: 1.0}   # 142 fps: 5 frame steps = 35 ms gaps
+    bsergb: {root: data/bsergb, skip: 0, weight: 1.0, gamma: 2.2}   # 20-28 fps: 36-50 ms
+    eds:    {root: data/eds,    skip: 2, weight: 1.0, gamma: 1.0}   # 75 fps: 40 ms
+    ced:    {root: data/ced,    skip: 0, weight: 1.0, gamma: 1.0}   # 9-40 fps: 25-110 ms
                                # root holds train/ and val/ or test/ (val falls back to test); skip = frames hidden
                                # between I0 and I1: (skip+1)/fps close to the frame interval of the target video;
-                               # weight = share of batches (normalized); the order gives the dataset id (batch["ds"])
+                               # weight = share of batches (normalized); the order gives the dataset id (batch["ds"]);
+                               # gamma: PNG value^gamma = linear light (check_data.py picks 1.0 or 2.2); each dataset
+                               # also gets its own learned sensor (c, r, k, nu, R) and RGB weights
   crop: 256                    # multiple of 16
   context: 4                   # frames per side for the student, taken at the gap's stride (even for vjepa2_1: 2-frame tubelets)
   bins: 16                     # time bins of the teacher's event input
@@ -20,7 +22,7 @@ model:
   z_dim: 32                    # path code per 16x16 patch
   flow_prior: raft             # raft | none
   flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
-  gamma: 1.0                   # PNG -> linear light (HQ-EVFI: 1.0 beat 2.2, val nll 0.35 vs 0.67)
+  gamma: 1.0                   # PNG -> linear light for datasets without their own gamma in data.sets
   eps: 0.01                    # L = log(Y + eps)
   c_init: 0.25                 # contrast threshold (learned)
   r_init: 1.0                  # C_off / C_on (learned)

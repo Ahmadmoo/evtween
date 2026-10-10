@@ -63,6 +63,7 @@ torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 model = build_model(cfg).to(dev)
 if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     sd, own = torch.load(T["init"], map_location=dev, weights_only=False)["model"], model.state_dict()
+    sd = {k: v.expand_as(own[k]).clone() if k in own and v.dim() == 0 and own[k].dim() == 1 else v for k, v in sd.items()}  # one sensor -> all
     skip = sorted({k.split(".")[0] for k, v in sd.items() if k in own and own[k].shape != v.shape})
     model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
     if rank == 0 and skip:
@@ -138,8 +139,10 @@ while step < T["steps"]:
 
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
-            print(f"[{stage}] step {step} {list(D['sets'])[int(batch['ds'][0])]} loss {loss.item():.4f} {msg} c {model.c.item():.3f} r {model.r.item():.3f} "
-                  f"k {model.log_k.exp().item():.2f} nu {model.log_nu.exp().item():.2f} R {model.R.item() * 1e6:.0f}us gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
+            d = int(batch["ds"][0])  # the sensor of this batch's dataset
+            print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {model.c[d].item():.3f} r {model.r[d].item():.3f} "
+                  f"k {model.log_k[d].exp().item():.2f} nu {model.log_nu[d].exp().item():.2f} R {model.R[d].item() * 1e6:.0f}us "
+                  f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
             torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
             for name, val in vals.items():

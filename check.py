@@ -23,7 +23,8 @@ for name, S in sets.items():
     for split in ("train", "val", "test"):
         if not os.path.isdir(f"{S['root']}/{split}"):
             continue
-        ds = PairDataset(f"{S['root']}/{split}", D["crop"], S["skip"], D["context"], D["bins"], 0, train=False)
+        d = list(D["sets"]).index(name) if name in (D.get("sets") or {}) else 0  # dataset id: its sensor in the model
+        ds = PairDataset(f"{S['root']}/{split}", D["crop"], S["skip"], D["context"], D["bins"], 0, train=False, ds=d)
         print(f"{name} {split}: {len(ds.seqs)} sequences, {len(ds)} samples, skip {S['skip']}")
         if len(ds) == 0:
             continue
@@ -32,7 +33,7 @@ for name, S in sets.items():
         for b in DataLoader(ds, 8, collate_fn=collate, num_workers=4):
             b = {k: v.to(dev) for k, v in b.items()}
             with torch.no_grad():
-                p = model.prepare(b["i0"], b["i1"])
+                p = model.prepare(b["i0"], b["i1"], b["ds"], b["cfa"])
                 z = model.encode(p, b["voxel"])
                 ev = (b["ev_b"], b["ev_pix"], b["ev_tau"], b["ev_pol"])
                 nll = lambda code, e=ev: event_nll(model, model.decode(p, code), e, b["dt"], cfg["loss"]["grid"]).item()

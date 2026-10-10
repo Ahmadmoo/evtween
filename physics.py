@@ -16,17 +16,18 @@ def first_root(a, b, c, lo, hi):
     return torch.minimum(torch.where(ok(r1), r1, inf), torch.where(ok(r2), r2, inf))
 
 
-def profile(model):
-    # the learned sensor in physical units (v2e names and meanings where v2e has the parameter);
+def profile(model, ds=0):
+    # the learned sensor of dataset ds in physical units (v2e names and meanings where v2e has the parameter);
     # sigma_event: per-event threshold noise as a fraction of the threshold;
     # sigma_thres: fixed per-pixel threshold spread in log units, as in v2e (not learned, v2e's default 0.03)
-    return dict(pos_thres=model.c.item(), neg_thres=(model.c * model.r).item(), sigma_event=model.log_k.exp().item() ** -0.5,
-                sigma_thres=0.03, shot_noise_rate_hz=model.log_nu.exp().item(), refractory_period_s=model.R.item())
+    C, k, nu, R = (v[0] for v in model.sensor(torch.tensor([ds], device=model.log_c.device)))
+    return dict(pos_thres=C[0].item(), neg_thres=C[1].item(), sigma_event=k.item() ** -0.5,
+                sigma_thres=0.03, shot_noise_rate_hz=nu.item(), refractory_period_s=R.item())
 
 
-def resolve(model, name="learned", overrides=None):
+def resolve(model, name="learned", overrides=None, ds=0):
     # learned | clean | profile YAML (any subset of keys), then overrides: a number, or "x1.5" = 1.5 x the profile value
-    p = profile(model)
+    p = profile(model, ds)
     if name == "clean":  # like v2e --dvs_params clean: no noise, small threshold spread
         p.update(sigma_event=0.03, sigma_thres=0.0, shot_noise_rate_hz=0.0)
     elif name != "learned":
