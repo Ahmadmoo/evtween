@@ -9,7 +9,7 @@ At test time only RGB is needed.
 
 ```
 TRAIN
- I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 16×16 patch)
+ I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 32×32 patch)
  context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
  z or ẑ + I0, I1 ──> physics decoder ──> L(u,τ), dL/dτ ──> exact-time event likelihood
 
@@ -23,9 +23,9 @@ TEST
 
 | Part | What it does |
 |---|---|
-| Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 16×16 patch grid. Training only |
+| Teacher | Hybrid event encoder (training only). (1) Exact-time event tokens: each real event (its place in its 16 px patch, `τ`, polarity, Fourier features) → small MLP; 4 attention queries pool the events of each patch (softmax over that patch, no padding). (2) Patch embedding of the time-binned voxel + I0, I1. Both added → ViT (S or B, 12 blocks, from scratch) → 2×2 tokens merged → `z` (256 numbers per 32×32 patch). The event branch starts at zero, so training begins as a plain voxel ViT |
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
-| Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
+| Decoder | Frames (I0, I1, RAFT flows, warp errors) → ViT (same size as the teacher) → Depth-Anything-V2 DPT head at full resolution + a full-resolution conv branch for fine edges. Features are **gated by `z`** (1×1 conv, no bias, `z` upsampled): `z = 0` gives exactly the plain SloMo path, so the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
 | Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on`, `k`, `ν`, refractory `R` are learned **per dataset** (each dataset is its own camera); brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. Mismatch and refractory are optional extras (off by default, not learned) |
@@ -66,6 +66,8 @@ TEST
 | V-JEPA 2.1 ViT-L | [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2) | `torch.hub.load(..., "vjepa2_1_vit_large_384", pretrained=False)`, then the official checkpoint (`ema_encoder`). The repo's hub file points downloads to `localhost`, so the URL is set in `model.py` |
 | LeVJEPA ViT-L | [galilai-group/LeVJEPA-VideoMix-Large](https://huggingface.co/galilai-group/LeVJEPA-VideoMix-Large) | `AutoModel.from_pretrained(..., trust_remote_code=True)` |
 | SIGReg | [rbalestr-lab/lejepa](https://github.com/rbalestr-lab/lejepa) | `SlicingUnivariateTest(EppsPulley(n_points=17), num_slices=256)` |
+| ViT | [timm](https://github.com/huggingface/pytorch-image-models) | `VisionTransformer(..., dynamic_img_size=True)`, from scratch |
+| DPT head | [Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-V2) (Apache-2.0) | `third_party/dpt.py`: `blocks.py` + `DPTHead`, two marked changes (output channels, no final ReLU). The unused unit of the deepest fusion block is removed in `model.py` |
 
 ---
 
@@ -170,7 +172,7 @@ The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT 
 ```bash
 python toy_data.py data/toy 24
 S="data.sets={\"toy\":{\"root\":\"data/toy\",\"skip\":3}} data.crop=64 data.min_events=50 data.workers=2 data.bins=8 \
-   model.flow_prior=none model.backbone=none model.width=16 model.depth=[1,1,1] model.pred_dim=64 model.pred_depth=2 \
+   model.flow_prior=none model.backbone=none model.width=16 model.z_dim=64 model.ev_dim=32 model.pred_dim=64 model.pred_depth=2 \
    loss.grid=16 train.batch=4 train.lr=1e-3 train.warmup=20 train.log_every=100 train.val_batches=8"
 python train.py $S train.stage=teacher train.steps=1000 train.save_every=500 train.out=runs/teacher
 python train.py $S train.stage=student train.init=runs/teacher/last.pt train.steps=600 train.save_every=300 train.out=runs/student
@@ -197,7 +199,9 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 | `data.sets` | Datasets trained together: `root`, `skip` (hidden frames in the gap; `(skip+1)/fps` close to the frame interval of the videos you will convert), `weight` (share of batches), `gamma` (PNG → linear light, from `check_data.py`) |
 | `data.context` | Frames per side for the student, taken at the gap's own stride, so training sees the same frame spacing as generation (even for V-JEPA 2.1) |
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
-| `model.z_dim` | Size of the path code per patch |
+| `model.vit` | `s` (teacher + decoder ≈ 26 + 25 M params) or `b` (≈ 94 + 99 M) |
+| `model.z_dim` | Size of the path code per 32×32 patch |
+| `model.ev_cap` | Max events per batch for the teacher's event tokens (random subset above it) |
 | `model.K` | Polynomial order of the path in time |
 | `loss.grid` | τ steps for the likelihood clocks |
 | `sensor.*` | Generation only: `noise` scales the learned background rate; `mismatch`, `refractory` are optional extras; step limits |

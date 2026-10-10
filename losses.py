@@ -156,20 +156,20 @@ def compute(model, batch, w, stage):
     # stage: probe | teacher | student | joint
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     if stage == "probe":
-        target = torch.log1p(F.avg_pool2d(batch["voxel"], 16) * 256)
+        target = torch.log1p(F.avg_pool2d(batch["voxel"], model.mult) * model.mult ** 2)
         loss = F.mse_loss(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts"), target)
         return loss, dict(probe=loss)
 
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     terms = {}
     if stage in ("teacher", "joint"):
-        z = model.encode(p, batch["voxel"])
+        z = model.encode(p, batch["voxel"], ev)
         s = model.decode(p, z)
         terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=SIGREG.to(z.device)(z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])))
     if stage in ("student", "joint"):
-        zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
+        zt = model.encode(p, batch["voxel"], ev).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)
         terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"]))
@@ -184,7 +184,7 @@ def diagnostics(model, batch, w, student=True):
     # does the decoder use z (shuffled / zero codes must hurt), and how much can the student predict (gap)?
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
-    z = model.encode(p, batch["voxel"])
+    z = model.encode(p, batch["voxel"], ev)
     nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"]).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
     if student:

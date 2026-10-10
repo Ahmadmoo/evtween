@@ -2,11 +2,16 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models.vision_transformer import VisionTransformer
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+from third_party.dpt import DPTHead
 
 # official V-JEPA 2.1 ViT-L checkpoint (the hub file in facebookresearch/vjepa2 points its downloads to localhost)
 VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt"
 LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
+VIT = {"s": dict(embed_dim=384, num_heads=6), "b": dict(embed_dim=768, num_heads=12)}  # depth 12, 16 px patches
+DPT = {"s": (64, [48, 96, 192, 384]), "b": (128, [96, 192, 384, 768])}  # Depth-Anything-V2 head sizes for vits / vitb
+TAKE = (2, 5, 8, 11)  # ViT blocks the DPT head reads (Depth-Anything-V2, vits / vitb)
 
 
 def luminance(img, gamma=2.2):
@@ -56,45 +61,20 @@ def fourier(v, n=16):
     return torch.cat([a.sin(), a.cos()], -1)
 
 
-class LayerNorm2d(nn.LayerNorm):
-    def forward(self, x):
-        return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+def vit(size, cin):
+    # timm's ViT (authors' code) trained from scratch, any image size (the position embedding is resampled)
+    return VisionTransformer(img_size=256, patch_size=16, in_chans=cin, depth=12, num_classes=0, global_pool="",
+                             class_token=False, dynamic_img_size=True, **VIT[size])
 
 
-class Block(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.dw = nn.Conv2d(c, c, 7, padding=3, groups=c)
-        self.norm = LayerNorm2d(c)
-        self.mlp = nn.Sequential(nn.Conv2d(c, 4 * c, 1), nn.GELU(), nn.Conv2d(4 * c, c, 1))
-        self.scale = nn.Parameter(torch.full((1, c, 1, 1), 1e-2))
-
-    def forward(self, x):
-        return x + self.scale * self.mlp(self.norm(self.dw(x)))
-
-
-class UNet(nn.Module):
-    def __init__(self, cin, cout, width, depth):
-        super().__init__()
-        ch = [width * 2 ** i for i in range(len(depth))]
-        self.stem = nn.Conv2d(cin, ch[0], 3, padding=1)
-        self.enc = nn.ModuleList(nn.Sequential(*[Block(c) for _ in range(n)]) for c, n in zip(ch, depth))
-        self.down = nn.ModuleList(nn.Sequential(LayerNorm2d(a), nn.Conv2d(a, b, 2, stride=2)) for a, b in zip(ch, ch[1:]))
-        self.up = nn.ModuleList(nn.Conv2d(b, a, 1) for a, b in zip(ch, ch[1:]))
-        self.dec = nn.ModuleList(nn.Sequential(nn.Conv2d(2 * a, a, 1), Block(a)) for a in ch[:-1])
-        self.head = nn.Sequential(LayerNorm2d(ch[0]), nn.Conv2d(ch[0], cout, 3, padding=1))
-
-    def forward(self, x):
-        x, skips = self.stem(x), []
-        for i, blk in enumerate(self.enc):
-            x = blk(x)
-            if i < len(self.down):
-                skips.append(x)
-                x = self.down[i](x)
-        for i in reversed(range(len(skips))):
-            x = F.interpolate(self.up[i](x), scale_factor=2, mode="bilinear", align_corners=False)
-            x = self.dec[i](torch.cat([x, skips[i]], 1))
-        return self.head(x)
+def run_vit(v, x):
+    # patch tokens (B, h, w, D) -> output tokens (B, h*w, D) and the normed outputs of the TAKE blocks
+    x, outs = v.norm_pre(v.patch_drop(v._pos_embed(x))), []
+    for i, blk in enumerate(v.blocks):
+        x = blk(x)
+        if i in TAKE:
+            outs.append(v.norm(x))
+    return v.norm(x), outs
 
 
 class FlowPrior(nn.Module):
@@ -188,52 +168,91 @@ class Student(nn.Module):
         gy, gx = torch.meshgrid(torch.arange(h, device=tok.device), torch.arange(w, device=tok.device), indexing="ij")
         mem = self.inp(tok) + self.embed(gy.expand(B, n, h, w), gx.expand(B, n, h, w),
                                          tt.view(B, n, 1, 1).expand(B, n, h, w), dt.view(B, 1, 1, 1).expand(B, n, h, w))
-        q = self.query + self.embed(gy.expand(B, h, w), gx.expand(B, h, w),
-                                    torch.full((B, h, w), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, h, w))
+        qy, qx = (g[::2, ::2] + 0.5 for g in (gy, gx))  # one query per 32 px cell (centre of its 2x2 tokens)
+        hq, wq = qy.shape
+        q = self.query + self.embed(qy.expand(B, hq, wq), qx.expand(B, hq, wq),
+                                    torch.full((B, hq, wq), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, hq, wq))
         out = self.dec(q.flatten(1, 2), mem.flatten(1, 3))
-        return out.transpose(1, 2).reshape(B, -1, h, w)
+        return out.transpose(1, 2).reshape(B, -1, hq, wq)
 
 
 class EventEncoder(nn.Module):
-    # teacher: real events in the gap (time-binned) + I0, I1 -> path code on the 16x16 patch grid
-    def __init__(self, cin, z_dim, width):
+    # teacher, hybrid: exact-time event tokens (each event: place in its 16 px patch, time, polarity -> MLP; 4 queries pool the
+    # events of a patch by attention) added to a patch embedding of the time-binned voxel and I0, I1 -> ViT -> 2x2 tokens
+    # merged -> path code on the 32 px grid
+    def __init__(self, cin, z_dim, size, ev_dim=128, queries=4, cap=400_000):
         super().__init__()
-        ch = [width, 2 * width, 4 * width, 4 * width, 4 * width]
-        layers = [nn.Conv2d(cin, ch[0], 3, padding=1)]
-        for a, b in zip(ch, ch[1:]):
-            layers += [Block(a), LayerNorm2d(a), nn.Conv2d(a, b, 2, stride=2)]
-        self.net = nn.Sequential(*layers, Block(ch[-1]), Block(ch[-1]), LayerNorm2d(ch[-1]), nn.Conv2d(ch[-1], z_dim, 1))
+        self.vit, self.q, self.cap = vit(size, cin), queries, cap
+        D = self.vit.embed_dim
+        self.ev = nn.Sequential(nn.Linear(36, ev_dim), nn.GELU(), nn.Linear(ev_dim, ev_dim), nn.GELU())
+        self.key, self.val = nn.Linear(ev_dim, queries), nn.Linear(ev_dim, queries * ev_dim)
+        self.out = nn.Linear(queries * ev_dim, D)
+        nn.init.zeros_(self.out.weight)  # starts as the plain voxel ViT
+        nn.init.zeros_(self.out.bias)
+        self.merge = nn.Linear(4 * D, z_dim)
 
-    def forward(self, x):
-        return self.net(x)
+    def pool(self, e, seg, n):
+        # attention pooling per patch without padding: query j weights the patch's events by softmax over the patch of key_j
+        a, v = self.key(e).float(), self.val(e).float().view(len(e), self.q, -1)
+        m = torch.full((n, self.q), -1e30, device=e.device).scatter_reduce(0, seg[:, None].expand_as(a), a.detach(), "amax")
+        w = (a - m[seg]).exp()
+        s = torch.zeros(n, self.q, device=e.device).index_add(0, seg, w)
+        out = torch.zeros(n, self.q, v.shape[-1], device=e.device).index_add(0, seg, w[..., None] * v)
+        return (out / s.clamp(min=1e-12)[..., None]).flatten(1)
+
+    def forward(self, x, ev, W):
+        # x: (B, cin, H, W) padded to the 32 px grid; ev: batch index, pixel index in the W-wide crop, tau, polarity
+        tok = self.vit.patch_embed(x)  # (B, h, w, D)
+        B, h, w, D = tok.shape
+        b, pix, tau, pol = ev
+        if self.training and len(tau) > self.cap:  # memory stays bounded: a random subset of the events
+            k = torch.randperm(len(tau), device=tau.device)[:self.cap]
+            b, pix, tau, pol = b[k], pix[k], tau[k], pol[k]
+        if len(tau):
+            px, py = pix % W, pix // W
+            u, v = (px % 16 + 0.5) / 16, (py % 16 + 0.5) / 16
+            f = torch.cat([torch.stack([u, v, tau, pol.float()], -1), fourier(tau, 16), fourier(u, 8), fourier(v, 8)], -1)
+            seg = (b * h + py // 16) * w + px // 16
+            tok = tok + self.out(self.pool(self.ev(f), seg, B * h * w)).view(B, h, w, D)
+        z, _ = run_vit(self.vit, tok)
+        z = z.view(B, h // 2, 2, w // 2, 2, D).permute(0, 1, 3, 2, 4, 5).reshape(B, h // 2, w // 2, 4 * D)
+        return self.merge(z).permute(0, 3, 1, 2)
 
 
 class Decoder(nn.Module):
-    # frames + path code -> per-pixel path coefficients; every coefficient is gated by z,
-    # so z = 0 gives exactly the plain SloMo path and the decoder cannot ignore the code
-    def __init__(self, z_dim, cout, width, depth):
+    # frames (12 ch) -> ViT -> DPT head (Depth-Anything-V2) at full resolution, plus a full-resolution conv branch for fine
+    # edges; every output is gated by z, so z = 0 gives exactly the plain SloMo path and the decoder cannot ignore the code
+    def __init__(self, z_dim, cout, width, size):
         super().__init__()
-        self.feat = UNet(12, width, width, depth)
+        self.vit = vit(size, 12)
+        feat, chans = DPT[size]
+        self.dpt = DPTHead(self.vit.embed_dim, feat, False, chans, out_dim=width)
+        self.dpt.scratch.refinenet4.resConfUnit1 = None  # never used (the deepest fusion block has one input); DDP needs every param used
+        self.skip = nn.Sequential(nn.Conv2d(12, width, 3, padding=1), nn.GELU(), nn.Conv2d(width, width, 3, padding=1))
         self.gate = nn.Conv2d(z_dim, width, 1, bias=False)
         self.head = nn.Conv2d(width, cout, 1, bias=False)
         nn.init.zeros_(self.head.weight)
 
     def forward(self, x, z):
+        tok = self.vit.patch_embed(x)
+        _, h, w, _ = tok.shape
+        _, outs = run_vit(self.vit, tok)
+        f = self.dpt([(o,) for o in outs], h, w) + self.skip(x)
         g = self.gate(F.interpolate(z, size=x.shape[-2:], mode="bilinear", align_corners=False))
-        return self.head(self.feat(x) * g)
+        return self.head(f * g)
 
 
 class EvTween(nn.Module):
-    def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
-                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True, gammas=None):
+    def __init__(self, vit="s", width=64, K=3, z_dim=256, ev_dim=128, ev_cap=400_000, flow_prior="raft", flow_scale=8.0,
+                 gamma=2.2, eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16,
+                 amp=True, uncertainty=True, gammas=None):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
-        self.mult = max(16, 2 ** (len(depth) - 1))
+        self.mult = 32  # z lives on the 32 px grid
         self.flow = FlowPrior(flow_prior)
-        self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
+        self.teacher = EventEncoder(2 * bins + 6, z_dim, vit, ev_dim, cap=ev_cap)
         self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty), width, depth)
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty), width, vit)
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -308,10 +327,11 @@ class EvTween(nn.Module):
         x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
         return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W, ds=ds, cfa=cfa)
 
-    def encode(self, p, voxel):
+    def encode(self, p, voxel, ev):
+        # ev: (batch index, pixel index in the crop, tau, polarity) of the real events in the gap
         x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
         with self._ac(x):
-            return self.teacher(x).float()
+            return self.teacher(x, ev, p["W"]).float()
 
     def predict(self, ctx, ctx_tau, dt, head="z"):
         ctx = self._pad(ctx)

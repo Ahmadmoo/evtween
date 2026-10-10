@@ -34,8 +34,8 @@ for name, S in sets.items():
             b = {k: v.to(dev) for k, v in b.items()}
             with torch.no_grad():
                 p = model.prepare(b["i0"], b["i1"], b["ds"], b["cfa"])
-                z = model.encode(p, b["voxel"])
                 ev = (b["ev_b"], b["ev_pix"], b["ev_tau"], b["ev_pol"])
+                z = model.encode(p, b["voxel"], ev)
                 nll = lambda code, e=ev: event_nll(model, model.decode(p, code), e, b["dt"], cfg["loss"]["grid"]).item()
                 s = model.decode(p, z)
                 out = dict(nll=nll(z), shuffled=nll(z.roll(1, 0)), zero=nll(torch.zeros_like(z)),

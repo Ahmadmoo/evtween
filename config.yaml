@@ -16,10 +16,12 @@ data:
   workers: 8
 
 model:
-  width: 64
-  depth: [2, 2, 4, 2]          # decoder UNet levels
+  vit: s                       # teacher and decoder ViT, from scratch: s (384 wide, 6 heads) | b (768 wide, 12 heads); 12 blocks, 16 px patches
+  width: 64                    # decoder output features (DPT head + full-res skip)
   K: 3                         # polynomial order of the path in time
-  z_dim: 32                    # path code per 16x16 patch
+  z_dim: 256                   # path code per 32x32 patch
+  ev_dim: 128                  # per-event features before pooling into the patch tokens
+  ev_cap: 400000               # max events per batch the teacher tokenizes (random subset above it, training only)
   flow_prior: raft             # raft | none
   flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
   gamma: 1.0                   # PNG -> linear light for datasets without their own gamma in data.sets
