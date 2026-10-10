@@ -7,6 +7,14 @@ import lejepa
 SIGREG = lejepa.multivariate.SlicingUnivariateTest(univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=256)
 
 
+def sigreg_loss(z):
+    # lejepa's statistic grows with the number of samples (x N x GPUs): rescale to 256 samples so the weight
+    # does not depend on batch, crop or GPU count
+    x = z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])
+    n = len(x) * (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1)
+    return SIGREG.to(z.device)(x) * 256 / n
+
+
 def ig_logs(x, k):
     # inverse Gaussian with mean 1 and shape k (float64 for stability):
     # log pdf, log survival, and log survival of the stationary first wait (pixel state unknown at the window start)
@@ -167,7 +175,7 @@ def compute(model, batch, w, stage):
         s = model.decode(p, z)
         terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
-                     sigreg=SIGREG.to(z.device)(z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])))
+                     sigreg=sigreg_loss(z))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
