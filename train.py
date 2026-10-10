@@ -14,9 +14,9 @@ from model import build_model
 
 # which parameters each stage trains (pretrained RAFT / video backbone always stay frozen)
 TRAIN = {"probe": ("student.", "to_counts."),
-         "teacher": ("teacher.", "decoder.", "log_"),
+         "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
          "student": ("student.", "to_z."),
-         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_")}
+         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
 
 
 def load_cfg(argv):
