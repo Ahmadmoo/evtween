@@ -226,7 +226,7 @@ class Decoder(nn.Module):
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True, gammas=None):
+                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -245,6 +245,9 @@ class EvTween(nn.Module):
         self.log_nu = full(0.2)                                       # background events per pixel per second
         self.log_R = full(5e-5)                                       # refractory time (s); grows from below to the real floor
         self.R_max = 2e-3                                             # soft cap: with few events per pixel R is weakly pinned
+        # sensor noise set in the config instead of learned (None = learned): learned, it soaks up the path's errors and the
+        # sampler then spreads them as noise. sigma_event: threshold spread per event (fraction of c), nu: events / px / s
+        self.k_fixed, self.nu_fixed, self.sig_max = None if sigma_event is None else sigma_event ** -2, nu, sig_max
         self.w_rgb = nn.Parameter(torch.tensor([[0.299, 0.587, 0.114]]).log().repeat(n, 1))  # RGB weights (softmax), learned
         self.register_buffer("gammas", torch.tensor(gammas or [gamma], dtype=torch.float32), persistent=False)  # from config
 
@@ -274,7 +277,9 @@ class EvTween(nn.Module):
     def sensor(self, ds):
         # per sample: thresholds (C_on, C_off), IG shape k, background rate nu (1/s), refractory R (s)
         c = self.log_c.exp()[ds]
-        return torch.stack([c, c * self.log_r.exp()[ds]], 1), self.log_k.exp()[ds], self.log_nu.exp()[ds], self.R[ds]
+        k = self.log_k.exp()[ds] if self.k_fixed is None else torch.full_like(c, self.k_fixed)
+        nu = self.log_nu.exp()[ds] if self.nu_fixed is None else torch.full_like(c, self.nu_fixed)
+        return torch.stack([c, c * self.log_r.exp()[ds]], 1), k, nu, self.R[ds]
 
     def load_state_dict(self, sd, strict=False):
         # checkpoints from before per-dataset sensors hold one value per parameter: every dataset starts from it
@@ -284,6 +289,9 @@ class EvTween(nn.Module):
 
     def frozen(self, name):
         return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
+
+    def fixed(self, name):
+        return (name == "log_k" and self.k_fixed is not None) or (name == "log_nu" and self.nu_fixed is not None)
 
     def state(self):
         # checkpoint without the frozen pretrained networks (reloaded from their official sources)
@@ -330,7 +338,8 @@ class EvTween(nn.Module):
         s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
         if self.uncertainty:
-            s["sig"] = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
+            sig = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
+            s["sig"] = sig if self.sig_max is None else self.sig_max * torch.tanh(sig / self.sig_max)  # optional lower cap
         return s
 
     def flows(self, s, tau):

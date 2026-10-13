@@ -69,7 +69,7 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
 for n, p in model.named_parameters():
-    p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n)
+    p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
 params = [p for p in model.parameters() if p.requires_grad]
 opt = torch.optim.AdamW([{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
                          {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}],
@@ -140,8 +140,9 @@ while step < T["steps"]:
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
             d = int(batch["ds"][0])  # the sensor of this batch's dataset
-            print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {model.c[d].item():.3f} r {model.r[d].item():.3f} "
-                  f"k {model.log_k[d].exp().item():.2f} nu {model.log_nu[d].exp().item():.2f} R {model.R[d].item() * 1e6:.0f}us "
+            C, K, nu, R = (v[0] for v in model.sensor(batch["ds"][:1]))
+            print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {C[0].item():.3f} r {(C[1] / C[0]).item():.3f} "
+                  f"k {K.item():.2f} nu {nu.item():.2f} R {R.item() * 1e6:.0f}us "
                   f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
             torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)

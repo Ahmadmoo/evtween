@@ -3,7 +3,7 @@ data:
     hqevfi: {root: data/hqevfi, skip: 4, weight: 1.0, gamma: 1.0}   # 142 fps: 5 frame steps = 35 ms gaps
     bsergb: {root: data/bsergb, skip: 0, weight: 1.0, gamma: 2.2}   # 20-28 fps: 36-50 ms
     eds:    {root: data/eds,    skip: 2, weight: 1.0, gamma: 1.0}   # 75 fps: 40 ms
-    ced:    {root: data/ced,    skip: 0, weight: 1.0, gamma: 1.0}   # 9-40 fps: 25-110 ms
+    ced:    null                                                    # left out; null keeps the ids of the others (checkpoints stay compatible)
                                # root holds train/ and val/ or test/ (val falls back to test); skip = frames hidden
                                # between I0 and I1: (skip+1)/fps close to the frame interval of the target video;
                                # weight = share of batches (normalized); the order gives the dataset id (batch["ds"]);
@@ -31,6 +31,9 @@ model:
   pred_depth: 4
   amp: true                    # bf16 on CUDA
   uncertainty: true            # decoder also predicts how unsure the path is about arrival times
+  sigma_event: 0.2             # threshold spread per event (fraction of c), fixed; null = learned (it then soaks up path errors)
+  nu: 0.1                      # background events per pixel per second, fixed; null = learned
+  sig_max: 0.03                # cap on the arrival-time uncertainty (gap units, training only); null = no cap (0.2)
 
 loss:
   nll: 1.0                     # exact-time event likelihood
