@@ -46,7 +46,10 @@ class Simulator:
     # thresholds X*C with X ~ IG(1, sigma_event^-2), exact crossing of the local quadratic of L, background events;
     # after any event the pixel is blind for the refractory time and takes ref = L at the end of it;
     # sigma_thres adds a fixed per-pixel threshold offset (sampler only).
-    # With the tube (s["tube"]) the pixel sees the least-event path in the frame-noise tube, linear between grid points
+    # With the tube (s["tube"]) the pixel sees the least-event path in the frame-noise tube, linear between grid points.
+    # With s["texture"] random texture events come on top, at rate a |dL/dtau| / (2 C_pol) (as in losses.event_nll);
+    # then texture and background events leave the pixel's state alone (only real crossings reset it).
+    # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture
     def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
         self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
@@ -92,45 +95,68 @@ class Simulator:
             # each gap's path starts free inside the tube: the jump from the last gap's end fires nothing
             self.ref = g[:, 0].clone() if fresh else self.ref + g[:, 0] - self.last
             self.last = g[:, -1]
-        H, out = 1.0 / S, []
+        H, out, a = 1.0 / S, [], s.get("texture")
         for i in range(S):
             if g is not None:  # linear between grid points
-                self._cross(g[:, i], (g[:, i + 1] - g[:, i]) / H, torch.zeros_like(La), H, t0 + dt * i * H, dt, out)
-                continue
-            Lb, Db, _ = m.render(s, tau((i + 1) * H))
-            self._cross(La, Da, (Lb - La - Da * H) / H ** 2, H, t0 + dt * i * H, dt, out)
-            La, Da = Lb, Db
-        t, x, y, p = (torch.cat(v).cpu().numpy() for v in zip(*out)) if out else ([np.zeros(0)] * 4)
+                La, Lb = g[:, i], g[:, i + 1]
+                Da, alpha = (Lb - La) / H, torch.zeros_like(La)
+            else:
+                Lb, Db, _ = m.render(s, tau((i + 1) * H))
+                alpha = (Lb - La - Da * H) / H ** 2
+            tex = None if a is None else a * (Lb - La).abs() / H / (2 * self.c)  # texture events per unit time, ON / OFF
+            self._cross(La, Da, alpha, H, t0 + dt * i * H, dt, out, tex)
+            if g is None:
+                La, Da = Lb, Db
+        t, x, y, p, src = (torch.cat(v).cpu().numpy() for v in zip(*out)) if out else ([np.zeros(0)] * 5)
         o = np.argsort(t, kind="stable")
-        return dict(t=t[o], x=x[o].astype(np.int16), y=y[o].astype(np.int16), p=p[o].astype(np.int8))
+        return dict(t=t[o], x=x[o].astype(np.int16), y=y[o].astype(np.int16), p=p[o].astype(np.int8), s=src[o].astype(np.int8))
 
-    def _cross(self, La, Da, alpha, H, ta, dt, out):
+    def warm(self, s, t0, t1):
+        # run a gap and drop its events (e.g. the gap before the one of interest): the pixels then start in a real state
+        # (reference, thresholds, blind time) instead of the stationary guess, so the first events of the gap are no burst
+        self.run(s, t0, t1)
+
+    def _cross(self, La, Da, alpha, H, ta, dt, out, tex=None):
         q = lambda h: La + Da * h + alpha * h * h
         hw = ((self.wake - ta) / dt).float().clamp(min=0)  # where in this step each pixel wakes up
         woke = self.pending & (hw <= H)
         self.ref = torch.where(woke, q(hw), self.ref)
         self.pending = self.pending & ~woke
         h_last, inf = torch.zeros_like(La), torch.full_like(La, math.inf)
+        if tex is not None:  # texture: a Poisson process in this step (ON + OFF), its next time drawn ahead (memoryless)
+            lam = tex[0] + tex[1]
+            p_on = torch.where(lam > 0, tex[0] / lam, 0.5)
+            next_tex = lambda h: h - self._u(La.shape).log().float() / lam
+            h_tex = next_tex(h_last)
         for _ in range(self.max_events):
             lo = torch.where(self.pending, inf, torch.maximum(h_last, hw))  # no signal while blind
             r_on = first_root(alpha, Da, La - self.ref - self.x[0] * self.c[0], lo, H)
             r_off = first_root(alpha, Da, La - self.ref + self.x[1] * self.c[1], lo, H)
             h_noise = ((self.next_noise - ta) / dt).float()
             r_noise = torch.where((h_noise > h_last) & (h_noise <= H), h_noise, torch.full_like(h_noise, math.inf))
-            h = torch.minimum(torch.minimum(r_on, r_off), r_noise)
+            r_tex = inf if tex is None else torch.where(h_tex <= H, h_tex, inf)
+            r_sig = torch.minimum(r_on, r_off)
+            h = torch.minimum(torch.minimum(r_sig, r_noise), r_tex)
             fire = torch.isfinite(h)
             if not fire.any():
                 break
-            noise = fire & (r_noise < torch.minimum(r_on, r_off))
+            noise = fire & (r_noise < r_sig) & (r_noise <= r_tex)
+            textured = fire & (r_tex < r_sig) & (r_tex < r_noise)
             coin = torch.where(self._u(La.shape) < 0.5, 1, -1)
             pol = torch.where(noise, coin, torch.where(r_on <= r_off, 1, -1))
+            if tex is not None:
+                pol = torch.where(textured, torch.where(self._u(La.shape) < p_on, 1, -1), pol)
             h_last = torch.where(fire, h, h_last)
             t = ta + dt * h_last.double()
-            self.wake = torch.where(fire, t + self.R, self.wake)
-            hw = torch.where(fire, ((self.wake - ta) / dt).float(), hw)
-            self.pending = torch.where(fire, hw > H, self.pending)
-            self.ref = torch.where(fire & ~self.pending, q(hw), self.ref)
-            self.x = torch.where(fire, self._ig(self.x.shape), self.x)
+            # with texture only real crossings reset the pixel: an up-and-back swing leaves its reference where it was
+            reset = fire if tex is None else fire & ~noise & ~textured
+            self.wake = torch.where(reset, t + self.R, self.wake)
+            hw = torch.where(reset, ((self.wake - ta) / dt).float(), hw)
+            self.pending = torch.where(reset, hw > H, self.pending)
+            self.ref = torch.where(reset & ~self.pending, q(hw), self.ref)
+            self.x = torch.where(reset, self._ig(self.x.shape), self.x)
             self.next_noise = torch.where(noise, self.next_noise - self._u(La.shape).log() / max(self.nu, 1e-12), self.next_noise)
+            if tex is not None:
+                h_tex = torch.where(textured, next_tex(h_last), h_tex)
             i = fire.nonzero(as_tuple=True)
-            out.append((t[i], i[3], i[2], pol[i]))
+            out.append((t[i], i[3], i[2], pol[i], (noise.to(torch.int8) + 2 * textured.to(torch.int8))[i]))

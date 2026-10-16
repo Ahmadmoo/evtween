@@ -35,15 +35,18 @@ model:
   nu: 0.1                      # background events per pixel per second, fixed; null = learned
   sig_max: 0.03                # cap on the arrival-time uncertainty (gap units, training only); null = no cap (0.2)
   tube: true                   # events from the least-event path inside the frame-noise tube (width measured per dataset)
+  texture: true                # random ON / OFF pairs for change the frames do not show (one rate per pixel, likelihood + sampler)
+  measure_c: true              # thresholds measured from frame change vs real ON / OFF counts, not learned (c_init until then)
 
 loss:
   nll: 1.0                     # exact-time event likelihood
   photo: 1.0                   # hidden real frames
   cmax: 0.0                    # contrast maximization (off: unbounded score lets flows collapse events onto few pixels)
-  smooth: 0.01
+  smooth: 0.05                 # neighbours agree on their path over the whole gap (continuous x-t / y-t)
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
   grid: 128                    # tau steps of the likelihood path (32 sends sub-grid edges / texture into the noise rate)
+  mix: 16                      # texture: how far back (in events) the likelihood looks for a pixel's last real crossing
 
 sensor:                        # generation only (generate.py / physics.Simulator)
   profile: learned             # learned | clean | profile.yaml; generate.py --sensor / --set override it

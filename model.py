@@ -8,6 +8,8 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt"
 LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
 NOISE_BINS = 16  # brightness bins of the measured frame noise (tube width)
+C_RANGE = (0.5, 2.0)  # |L1 - L0| of the pixels that measure the thresholds: above the frame noise, below the sensor's speed limit
+TEX0 = 0.01  # texture at z = 0 (extra up-and-down change per unit of path change)
 
 
 def luminance(img, gamma=2.2):
@@ -295,7 +297,8 @@ class Decoder(nn.Module):
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False):
+                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
+                 measure_c=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -303,7 +306,9 @@ class EvTween(nn.Module):
         self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
         self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
         self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube), width, depth)
+        self.texture = texture  # one more output: up-and-down change the frames do not show (random ON / OFF pairs)
+        self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture), width, depth)
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -322,6 +327,9 @@ class EvTween(nn.Module):
         self.register_buffer("gammas", torch.tensor(gammas or [gamma], dtype=torch.float32), persistent=False)  # from config
         if tube:  # frame noise sigma_L per dataset and brightness bin, measured during training (0 = not measured yet)
             self.register_buffer("noise", torch.zeros(n, NOISE_BINS))
+        if measure_c:  # running moment equations of the threshold fit per dataset (0 = not measured yet)
+            self.register_buffer("c_zx", torch.zeros(n, 2, 2))
+            self.register_buffer("c_zd", torch.zeros(n, 2))
 
     @property
     def c(self):
@@ -351,7 +359,36 @@ class EvTween(nn.Module):
         c = self.log_c.exp()[ds]
         k = self.log_k.exp()[ds] if self.k_fixed is None else torch.full_like(c, self.k_fixed)
         nu = self.log_nu.exp()[ds] if self.nu_fixed is None else torch.full_like(c, self.nu_fixed)
-        return torch.stack([c, c * self.log_r.exp()[ds]], 1), k, nu, self.R[ds]
+        C = torch.stack([c, c * self.log_r.exp()[ds]], 1)
+        if self.measure_c:  # measured thresholds where the dataset has been measured, else the initial value
+            m, ok = self.c_measured()
+            C = torch.where(ok[ds, None], m[ds], C)
+        return C, k, nu, self.R[ds]
+
+    @torch.no_grad()
+    def measure_thresholds(self, p, b, pix, pol, momentum=0.99, min_px=100):
+        # over a gap the events of a pixel add up to its brightness change: E[c_on N_on - c_off N_off | d] = d, d = L1 - L0,
+        # whatever the path did in between (texture pairs cancel). The counts are the noisy side, so the fit is counts on
+        # change: the equation weighted by the rising part max(d, 0) and by the falling part max(-d, 0) gives two linear
+        # equations for (c_on, c_off) per dataset, kept as running sums like BatchNorm statistics
+        H, W = p["H"], p["W"]
+        L0, L1 = (torch.log(p[k][:, 0, :H, :W] + self.eps).flatten() for k in ("y0", "y1"))
+        key, d = b * H * W + pix, L1 - L0
+        x = torch.stack([torch.bincount(key[pol > 0], minlength=len(d)), -torch.bincount(key[pol < 0], minlength=len(d))], 1).float()
+        m = (d.abs() >= C_RANGE[0]) & (d.abs() <= C_RANGE[1])
+        ds, x, d = p["ds"].repeat_interleave(H * W)[m], x[m], d[m]
+        z = torch.stack([d.clamp(min=0), (-d).clamp(min=0)], 1)
+        n = torch.bincount(ds, minlength=len(self.c_zd)).float()
+        zx = torch.zeros_like(self.c_zx).index_add_(0, ds, z[:, :, None] * x[:, None]) / n.clamp(min=1)[:, None, None]
+        zd = torch.zeros_like(self.c_zd).index_add_(0, ds, z * d[:, None]) / n.clamp(min=1)[:, None]
+        w = torch.where(self.c_zd.abs().sum(1) > 0, 1 - momentum, 1.0) * (n >= min_px)  # first batch of a dataset: as is
+        self.c_zx.mul_(1 - w[:, None, None]).add_(w[:, None, None] * zx)
+        self.c_zd.mul_(1 - w[:, None]).add_(w[:, None] * zd)
+
+    def c_measured(self):
+        # (C_on, C_off) per dataset from the running sums, and which datasets have been measured
+        c = torch.linalg.solve(self.c_zx + 1e-6 * torch.eye(2, device=self.c_zx.device), self.c_zd.unsqueeze(-1))[..., 0]
+        return c.clamp(0.02, 5.0), (self.c_zd.abs().sum(1) > 0) & (c > 0).all(-1)
 
     def noise_bin(self, L):
         # brightness bin of L = log(Y + eps): NOISE_BINS equal steps from log(eps) (black) to 0 (white)
@@ -399,7 +436,8 @@ class EvTween(nn.Module):
         return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
 
     def fixed(self, name):
-        return (name == "log_k" and self.k_fixed is not None) or (name == "log_nu" and self.nu_fixed is not None)
+        return ((name == "log_k" and self.k_fixed is not None) or (name == "log_nu" and self.nu_fixed is not None)
+                or (name in ("log_c", "log_r") and self.measure_c))
 
     def state(self):
         # checkpoint without the frozen pretrained networks (reloaded from their official sources)
@@ -441,7 +479,8 @@ class EvTween(nn.Module):
             out = self.decoder(p["x"], z)
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
-        a, b, d, u, g = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube)], 1)
+        a, b, d, u, g, q = crop(out.float()).split(
+            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
         s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
@@ -450,6 +489,8 @@ class EvTween(nn.Module):
             s["sig"] = sig if self.sig_max is None else self.sig_max * torch.tanh(sig / self.sig_max)  # optional lower cap
         if self.tube:  # log factor on the measured tube width: x0.05 (real small changes) to x2.7, x1 at z = 0
             s["tube"] = torch.where(g < 0, 3 * torch.tanh(g / 3), torch.tanh(g))
+        if self.texture:  # extra up-and-down change per unit of path change (texture the frames do not show), 0.01 at z = 0
+            s["texture"] = TEX0 * bound(q, 8.0).exp()
         return s
 
     def flows(self, s, tau):
@@ -492,4 +533,5 @@ def build_model(cfg):
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**{"uncertainty": False, "tube": False, **cfg["model"]}, bins=cfg["data"]["bins"], gammas=gammas)
+    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, **cfg["model"]},
+                   bins=cfg["data"]["bins"], gammas=gammas)

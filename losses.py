@@ -30,9 +30,10 @@ def ig_logs(x, k):
 
 
 SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # mid-gap timing errors (grid steps) averaged per pixel with the predicted uncertainty
+MIX = 16  # with texture: how far back (in events) the last real crossing before an event is looked for (loss.mix)
 
 
-def event_nll(model, s, ev, dt, steps=128):
+def event_nll(model, s, ev, dt, steps=128, mix=MIX):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
@@ -42,7 +43,14 @@ def event_nll(model, s, ev, dt, steps=128):
     # With an uncertainty map s["sig"] (gap units) the timing of a pixel may be off by d ~ N(0, sig^2) in the middle of
     # the gap and the pixel's likelihood is averaged over d: a time warp moves all its events together, threshold noise
     # does not. The warp is pinned at both frames (their times are exact), so every d still scores the whole path.
-    # With s["tube"] the events come from the least-event path inside the frame-noise tube (model.taut), not from L itself
+    # With s["tube"] the events come from the least-event path inside the frame-noise tube (model.taut), not from L itself.
+    # With s["texture"] (a per pixel) the path also hides up-and-down change a |dL/dtau|, split evenly into up and down:
+    # random events at rate a |dL/dtau| / (2 C_pol) (texture the frames do not show). An up-and-back swing leaves the
+    # pixel's reference where it was, so texture and background events do not reset the pixel: only real crossings do,
+    # and the events of a pixel add up to its brightness change. Which events were crossings is unknown: a forward pass
+    # over each pixel's events sums over it (the last crossing is among the `mix` events before, or there was none since the
+    # gap started). Every pixel pays for
+    # the texture events it expects, a * total variation of its path * (1/C_on + 1/C_off) / 2
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
@@ -70,6 +78,25 @@ def event_nll(model, s, ev, dt, steps=128):
     L0 = Lg[:, 0]  # pixels without events: no crossing over the whole path (the same for every warp)
     whole = (torch.stack([Lg.amax(1) - L0, L0 - Lg.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
     still = ig_logs(whole, K.repeat_interleave(H * W)[:, None])[2].sum(1)
+    tex, cost = s.get("texture"), 0
+    if tex is not None:
+        tex = tex.flatten(1)
+        cost = (tex * (Lg[:, 1:] - Lg[:, :-1]).abs().sum(1) * (1 / C).sum(1, keepdim=True) / 2).sum()
+        tex = tex[b, pix] / (2 * c.gather(1, own)[:, 0])  # per event: texture rate per unit |dL/dtau|, its own polarity
+        # candidates for the last crossing before each event: the q-th event before it (q <= rank), or none since the gap
+        # started (always allowed, so every event sequence has an explanation)
+        gs = torch.arange(len(tau), device=tau.device)
+        gq = lambda x, q: x[(gs - q).clamp(min=0)]  # value at the q-th event before (same pixel when q <= rank)
+        gstart = torch.where(first, gs, 0).cummax(0).values
+        rank = gs - gstart
+        mix = min(mix, int(rank.max()) if len(rank) else 0)  # no pixel has more events before: no further candidates
+        cand = [(torch.minimum(gq(tau, q) + Rt, tau), torch.sigmoid((tau - gq(tau, q) - Rt) / wR)) for q in range(1, mix + 1)]
+        order = torch.argsort(rank, stable=True)
+        nrank = torch.bincount(rank)
+        pos = torch.empty_like(order)
+        pos[order] = gs - torch.repeat_interleave(nrank.cumsum(0) - nrank, nrank)
+        groups, inv = torch.split(order, nrank.tolist()), torch.argsort(order)
+        lidx = last.nonzero()[:, 0]
 
     def pixel_ll(Lg, d):
         # log-likelihood per pixel with timing off by d (gap units) mid-gap: events at t see L(phi(t)), phi(t) = t - d sin(pi t)
@@ -96,22 +123,80 @@ def event_nll(model, s, ev, dt, steps=128):
             bot = torch.where(has, Lg[b, imin, pix], ref).minimum(ref)
             return torch.stack([top - ref, ref - bot], 1) / c
 
-        t, tw = phi(tau), phi(wake)
-        Li, Lp, Di = at(t), at(tw), slope(t) * dphi(tau)
-        before = reach(tw, t, Lp)
-        now = torch.stack([Li - Lp, Lp - Li], 1) / c
-        M = torch.maximum(before, now)
-        # signal only at a new max (a wider gate biases c low when k is small) and never while blind
-        rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
-        logpdf, logsf, logsf_eq = ig_logs(M, k)
-        log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
-        log_s = torch.where(first[:, None], logsf_eq, logsf)
-        signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
-        log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
+        t = phi(tau)
+        Li, Di = at(t), slope(t) * dphi(tau)
+
+        def crossing(wake, awake, first, before=None):
+            # log density of a crossing at t (own polarity) since the pixel woke at `wake` (first: stationary start),
+            # and the log survival of both thresholds up to t (before: (top, bottom) of L since the wake, if known)
+            tw = phi(wake)
+            Lp = at(tw)
+            if before is None:
+                before = reach(tw, t, Lp)
+            else:
+                before = torch.stack([before[0].maximum(Lp) - Lp, Lp - before[1].minimum(Lp)], 1) / c
+            now = torch.stack([Li - Lp, Lp - Li], 1) / c
+            M = torch.maximum(before, now)
+            # signal only at a new max (a wider gate biases c low when k is small) and never while blind
+            rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
+            logpdf, logsf, logsf_eq = ig_logs(M, k)
+            log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
+            log_s = torch.where(first[:, None], logsf_eq, logsf)
+            return (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0], log_s.sum(1)
 
         end = phi((tau + Rt).clamp(max=1))
         tail = ig_logs(reach(end, torch.full_like(end, 1 + 0.5 / steps), at(end)), k)[1].sum(1)  # to the end of the path
-        ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
+        if tex is None:  # every event resets the pixel: crossing or background
+            signal, log_s = crossing(wake, awake, first)
+            log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s
+            ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
+            return torch.where(seen, ll, still)
+
+        log_o = (nu[b] / 2 + tex * Di.abs()).log()  # background + texture events of this polarity (no reset)
+        O = log_o.double().cumsum(0)  # sums of "other" events between two of a pixel's events: differences of this (float64)
+        Ob = O - log_o
+        signal, log_s = crossing(torch.zeros_like(tau), torch.ones_like(tau), torch.ones_like(first))
+        terms = [signal + log_s + (Ob - Ob[gstart]).float()]  # crossing here, none before it in the gap (others between)
+        # top / bottom of L since candidate q's wake: the stretch from its wake to the next event, then whole stretches
+        # between consecutive events up to this one, found once per event and combined (where they sit: no gradient)
+        with torch.no_grad():
+            row, tp = Lg[b, :, pix], gq(tau, 1)
+
+            def stretch(lo):  # value and grid index of the top and bottom of L strictly inside (lo, t)
+                inside = (taus > lo[:, None]) & (taus < t[:, None])
+                hi_i = torch.where(inside, row, -math.inf).argmax(1)
+                lo_i = torch.where(inside, row, math.inf).argmin(1)
+                has = inside.any(1)
+                return (torch.where(has, row.gather(1, hi_i[:, None])[:, 0], -math.inf), hi_i,
+                        torch.where(has, row.gather(1, lo_i[:, None])[:, 0], math.inf), lo_i)
+
+            part, full = stretch(phi(torch.minimum(tp + Rt, tau))), stretch(phi(tp))
+            hv, hi_, lv, li_ = torch.full_like(tau, -math.inf), torch.zeros_like(gs), torch.full_like(tau, math.inf), torch.zeros_like(gs)
+        no = torch.zeros_like(first)
+        for q, (wk, aw) in enumerate(cand, 1):
+            with torch.no_grad():
+                if q >= 2:  # whole stretch ending at the (q-2)-th event before
+                    u = gq(full[0], q - 2) > hv
+                    hv, hi_ = torch.where(u, gq(full[0], q - 2), hv), torch.where(u, gq(full[1], q - 2), hi_)
+                    u = gq(full[2], q - 2) < lv
+                    lv, li_ = torch.where(u, gq(full[2], q - 2), lv), torch.where(u, gq(full[3], q - 2), li_)
+                u = gq(part[0], q - 1) > hv
+                tv, ti = torch.where(u, gq(part[0], q - 1), hv), torch.where(u, gq(part[1], q - 1), hi_)
+                u = gq(part[2], q - 1) < lv
+                bv, bi = torch.where(u, gq(part[2], q - 1), lv), torch.where(u, gq(part[3], q - 1), li_)
+            top = torch.where(torch.isfinite(tv), Lg[b, ti, pix], -math.inf)
+            bot = torch.where(torch.isfinite(bv), Lg[b, bi, pix], math.inf)
+            signal, log_s = crossing(wk, aw, no, (top, bot))
+            terms.append(signal + log_s + (Ob - gq(O, q)).float())
+        beta = []  # log p(events of the pixel up to this one, this one a crossing), by rank
+        for r, idx in enumerate(groups):
+            beta.append(torch.logsumexp(torch.stack([terms[0][idx]] + [terms[q][idx] + beta[r - q][pos[idx - q]]
+                                                                         for q in range(1, min(mix, r) + 1)]), 0))
+        beta = torch.cat(beta)[inv]
+        fin = [torch.where(rank[lidx] >= q, beta[(lidx - q).clamp(min=0)] + (O[lidx] - O[(lidx - q).clamp(min=0)]).float()
+                           + tail[(lidx - q).clamp(min=0)], -math.inf) for q in range(mix)]
+        fin.append((O[lidx] - Ob[gstart[lidx]]).float() + still[key[lidx]])  # no crossing at all in the gap
+        ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key[lidx], torch.logsumexp(torch.stack(fin), 0))
         return torch.where(seen, ll, still)
 
     shifts = SHIFTS if "sig" in s else (0,)
@@ -120,7 +205,7 @@ def event_nll(model, s, ev, dt, steps=128):
         d = torch.tensor(shifts, device=tau.device, dtype=torch.float32) / steps
         logw = (-0.5 * (d[:, None] / s["sig"].flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
         lls = torch.logsumexp(logw + lls, 0, keepdim=True)
-    return -(lls[0].sum() - (nu * H * W).sum()) / (B * H * W)
+    return -(lls[0].sum() - (nu * H * W).sum() - cost) / (B * H * W)
 
 
 def photo_loss(model, s, mid, mid_tau):
@@ -159,8 +244,10 @@ def cmax_loss(model, s, ev):
 
 
 def smooth_loss(s, img):
-    # edge-aware first-order smoothness of the path coefficients
-    x = torch.cat([s["a"].flatten(1, 2), s["b"].flatten(1, 2), s["d"]], 1)
+    # edge-aware first-order smoothness of the path coefficients (and of the tube factor and log texture when present):
+    # neighbouring pixels get the same path over the whole gap, so an edge reaches them at consistent times
+    x = torch.cat([s["a"].flatten(1, 2), s["b"].flatten(1, 2), s["d"]] + ([s["tube"]] if "tube" in s else [])
+                  + ([s["texture"].log()] if "texture" in s else []), 1)
     dx = lambda t: t[..., :, 1:] - t[..., :, :-1]
     dy = lambda t: t[..., 1:, :] - t[..., :-1, :]
     wx = torch.exp(-10 * dx(img).abs().mean(1, keepdim=True))
@@ -179,18 +266,20 @@ def compute(model, batch, w, stage):
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     if model.tube and model.training:
         model.measure_noise(p, batch["ev_b"], batch["ev_pix"])
+    if model.measure_c and model.training:
+        model.measure_thresholds(p, batch["ev_b"], batch["ev_pix"], batch["ev_pol"])
     terms = {}
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
         s = model.decode(p, z)
-        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"]), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX)), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=sigreg_loss(z))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"]))
+        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX)))
         if stage == "student":
             terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
     weight = dict(w, nll_student=w["nll"])
@@ -203,7 +292,7 @@ def diagnostics(model, batch, w, student=True):
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     z = model.encode(p, batch["voxel"])
-    nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"]).item()
+    nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"], w.get("mix", MIX)).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
     if student:
         out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]))

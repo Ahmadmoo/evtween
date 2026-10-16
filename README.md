@@ -6,6 +6,7 @@ Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
 A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the frame noise, so noise in the frames makes no events.
+Fine texture the frames cannot show adds random ON/OFF pairs at a learned per-pixel **texture rate**, and the thresholds are **measured** from the data, not learned.
 At test time only RGB is needed.
 
 ```
@@ -18,7 +19,28 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v4-tube`)
+### This version (`v5-texture`)
+
+Built on `v4-tube` (below). In v4 the background was clean, but dense moving regions had about half of the real events. On dense pixels v4 had the right net change (ON − OFF) and missed **up-and-down pairs**: HQ-EVFI 98%, BS-ERGB 79% and EDS 60% of the missing events. Those come from fine texture the frames don't show. The learned threshold was also off by 12–43% against the data, because it was soaking up path errors.
+
+| Change | What it does |
+|---|---|
+| **Texture rate** (`model.texture`) | One more decoder output `a ≥ 0` per pixel (×1 = 0.01 at `z = 0`): hidden up-and-down change per unit of path change. It adds random events at `ρ_pol = a·|dL/dτ| / (2·C_pol)`, ON and OFF. They come only while the path moves (0 on a static background) and cancel in pairs, so the net change stays the path's job |
+| **Pairs don't reset the pixel** | An up-and-back swing leaves the pixel's reference where it was, so texture and background events don't reset it; only real crossings do, and a pixel's events add up to its brightness change. The likelihood doesn't know which events were crossings: a forward pass over each pixel's events sums over it, looking back up to `loss.mix` events (16) for the last real crossing, or none since the gap started. Each pixel pays for the texture events it expects, `a · TV(path) · (1/C_on + 1/C_off)/2` |
+| **Measured thresholds** (`model.measure_c`) | Over a gap a pixel's events add up to its change, `E[c_on·N_on − c_off·N_off | d] = d`, `d = L1 − L0`, whatever the path did (pairs cancel). The counts are the noisy side, so `(c_on, c_off)` is fitted as counts on change, with the rising and the falling part of `d` as the two equations. Pixels with `0.5 ≤ |d| ≤ 2` only. Kept as running sums per dataset (saved in the checkpoint); `log_c`, `log_r` are not trained |
+| **`loss.smooth` 0.05** (was 0.01) | Also covers the tube factor and `log a`. Neighbors get the same path over the whole gap, so an edge reaches them at consistent times (continuous x-t / y-t), and texture forms solid areas |
+| **Sampler warm start** (`Simulator.warm`) | Run the gap before and drop its events, so the pixels start the gap in a real state instead of the stationary guess (no burst in the first slice). The sampler's output also has `s` per event: 0 crossing, 1 background, 2 texture |
+
+Checks (CPU, toy data and simulated events):
+- **Forward pass:** equal to a brute-force sum over all 2^n crossing/other labelings of a pixel's events (to 1e-6 with a window of 16 for 7 events, and of 8 for 12 events).
+- **Texture rate:** on events simulated with a known `a` (0.5, 1.0), the likelihood is lowest at the true `a`.
+- **Events add up:** the simulated events add up to exactly 1.00× the frame change for any `a`. Pairs that reset the pixel would give 0.85× at `a` 0.5 and 0.74× at `a` 1.
+- **Thresholds:** recovered from simulated events (0.250 / 0.354 vs 0.25 / 0.35, 60 samples). On the toy data, which has a real camera's dead zone (after rising, a pixel must fall a full threshold before an OFF event), the fit is about 10% high: a pixel that reverses direction loses up to one event.
+- **Old configs** (no texture, no measured c): same loss and events as v4. Gradients agree to about 1e-8, because the backward pass adds terms in a different order.
+
+Cost: the likelihood with texture took about 2× as long on CPU (toy batch). It grows with `loss.mix` and with the busiest pixel's event count.
+
+### v4 (`v4-tube`)
 
 Built on `v2-sensor-teacher` (not on `v3-vit-dpt`). Two changes, both for the salt-and-pepper noise in static regions, which was strongest at the end of the gap:
 
@@ -46,14 +68,15 @@ Tube width, no hand-set value:
 | Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends), `ε` = measured frame noise × learned factor. Used by both the likelihood and the sampler (`model.tube`) |
-| Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on` and refractory `R` are learned **per dataset** (each dataset is its own camera); the noise (`k` via `model.sigma_event`, `ν` via `model.nu`) is fixed in the config, because when learned it soaks up the path's errors and the sampler spreads them as noise; brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
+| Texture | `s["texture"] = a` per pixel: random ON/OFF pairs at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel (`model.texture`) |
+| Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on` and refractory `R` are learned **per dataset** (each dataset is its own camera; with `model.measure_c` the thresholds are measured from frame change vs real event counts instead); the noise (`k` via `model.sigma_event`, `ν` via `model.nu`) is fixed in the config, because when learned it soaks up the path's errors and the sampler spreads them as noise; brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. With the tube: the taut path on a grid of at least 128 steps, exact crossing of its linear pieces; between gaps the pixel reference moves with the path's free start, so the jump fires nothing |
 
 ### Losses
 
 | Loss | Meaning |
 |---|---|
-| `nll` | Likelihood of the real event **times** under the sensor model above: signal hazard + background rate at each event, survival of both thresholds between events, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. With `model.uncertainty` it is averaged over timing errors `d ~ N(0, sig²)` through a warp pinned at both frames (the whole path is always scored) |
+| `nll` | Likelihood of the real event **times** under the sensor model above: signal hazard + background rate at each event, survival of both thresholds between events, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. With `model.uncertainty` it is averaged over timing errors `d ~ N(0, sig²)` through a warp pinned at both frames (the whole path is always scored). With `model.texture` each event is a crossing or a texture/background event, summed over by a forward pass per pixel (`loss.mix`) |
 | `photo` | `L(τ)` must match the real hidden frames |
 | `cmax` | Contrast maximization: real events moved along the model flow to τ=0 and τ=1 must stack into sharp edges (scale-normalized) |
 | `sigreg` | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to model later) |
@@ -171,8 +194,8 @@ python train.py train.stage=student train.init=runs/teacher/last.pt train.out=ru
 # 3. optional joint fine-tune (small lr)
 python train.py train.stage=joint train.init=runs/student/last.pt train.lr=2e-5 train.out=runs/joint
 
-# fine-tune a teacher trained without the tube: the decoder gets one more output, the old ones are kept
-python train.py train.stage=teacher train.init=runs/teacher/last.pt train.out=runs/teacher_tube
+# fine-tune a teacher trained without the tube / texture: the decoder gets more outputs, the old ones are kept
+python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out=runs/teacher_v5
 ```
 
 ### What to watch (validation line)
@@ -223,6 +246,10 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 | `model.sigma_event`, `model.nu` | Sensor noise, fixed (threshold spread per event as a fraction of c, background events / px / s); `null` = learned |
 | `model.sig_max` | Cap on the per-pixel arrival-time uncertainty used by the likelihood (training only) |
 | `model.tube` | Events from the least-event path in the frame-noise tube; the width is measured, not set. `false` = the old path (old configs build without it) |
+| `model.texture` | Random ON/OFF pairs for texture the frames don't show, at a learned per-pixel rate (likelihood + sampler) |
+| `model.measure_c` | Thresholds measured from frame change vs real ON/OFF counts per dataset (`c_init` until the first batch of a dataset) |
+| `loss.mix` | With texture: how far back, in events, the likelihood looks for a pixel's last real crossing (16; cost grows with it) |
+| `loss.smooth` | Edge-aware smoothness of the path coefficients, tube factor and log texture (0.05) |
 | `model.K` | Polynomial order of the path in time |
 | `loss.grid` | τ steps for the likelihood clocks |
 | `sensor.*` | Generation only: `noise` scales the learned background rate; `mismatch`, `refractory` are optional extras; step limits |
@@ -248,4 +275,6 @@ Known limits:
 - The sensor model ignores refractory time and low-light bandwidth; the likelihood reads `L` on a τ grid (`loss.grid`) with linear interpolation.
 - The noise table uses pixels without events; tiny real changes below the threshold are counted as noise, so `σ_L` is slightly too large. The learned factor can narrow the tube.
 - The tube adds a loop over the τ grid (forward and backward in time) per likelihood call.
+- Texture: a real crossing more than `loss.mix` events back is not found (the "no crossing since the start" case still is). Texture events have random times: they get the density right, not the exact streaks.
+- Measured thresholds assume the stationary start state, like the likelihood. A real pixel remembers its last direction (dead zone), which pushes the fit up on small changes (about 10% on the toy data for `0.5 ≤ |d| ≤ 2`).
 - The student is deterministic, so ambiguous gaps (same endpoints, different timing) get an average code. A stochastic student `p(z | video)` is the next step.
