@@ -64,10 +64,15 @@ model = build_model(cfg).to(dev)
 if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     sd, own = torch.load(T["init"], map_location=dev, weights_only=False)["model"], model.state_dict()
     sd = {k: v.expand_as(own[k]).clone() if k in own and v.dim() == 0 and own[k].dim() == 1 else v for k, v in sd.items()}  # one sensor -> all
+    grow = [k for k in ("decoder.head.weight",) if k in sd and k in own and own[k].shape[1:] == sd[k].shape[1:]
+            and own[k].shape[0] > sd[k].shape[0]]  # decoder outputs added at the end (e.g. the tube factor): old ones kept, new ones 0
+    sd.update({k: torch.cat([sd[k], own[k][len(sd[k]):]]) for k in grow})
     skip = sorted({k.split(".")[0] for k, v in sd.items() if k in own and own[k].shape != v.shape})
     model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
+    if rank == 0 and grow:
+        print("init: more outputs, old ones loaded:", grow, flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
 params = [p for p in model.parameters() if p.requires_grad]

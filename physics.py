@@ -2,6 +2,9 @@ import math
 import numpy as np
 import torch
 import yaml
+from model import taut
+
+TUBE_STEPS = 128  # with the tube the path is fixed on a grid first, at least as fine as the likelihood's (loss.grid)
 
 
 def first_root(a, b, c, lo, hi):
@@ -42,12 +45,13 @@ class Simulator:
     # samples the sensor model the likelihood is trained on (losses.event_nll) with a sensor profile (default: the learned one):
     # thresholds X*C with X ~ IG(1, sigma_event^-2), exact crossing of the local quadratic of L, background events;
     # after any event the pixel is blind for the refractory time and takes ref = L at the end of it;
-    # sigma_thres adds a fixed per-pixel threshold offset (sampler only)
+    # sigma_thres adds a fixed per-pixel threshold offset (sampler only).
+    # With the tube (s["tube"]) the pixel sees the least-event path in the frame-noise tube, linear between grid points
     def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
         self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
         self.gen = torch.Generator().manual_seed(seed)
-        self.ref = None
+        self.ref = self.last = None
 
     def _u(self, shape):
         return torch.rand(shape, generator=self.gen, dtype=torch.float64).to(self.dev).clamp(min=1e-12)
@@ -67,7 +71,8 @@ class Simulator:
         self.dev, self.k, self.nu, self.R = s["d"].device, max(p["sigma_event"], 1e-3) ** -2, p["shot_noise_rate_hz"], p["refractory_period_s"]
         tau = lambda v: torch.full((1,), v, device=self.dev)
         La, Da, _ = m.render(s, tau(0.0))
-        if self.ref is None:
+        fresh = self.ref is None
+        if fresh:
             shape = (2, *La.shape)
             spread = p["sigma_thres"] * torch.randn(shape, generator=self.gen).to(self.dev)
             self.c = (torch.tensor([p["pos_thres"], p["neg_thres"]], device=self.dev).view(2, 1, 1, 1, 1) + spread).clamp(min=0.01)
@@ -79,8 +84,19 @@ class Simulator:
 
         speed = max(m.render(s, tau(v))[1].abs().flatten().quantile(0.999).item() for v in (0.0, 0.5, 1.0))
         S = int(min(max(math.ceil(2 * speed / self.c.min().item()), self.min_steps), self.max_steps))
+        g = None
+        if "tube" in s:
+            S = max(S, TUBE_STEPS)
+            L = torch.stack([m.render(s, tau(i / S))[0] for i in range(S + 1)], 1)
+            g = taut(L.flatten(2), m.tube_eps(s)).view_as(L)
+            # each gap's path starts free inside the tube: the jump from the last gap's end fires nothing
+            self.ref = g[:, 0].clone() if fresh else self.ref + g[:, 0] - self.last
+            self.last = g[:, -1]
         H, out = 1.0 / S, []
         for i in range(S):
+            if g is not None:  # linear between grid points
+                self._cross(g[:, i], (g[:, i + 1] - g[:, i]) / H, torch.zeros_like(La), H, t0 + dt * i * H, dt, out)
+                continue
             Lb, Db, _ = m.render(s, tau((i + 1) * H))
             self._cross(La, Da, (Lb - La - Da * H) / H ** 2, H, t0 + dt * i * H, dt, out)
             La, Da = Lb, Db

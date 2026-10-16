@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import lejepa
+from model import taut
 
 SIGREG = lejepa.multivariate.SlicingUnivariateTest(univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=256)
 
@@ -28,7 +29,7 @@ def ig_logs(x, k):
     return logpdf.float(), logsf.float(), logsf_eq.float()
 
 
-SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # path time shifts (grid steps) averaged per pixel with the predicted uncertainty
+SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # mid-gap timing errors (grid steps) averaged per pixel with the predicted uncertainty
 
 
 def event_nll(model, s, ev, dt, steps=128):
@@ -38,14 +39,18 @@ def event_nll(model, s, ev, dt, steps=128):
     # background events (nu per second, half per polarity) compete with the signal and also reset the pixel;
     # after any event the pixel is blind for the refractory time R and takes ref = L at its end (not at the event);
     # the first wait of each pixel starts from the stationary state (its ref and thresholds are unknown).
-    # With an uncertainty map s["sig"] (gap units) the whole path of a pixel may be shifted in time by d ~ N(0, sig^2)
-    # and the pixel's likelihood is averaged over shifts: a shift moves all its events together, threshold noise does not
+    # With an uncertainty map s["sig"] (gap units) the timing of a pixel may be off by d ~ N(0, sig^2) in the middle of
+    # the gap and the pixel's likelihood is averaged over d: a time warp moves all its events together, threshold noise
+    # does not. The warp is pinned at both frames (their times are exact), so every d still scores the whole path.
+    # With s["tube"] the events come from the least-event path inside the frame-noise tube (model.taut), not from L itself
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
     frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
     grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
     Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
+    if "tube" in s:
+        Lg = taut(Lg, model.tube_eps(s))
     C, K, nu, R = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
     nu = nu * dt
     c, k = C[b], K[b, None]  # per event
@@ -62,9 +67,16 @@ def event_nll(model, s, ev, dt, steps=128):
     wake = torch.where(first, tprev, torch.minimum(tprev + Rt, tau))  # end of the blind time: ref is taken here
     awake = torch.where(first, torch.ones_like(tau), torch.sigmoid((tau - tprev - Rt) / wR))
     own = (pol < 0).long()[:, None]
+    L0 = Lg[:, 0]  # pixels without events: no crossing over the whole path (the same for every warp)
+    whole = (torch.stack([Lg.amax(1) - L0, L0 - Lg.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
+    still = ig_logs(whole, K.repeat_interleave(H * W)[:, None])[2].sum(1)
 
     def pixel_ll(Lg, d):
-        # log-likelihood per pixel with the path delayed by d (gap units): events see L(t - d), L held constant outside [0, 1]
+        # log-likelihood per pixel with timing off by d (gap units) mid-gap: events at t see L(phi(t)), phi(t) = t - d sin(pi t)
+        # (phi(0) = 0, phi(1) = 1, monotone for |d| < 1 / pi)
+        phi = lambda t: t - d * torch.sin(math.pi * t)
+        dphi = lambda t: 1 - d * math.pi * torch.cos(math.pi * t)
+
         def at(t):
             j = (t * steps).clamp(0, steps - 1e-4)
             j0, w = j.long(), j - j.floor()
@@ -84,8 +96,8 @@ def event_nll(model, s, ev, dt, steps=128):
             bot = torch.where(has, Lg[b, imin, pix], ref).minimum(ref)
             return torch.stack([top - ref, ref - bot], 1) / c
 
-        t, tw = tau - d, wake - d
-        Li, Lp, Di = at(t), at(tw), slope(t)
+        t, tw = phi(tau), phi(wake)
+        Li, Lp, Di = at(t), at(tw), slope(t) * dphi(tau)
         before = reach(tw, t, Lp)
         now = torch.stack([Li - Lp, Lp - Li], 1) / c
         M = torch.maximum(before, now)
@@ -97,14 +109,10 @@ def event_nll(model, s, ev, dt, steps=128):
         signal = (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0]
         log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s.sum(1)
 
-        end = (tau + Rt).clamp(max=1) - d
-        tail = ig_logs(reach(end, torch.full_like(end, 1 - d + 0.5 / steps), at(end)), k)[1].sum(1)
-        q = round(d * steps)
-        win = Lg[:, max(0, -q):steps + 1 - max(0, q)]  # the path seen inside the window
-        L0 = win[:, 0]
-        whole = (torch.stack([win.amax(1) - L0, L0 - win.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
+        end = phi((tau + Rt).clamp(max=1))
+        tail = ig_logs(reach(end, torch.full_like(end, 1 + 0.5 / steps), at(end)), k)[1].sum(1)  # to the end of the path
         ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
-        return torch.where(seen, ll, ig_logs(whole, K.repeat_interleave(H * W)[:, None])[2].sum(1))
+        return torch.where(seen, ll, still)
 
     shifts = SHIFTS if "sig" in s else (0,)
     lls = torch.stack([checkpoint(pixel_ll, Lg, q / steps, use_reentrant=False) if grad else pixel_ll(Lg, q / steps) for q in shifts])
@@ -169,6 +177,8 @@ def compute(model, batch, w, stage):
         return loss, dict(probe=loss)
 
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
+    if model.tube and model.training:
+        model.measure_noise(p, batch["ev_b"], batch["ev_pix"])
     terms = {}
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])

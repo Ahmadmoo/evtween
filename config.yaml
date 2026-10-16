@@ -34,6 +34,7 @@ model:
   sigma_event: 0.2             # threshold spread per event (fraction of c), fixed; null = learned (it then soaks up path errors)
   nu: 0.1                      # background events per pixel per second, fixed; null = learned
   sig_max: 0.03                # cap on the arrival-time uncertainty (gap units, training only); null = no cap (0.2)
+  tube: true                   # events from the least-event path inside the frame-noise tube (width measured per dataset)
 
 loss:
   nll: 1.0                     # exact-time event likelihood

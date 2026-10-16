@@ -7,6 +7,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 # official V-JEPA 2.1 ViT-L checkpoint (the hub file in facebookresearch/vjepa2 points its downloads to localhost)
 VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt"
 LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
+NOISE_BINS = 16  # brightness bins of the measured frame noise (tube width)
 
 
 def luminance(img, gamma=2.2):
@@ -54,6 +55,74 @@ def fourier(v, n=16):
     f = torch.exp(torch.linspace(0, math.log(100), n // 2, device=v.device))
     a = v.float()[..., None] * f
     return torch.cat([a.sin(), a.cos()], -1)
+
+
+def _play(L, eps, ts, out):
+    # play operator along the times ts: the path stays put until the tube [L - eps, L + eps] pushes it. Free start: the
+    # value that stays inside the tube longest, on the side of the first push (inside the tube all the way: the middle).
+    # Adds the path to out; returns where it was pushed (side: -1 lower edge, +1 upper edge, 0 not pushed) and the start's
+    # sources (start = (L[ka] + sa * eps + L[kb] + sb * eps) / 2)
+    lo_max, hi_min = L[:, ts[0]] - eps, L[:, ts[0]] + eps
+    ia = torch.full(eps.shape, ts[0], dtype=torch.long, device=L.device)
+    ib, ka, start, sd = ia.clone(), ia.clone(), torch.zeros_like(eps), torch.zeros_like(eps)
+    done = torch.zeros_like(eps, dtype=torch.bool)
+    for t in ts[1:]:
+        lo, hi = L[:, t] - eps, L[:, t] + eps
+        up, dn = ~done & (lo > hi_min), ~done & (hi < lo_max)
+        start = torch.where(up, hi_min, torch.where(dn, lo_max, start))
+        ka = torch.where(up, ib, torch.where(dn, ia, ka))
+        sd = torch.where(up | dn, up.float() - dn.float(), sd)
+        done = done | up | dn
+        m = lo > lo_max
+        lo_max, ia = torch.where(m, lo, lo_max), torch.where(m, t, ia)
+        m = hi < hi_min
+        hi_min, ib = torch.where(m, hi, hi_min), torch.where(m, t, ib)
+    start = torch.where(done, start, (lo_max + hi_min) / 2)
+    kb, ka = torch.where(done, ka, ib), torch.where(done, ka, ia)
+    sb, sa = torch.where(done, sd, 1.0), torch.where(done, sd, -1.0)
+    g, side = start, torch.zeros(L.shape, dtype=torch.int8, device=L.device)
+    for t in ts:
+        lo, hi = L[:, t] - eps, L[:, t] + eps
+        up, dn = g < lo, g > hi
+        g = torch.where(up, lo, torch.where(dn, hi, g))
+        side[:, t] = dn.to(torch.int8) - up.to(torch.int8)
+        out[:, t] += g
+    return side, ka, kb, sa, sb
+
+
+class Taut(torch.autograd.Function):
+    # least-event path in the tube |g - L| <= eps along time (L: (B, T, N), eps: (B, N)): the taut string, taken as the mean
+    # of the forward and the backward play-operator paths (free ends). Every value of a play path is one value of L -+ eps
+    # (or the mean of two), so backward sends each gradient to that value and only an int8 side per step is kept
+    @staticmethod
+    def forward(ctx, L, eps):
+        T, out, saved = L.shape[1], torch.zeros_like(L), []
+        for ts in (range(T), range(T - 1, -1, -1)):
+            saved += _play(L, eps, list(ts), out)
+        ctx.save_for_backward(*saved)
+        return out / 2
+
+    @staticmethod
+    def backward(ctx, grad):
+        T, grad = grad.shape[1], grad / 2
+        gL, geps = torch.zeros_like(grad), torch.zeros_like(grad[:, 0])
+        for n, ts in enumerate((range(T), range(T - 1, -1, -1))):
+            side, ka, kb, sa, sb = ctx.saved_tensors[5 * n:5 * n + 5]
+            r = torch.zeros_like(geps)  # gradient of the steps since the last push, walking back
+            for t in reversed(list(ts)):
+                r = r + grad[:, t]
+                s = side[:, t].to(grad.dtype)
+                gL[:, t] += torch.where(s != 0, r, 0)
+                geps += s * r
+                r = torch.where(s != 0, 0, r)
+            for k, sk in ((ka, sa), (kb, sb)):  # steps before the first push hold the start value
+                gL.scatter_add_(1, k[:, None], r[:, None] / 2)
+                geps += sk * r / 2
+        return gL, geps
+
+
+def taut(L, eps):
+    return Taut.apply(L, eps)
 
 
 class LayerNorm2d(nn.LayerNorm):
@@ -226,14 +295,15 @@ class Decoder(nn.Module):
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None):
+                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
         self.flow = FlowPrior(flow_prior)
         self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
         self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty), width, depth)
+        self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube), width, depth)
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -250,6 +320,8 @@ class EvTween(nn.Module):
         self.k_fixed, self.nu_fixed, self.sig_max = None if sigma_event is None else sigma_event ** -2, nu, sig_max
         self.w_rgb = nn.Parameter(torch.tensor([[0.299, 0.587, 0.114]]).log().repeat(n, 1))  # RGB weights (softmax), learned
         self.register_buffer("gammas", torch.tensor(gammas or [gamma], dtype=torch.float32), persistent=False)  # from config
+        if tube:  # frame noise sigma_L per dataset and brightness bin, measured during training (0 = not measured yet)
+            self.register_buffer("noise", torch.zeros(n, NOISE_BINS))
 
     @property
     def c(self):
@@ -280,6 +352,42 @@ class EvTween(nn.Module):
         k = self.log_k.exp()[ds] if self.k_fixed is None else torch.full_like(c, self.k_fixed)
         nu = self.log_nu.exp()[ds] if self.nu_fixed is None else torch.full_like(c, self.nu_fixed)
         return torch.stack([c, c * self.log_r.exp()[ds]], 1), k, nu, self.R[ds]
+
+    def noise_bin(self, L):
+        # brightness bin of L = log(Y + eps): NOISE_BINS equal steps from log(eps) (black) to 0 (white)
+        lo = math.log(self.eps)
+        return ((L - lo) / -lo * NOISE_BINS).long().clamp(0, NOISE_BINS - 1)
+
+    @torch.no_grad()
+    def measure_noise(self, p, b, pix, momentum=0.99, min_px=100):
+        # running frame-noise table, like BatchNorm statistics: a pixel without events in the gap saw no change, so its
+        # L1 - L0 is the noise of two frames: sigma_L = median |L1 - L0| / 0.6745 / sqrt(2), per dataset and brightness bin
+        H, W = p["H"], p["W"]
+        L0, L1 = (torch.log(p[k][:, 0, :H, :W] + self.eps).flatten() for k in ("y0", "y1"))
+        quiet = torch.ones_like(L0, dtype=torch.bool)
+        quiet[b * H * W + pix] = False
+        if not quiet.any():
+            return
+        key = (p["ds"].repeat_interleave(H * W) * NOISE_BINS + self.noise_bin((L0 + L1) / 2))[quiet]
+        d, o = (L1 - L0)[quiet].abs().sort()
+        key, o = key[o].sort(stable=True)  # grouped by key, sorted by |L1 - L0| inside each group
+        n = torch.bincount(key, minlength=self.noise.numel())
+        mid = d[o][(n.cumsum(0) - n + n // 2).clamp(max=len(d) - 1)] / 0.6745 / math.sqrt(2)
+        old = self.noise.view(-1)
+        old.copy_(torch.where(n >= min_px, torch.where(old > 0, momentum * old + (1 - momentum) * mid, mid), old))
+
+    def noise_table(self):
+        # bins without a measurement take the nearest measured bin of their dataset (none measured: 0, no tube)
+        j = torch.arange(NOISE_BINS, device=self.noise.device)
+        dist = torch.where(self.noise[:, None] > 0, (j[:, None] - j[None]).abs().float(), math.inf)
+        return self.noise.gather(1, dist.argmin(-1))
+
+    def tube_eps(self, s):
+        # tube half-width per pixel (B, H*W): 1.96 / sqrt(2) x the frame noise at its brightness, so 95% of pixels that only
+        # see noise (L1 - L0 ~ N(0, 2 sigma^2)) fit a flat path, times the learned factor exp(s["tube"])
+        L0, L1 = (torch.log(s[k][:, 0] + self.eps).flatten(1) for k in ("y0", "y1"))
+        sig = self.noise_table()[s["ds"][:, None], self.noise_bin((L0 + L1) / 2)]
+        return 1.96 / math.sqrt(2) * sig * s["tube"].flatten(1).exp()
 
     def load_state_dict(self, sd, strict=False):
         # checkpoints from before per-dataset sensors hold one value per parameter: every dataset starts from it
@@ -333,13 +441,15 @@ class EvTween(nn.Module):
             out = self.decoder(p["x"], z)
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
-        a, b, d, u = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty)], 1)
+        a, b, d, u, g = crop(out.float()).split([2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
         s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
         if self.uncertainty:
             sig = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
             s["sig"] = sig if self.sig_max is None else self.sig_max * torch.tanh(sig / self.sig_max)  # optional lower cap
+        if self.tube:  # log factor on the measured tube width: x0.05 (real small changes) to x2.7, x1 at z = 0
+            s["tube"] = torch.where(g < 0, 3 * torch.tanh(g / 3), torch.tanh(g))
         return s
 
     def flows(self, s, tau):
@@ -378,8 +488,8 @@ class EvTween(nn.Module):
 
 
 def build_model(cfg):
-    # configs from before the uncertainty output have no "uncertainty" key: build those checkpoints without it.
+    # configs from before the uncertainty output / the tube have no "uncertainty" / "tube" key: build those checkpoints without.
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**{"uncertainty": False, **cfg["model"]}, bins=cfg["data"]["bins"], gammas=gammas)
+    return EvTween(**{"uncertainty": False, "tube": False, **cfg["model"]}, bins=cfg["data"]["bins"], gammas=gammas)
