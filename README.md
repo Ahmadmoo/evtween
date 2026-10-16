@@ -18,9 +18,9 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v2-tube`)
+### This version (`v4-tube`)
 
-Two changes against `v2-sensor-teacher`, both for the salt-and-pepper noise in static regions, which was strongest at the end of the gap:
+Built on `v2-sensor-teacher` (not on `v3-vit-dpt`). Two changes, both for the salt-and-pepper noise in static regions, which was strongest at the end of the gap:
 
 | Change | Why |
 |---|---|
@@ -236,7 +236,7 @@ Verified here (CPU, toy data):
 - Simulator and likelihood are the same model: on simulated events the likelihood is lowest at the true `k`, `ν`, `C_on`, `r` and the true motion.
 - Teacher generalizes on held-out toy scenes: `nll` < `nll_zero` < `nll_shuffled`. Student lands in between.
 - All four stages, generation, V-JEPA 2.1 wrapper (official code, random weights), 2-process DDP.
-- `v2-tube`:
+- `v4-tube`:
   - Taut path: values equal, and gradients agree to 1e-14, with a plain autograd version; `gradcheck` passes; the path stays in the tube.
   - Old configs (`model.uncertainty: false`, no tube) give the same loss, gradients and sampled events as `v2-sensor-teacher`.
   - Loss hole: a pixel with no events whose path rises by 1.5 c now costs the same whether the rise is mid-gap or in the last 2%. The old loss made the late rise 5.2 nats cheaper at `sig` 0.03.
