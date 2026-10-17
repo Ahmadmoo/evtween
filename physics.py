@@ -49,7 +49,8 @@ class Simulator:
     # With the tube (s["tube"]) the pixel sees the least-event path in the frame-noise tube, linear between grid points.
     # With s["texture"] random texture events come on top, at rate a |dL/dtau| / (2 C_pol) (as in losses.event_nll);
     # then texture and background events leave the pixel's state alone (only real crossings reset it).
-    # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture
+    # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture.
+    # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it
     def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
         self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events

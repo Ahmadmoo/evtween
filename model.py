@@ -10,6 +10,7 @@ LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
 NOISE_BINS = 16  # brightness bins of the measured frame noise (tube width)
 C_RANGE = (0.5, 2.0)  # |L1 - L0| of the pixels that measure the thresholds: above the frame noise, below the sensor's speed limit
 TEX0 = 0.01  # texture at z = 0 (extra up-and-down change per unit of path change)
+DETAIL0 = 0.01  # spread of the random detail image at z = 0 (log units)
 
 
 def luminance(img, gamma=2.2):
@@ -298,7 +299,7 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False):
+                 measure_c=False, detail=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -308,7 +309,14 @@ class EvTween(nn.Module):
         self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
         self.texture = texture  # one more output: up-and-down change the frames do not show (random ON / OFF pairs)
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture), width, depth)
+        # detail image: three more outputs (its mean at frame 0 and at frame 1, the spread of its random part) and a
+        # full-resolution teacher branch that reads the random part from the events
+        self.detail = detail
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture) + 3 * int(detail), width, depth)
+        if detail:
+            self.detail_enc = UNet(2 * bins + 12, 2, 32, (1, 1, 2))
+            nn.init.zeros_(self.detail_enc.head[1].weight)
+            nn.init.zeros_(self.detail_enc.head[1].bias)
         self.student = Student(backbone, pred_dim, pred_depth)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -422,7 +430,7 @@ class EvTween(nn.Module):
     def tube_eps(self, s):
         # tube half-width per pixel (B, H*W): 1.96 / sqrt(2) x the frame noise at its brightness, so 95% of pixels that only
         # see noise (L1 - L0 ~ N(0, 2 sigma^2)) fit a flat path, times the learned factor exp(s["tube"])
-        L0, L1 = (torch.log(s[k][:, 0] + self.eps).flatten(1) for k in ("y0", "y1"))
+        L0, L1 = (torch.log(s[k][:, 0] + self.eps).flatten(1) for k in (("frame0", "frame1") if "frame0" in s else ("y0", "y1")))
         sig = self.noise_table()[s["ds"][:, None], self.noise_bin((L0 + L1) / 2)]
         return 1.96 / math.sqrt(2) * sig * s["tube"].flatten(1).exp()
 
@@ -467,20 +475,31 @@ class EvTween(nn.Module):
         with self._ac(x):
             return self.teacher(x).float()
 
+    def detail_code(self, p, voxel, sample=True):
+        # teacher: the random part n of the detail image, read from the events at full resolution. Prior N(0, 1) per pixel,
+        # posterior N(m, s^2); returns n (a sample, or the mean m) and KL(posterior || prior) per pixel, averaged
+        x = torch.cat([torch.log1p(self._pad(voxel)), p["x"]], 1)
+        with self._ac(x):
+            out = self.detail_enc(x).float()[..., :p["H"], :p["W"]]
+        m, logs = out[:, :1], 3 * torch.tanh(out[:, 1:] / 3)
+        n = m + logs.exp() * torch.randn_like(m) if sample else m
+        return n, (0.5 * (m ** 2 + (2 * logs).exp() - 1) - logs).mean()
+
     def predict(self, ctx, ctx_tau, dt, head="z"):
         ctx = self._pad(ctx)
         with self._ac(ctx):
             f = self.student(ctx, ctx_tau, dt).float()
         return (self.to_z if head == "z" else self.to_counts)(f)
 
-    def decode(self, p, z):
-        # path code -> trajectory state used by render()
+    def decode(self, p, z, n=None):
+        # path code -> trajectory state used by render(); n: the random part of the detail image (teacher: from
+        # detail_code; None: drawn from its prior N(0, 1), as in generation)
         with self._ac(z):
             out = self.decoder(p["x"], z)
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
-        a, b, d, u, g, q = crop(out.float()).split(
-            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture)], 1)
+        a, b, d, u, g, q, e = crop(out.float()).split(
+            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture), 3 * int(self.detail)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
         s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
@@ -491,6 +510,18 @@ class EvTween(nn.Module):
             s["tube"] = torch.where(g < 0, 3 * torch.tanh(g / 3), torch.tanh(g))
         if self.texture:  # extra up-and-down change per unit of path change (texture the frames do not show), 0.01 at z = 0
             s["texture"] = TEX0 * bound(q, 8.0).exp()
+        if self.detail:
+            # detail image (log brightness) on both keyframes: a mean per frame (e.g. sharper edges, +-2) and a random part
+            # sigma * n that lives at frame 0 and is moved to frame 1 by the path's own flow, so render() moves it with the
+            # frames and small things the frames don't show make connected curves in x-t / y-t
+            sig = DETAIL0 * bound(e[:, 2:], 5.0).exp()
+            n = torch.randn_like(sig) if n is None else n
+            F0 = self.flows(s, torch.ones(B, 1, 1, 1, device=z.device))[0]  # frame-1 pixel -> frame-0 position
+            s["D0"] = bound(e[:, :1], 2.0) + sig * n
+            s["D1"] = bound(e[:, 1:2], 2.0) + warp(sig * n, F0)
+            s["sig_detail"] = sig
+            s["frame0"], s["frame1"] = s["y0"], s["y1"]  # the frames themselves (noise table, tube width)
+            s["y0"], s["y1"] = s["y0"] * s["D0"].exp(), s["y1"] * s["D1"].exp()
         return s
 
     def flows(self, s, tau):
@@ -528,10 +559,16 @@ class EvTween(nn.Module):
         return torch.log(Y + self.eps), dY / (Y + self.eps), Y
 
 
+def head_rows(m):
+    # decoder outputs in order, name -> number of channels, for a config's "model" section (defaults as in build_model)
+    K, on = m.get("K", 3), lambda key: int(bool(m.get(key, False)))
+    return dict(a=2 * K, b=2 * K, d=K + 1, sig=on("uncertainty"), tube=on("tube"), texture=on("texture"), detail=3 * on("detail"))
+
+
 def build_model(cfg):
     # configs from before the uncertainty output / the tube have no "uncertainty" / "tube" key: build those checkpoints without.
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, **cfg["model"]},
+    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, **cfg["model"]},
                    bins=cfg["data"]["bins"], gammas=gammas)

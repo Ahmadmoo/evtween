@@ -35,18 +35,23 @@ model:
   nu: 0.1                      # background events per pixel per second, fixed; null = learned
   sig_max: 0.03                # cap on the arrival-time uncertainty (gap units, training only); null = no cap (0.2)
   tube: true                   # events from the least-event path inside the frame-noise tube (width measured per dataset)
-  texture: true                # random ON / OFF pairs for change the frames do not show (one rate per pixel, likelihood + sampler)
+  texture: false               # v5: random ON / OFF pairs for change the frames do not show (off: coin-flip polarity, no curves)
   measure_c: true              # thresholds measured from frame change vs real ON / OFF counts, not learned (c_init until then)
+  detail: true                 # detail image on the keyframes, moved by the flow: small things the frames don't show
+                               # (teacher reads its random part from the events; generation draws it); false = v6 base
 
 loss:
   nll: 1.0                     # exact-time event likelihood
   photo: 1.0                   # hidden real frames
   cmax: 0.0                    # contrast maximization (off: unbounded score lets flows collapse events onto few pixels)
   smooth: 0.05                 # neighbours agree on their path over the whole gap (continuous x-t / y-t)
+  xt: 0.1                      # x-t / y-t loss: expected vs real ON / OFF events on blurred x-t and y-t slices (0 = off)
+  xt_blur: [2, 2]              # its blur (px, ms): compares curves, not single events
+  detail_kl: 1.0               # price of the detail image's random part (KL to its prior, nats per pixel; 1 = the proper value)
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
   grid: 128                    # tau steps of the likelihood path (32 sends sub-grid edges / texture into the noise rate)
-  mix: 16                      # texture: how far back (in events) the likelihood looks for a pixel's last real crossing
+  mix: 16                      # texture only: how far back (in events) the likelihood looks for a pixel's last real crossing
 
 sensor:                        # generation only (generate.py / physics.Simulator)
   profile: learned             # learned | clean | profile.yaml; generate.py --sensor / --set override it

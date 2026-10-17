@@ -6,20 +6,56 @@ Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
 A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the frame noise, so noise in the frames makes no events.
-Fine texture the frames cannot show adds random ON/OFF pairs at a learned per-pixel **texture rate**, and the thresholds are **measured** from the data, not learned.
+Small things the frames cannot show live in a **detail image** on the keyframes, moved by the same flow: the teacher reads it from the events, generation draws it. The thresholds are **measured** from the data, not learned.
 At test time only RGB is needed.
 
 ```
 TRAIN
  I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 16×16 patch)
+                                  ──> detail branch (teacher)  ──> n        (per pixel, priced by its KL)
  context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
- z or ẑ + I0, I1 ──> physics decoder ──> L(u,τ) ──> taut path in the noise tube ──> exact-time event likelihood
+ z or ẑ, n + I0, I1 ──> physics decoder ──> L(u,τ) ──> taut path in the noise tube ──> exact-time likelihood + x-t / y-t loss
 
 TEST
- video ──> student ──> ẑ ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
+ video ──> student ──> ẑ, n ~ N(0,1) ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v5-texture`)
+### This version (`v6-detail`)
+
+Built on `v5-texture` (below). What the v4 / v5 checks showed, per dataset (HQ-EVFI / BS-ERGB / EDS):
+- v4 makes 0.50× / 0.17× / 0.55× of GT's events. Most missing events are up-and-down pairs (HQ 98%), most likely small things passing that the frames don't show.
+- v5's texture events have coin-flip polarity (50% polarity agreement, GT 79 / 84 / 91%) and break the one-polarity bursts (HQ 55 → 41%, EDS 57 → 38%): independent random events can't form curves.
+- Blurred x-t / y-t agreement with GT (4 px, 4 ms): 0.83 / 0.69 / 0.82 for v4, against 0.97–1.00 for two samples of the same path. The tube is not the cause (without it: 0.83 / 0.64 / 0.79).
+
+| Change | What it does |
+|---|---|
+| **Detail image** (`model.detail`) | A log-brightness image added to both keyframes before `render` moves them. Its mean per frame (`±2`, e.g. sharper edges) comes from the decoder like the rest of the path. Its random part `σ·n` lives at frame 0 and is moved to frame 1 by the path's own flow `F0(1)`, so a small dark thing makes OFF then ON at every pixel it crosses: connected curves in x-t / y-t, one polarity each. `σ` is a decoder output (0.01 at `z = 0`); `n` has the prior `N(0, 1)` per pixel. **Teacher:** a full-resolution branch (`detail_enc`, a small UNet on the event voxel + frames + flows) gives the posterior `N(m, s²)` of `n`; training uses a sample, validation the mean. **Generation / student:** `n ~ N(0, 1)`. The sampler, tube, likelihood and threshold fit are unchanged |
+| **Detail price** (`loss.detail_kl`) | `KL(posterior ‖ prior)` per pixel, added to the likelihood (1 = the proper value, an ELBO). The teacher puts a detail only where the events pay for it, so the detail can't cheaply soak up path errors (what learned `k`, `ν` and v5's texture rate did). The KL also pins `σ` to the size of the details the teacher finds, which is what generation draws |
+| **x-t / y-t loss** (`loss.xt`) | The ON / OFF events the path is expected to make (rise / `C_on`, fall / `C_off`, plus background) against the real events, both cut into x-t slices (one per row) and y-t slices (one per column), blurred by `loss.xt_blur` (2 px, 2 ms), compared slice by slice with the generalized KL of counts. It compares curves, not single events (which pixel fires when inside a curve is the sensor's randomness). Targets too few events along a curve, and curves a few ms or px off. 64 time bins (`losses.XT_BINS`) |
+| **Texture off** (`model.texture: false`) | v5's random events are left out (the code stays) |
+| **Init by name** (`train.py`) | Decoder outputs of the init checkpoint are matched by name (`model.head_rows`): from v4 or v5 the path outputs are kept, the texture row is dropped, the detail rows start at 0 |
+
+Checks (CPU, toy data and simulated events):
+- **Old configs** (no detail, `loss.xt` 0; v5 and v4-like): same losses and gradients as `v5-texture`, bit for bit, teacher and student stage.
+- **Detail image off = no detail:** with `n = 0` and its outputs at 0, the path equals the path without it (difference 0); the random part at frame 1 is the frame-0 one moved by the path's flow.
+- **Reads what the frames don't show:** flat gray frames, dark 2×2 specks present only in the events, moving 8 px per gap. On one batch, after 300 steps the teacher's detail correlates 0.98 with the true specks; `nll` −3.34 nats per pixel against 6.40 without the random part, for a KL of 1.07.
+- **x-t / y-t loss:** 6e-6 (the background floor) when expected and real counts match; gradients agree with finite differences (median relative error 1e-7); an edge off by ±1 / 2 / 4 / 8 ms costs 0.15 / 0.58 / 2.3 / 8.5, against 0.01 when aligned.
+- **Init from a v5-config checkpoint:** path rows kept, texture row dropped, detail rows 0.
+- **Smoke:** teacher, student, `generate.py`, `check.py` on toy data.
+
+Cost: the detail branch (UNet at full resolution, 32 / 64 / 128 channels); the x-t / y-t loss keeps two `2 × 64 × H × W` volumes per sample (recomputed in backward, a few GB at peak for batch 8 and 256² crops).
+
+Train each run from scratch (`train.out` empty), one change at a time:
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher model.detail=false loss.xt=0 train.out=runs/teacher_v6_base
+torchrun --nproc_per_node 4 train.py train.stage=teacher model.detail=false train.out=runs/teacher_v6_xt
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.out=runs/teacher_v6
+```
+
+Before training, run `check_data.py` on BS-ERGB (time offset and pixel shift): a misaligned frame teaches the detail image the wrong edges.
+
+### v5 (`v5-texture`)
 
 Built on `v4-tube` (below). In v4 the background was clean, but dense moving regions had about half of the real events. On dense pixels v4 had the right net change (ON − OFF) and missed **up-and-down pairs**: HQ-EVFI 98%, BS-ERGB 79% and EDS 60% of the missing events. Those come from fine texture the frames don't show. The learned threshold was also off by 12–43% against the data, because it was soaking up path errors.
 
@@ -68,7 +104,8 @@ Tube width, no hand-set value:
 | Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends), `ε` = measured frame noise × learned factor. Used by both the likelihood and the sampler (`model.tube`) |
-| Texture | `s["texture"] = a` per pixel: random ON/OFF pairs at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel (`model.texture`) |
+| Detail image | `s["D0"]`, `s["D1"]`: log brightness added to the keyframes (`model.detail`). Mean per frame from the decoder; random part `σ·n` at frame 0, moved to frame 1 by the path's flow. Teacher: `n` from `detail_code` (events); generation: `n ~ N(0, 1)`. `decode(p, z, n)`; `n = None` draws it |
+| Texture | v5, off by default: `s["texture"] = a` per pixel, random ON/OFF pairs at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel (`model.texture`) |
 | Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on` and refractory `R` are learned **per dataset** (each dataset is its own camera; with `model.measure_c` the thresholds are measured from frame change vs real event counts instead); the noise (`k` via `model.sigma_event`, `ν` via `model.nu`) is fixed in the config, because when learned it soaks up the path's errors and the sampler spreads them as noise; brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. With the tube: the taut path on a grid of at least 128 steps, exact crossing of its linear pieces; between gaps the pixel reference moves with the path's free start, so the jump fires nothing |
 
@@ -81,7 +118,9 @@ Tube width, no hand-set value:
 | `cmax` | Contrast maximization: real events moved along the model flow to τ=0 and τ=1 must stack into sharp edges (scale-normalized) |
 | `sigreg` | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to model later) |
 | `jepa` | Student code vs teacher code (`stopgrad` in the student stage, joint in the joint stage) |
-| `smooth` | Edge-aware smoothness of the path coefficients |
+| `smooth` | Edge-aware smoothness of the path coefficients (not the detail image) |
+| `xt` | Expected vs real ON / OFF events on blurred x-t and y-t slices (generalized KL of counts) |
+| `detail_kl` | Price of the detail image's random part: KL of the teacher's posterior to the prior `N(0, 1)`, nats per pixel |
 
 ---
 
@@ -90,7 +129,7 @@ Tube width, no hand-set value:
 | File | Content |
 |---|---|
 | `model.py` | Backbones, teacher, student, gated decoder, flows, `render(s, τ) → L, dL/dτ` |
-| `losses.py` | Likelihood, photometric, contrast max, SIGReg, stage logic, validation diagnostics |
+| `losses.py` | Likelihood, x-t / y-t loss, photometric, contrast max, SIGReg, stage logic, validation diagnostics |
 | `physics.py` | Quadratic root solver and event `Simulator` |
 | `data.py` | Sequence reader, training samples, collate, joint sampling over the datasets in `data.sets` |
 | `train.py` | Stages `probe / teacher / student / joint`, single GPU or `torchrun` DDP, bf16, resume |
@@ -194,8 +233,8 @@ python train.py train.stage=student train.init=runs/teacher/last.pt train.out=ru
 # 3. optional joint fine-tune (small lr)
 python train.py train.stage=joint train.init=runs/student/last.pt train.lr=2e-5 train.out=runs/joint
 
-# fine-tune a teacher trained without the tube / texture: the decoder gets more outputs, the old ones are kept
-python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out=runs/teacher_v5
+# fine-tune a teacher from an older version: decoder outputs are matched by name, new ones start at 0
+python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out=runs/teacher_v6
 ```
 
 ### What to watch (validation line)
@@ -207,6 +246,11 @@ python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out
 | `nll_zero` | Plain SloMo path | Above `nll` |
 | `nll_student` | Student code | Between `nll` and `nll_zero` |
 | `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
+| `nll_no_detail` | Teacher code without the detail image's random part | Above `nll` once the teacher finds details |
+| `detail_kl` | Nats per pixel the teacher spends on the detail image | Grows from 0 where the events show small things |
+| `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
+
+The teacher's values use the detail's posterior mean; `nll_student` draws it from the prior, as generation does.
 
 The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT and backbone weights.
 
@@ -248,8 +292,11 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 | `model.tube` | Events from the least-event path in the frame-noise tube; the width is measured, not set. `false` = the old path (old configs build without it) |
 | `model.texture` | Random ON/OFF pairs for texture the frames don't show, at a learned per-pixel rate (likelihood + sampler) |
 | `model.measure_c` | Thresholds measured from frame change vs real ON/OFF counts per dataset (`c_init` until the first batch of a dataset) |
+| `model.detail` | Detail image on the keyframes, moved by the flow (teacher reads it from the events, generation draws it) |
+| `loss.xt`, `loss.xt_blur` | Weight of the x-t / y-t loss (0.1; 0 = off) and its blur (2 px, 2 ms) |
+| `loss.detail_kl` | Price of the detail image (1.0, the proper value; higher keeps it emptier) |
 | `loss.mix` | With texture: how far back, in events, the likelihood looks for a pixel's last real crossing (16; cost grows with it) |
-| `loss.smooth` | Edge-aware smoothness of the path coefficients, tube factor and log texture (0.05) |
+| `loss.smooth` | Edge-aware smoothness of the path coefficients, tube factor and log texture (0.05); not the detail image |
 | `model.K` | Polynomial order of the path in time |
 | `loss.grid` | τ steps for the likelihood clocks |
 | `sensor.*` | Generation only: `noise` scales the learned background rate; `mismatch`, `refractory` are optional extras; step limits |
@@ -277,4 +324,6 @@ Known limits:
 - The tube adds a loop over the τ grid (forward and backward in time) per likelihood call.
 - Texture: a real crossing more than `loss.mix` events back is not found (the "no crossing since the start" case still is). Texture events have random times: they get the density right, not the exact streaks.
 - Measured thresholds assume the stationary start state, like the likelihood. A real pixel remembers its last direction (dead zone), which pushes the fit up on small changes (about 10% on the toy data for `0.5 ≤ |d| ≤ 2`).
+- Detail image: generation draws its random part as white noise per pixel moved by the flow; real texture has more structure. Each gap draws a new one (with the tube the jump at the gap start fires nothing, but the texture does not carry over). The teacher reads it from 16 time bins (2–3 ms each).
+- Notebooks and scripts that call `decode(p, z)` for a teacher get a random detail image; pass `n = model.detail_code(p, voxel, sample=False)[0]` (as `check.py` and the validation do).
 - The student is deterministic, so ambiguous gaps (same endpoints, different timing) get an average code. A stochastic student `p(z | video)` is the next step.

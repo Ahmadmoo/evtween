@@ -31,9 +31,63 @@ def ig_logs(x, k):
 
 SHIFTS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)  # mid-gap timing errors (grid steps) averaged per pixel with the predicted uncertainty
 MIX = 16  # with texture: how far back (in events) the last real crossing before an event is looked for (loss.mix)
+XT_BINS = 64  # time bins of the x-t / y-t loss (the tau grid summed in groups)
 
 
-def event_nll(model, s, ev, dt, steps=128, mix=MIX):
+def path_grid(model, s, steps=128):
+    # the path the pixels see on the tau grid, (B, steps + 1, H*W): L, or the taut path in the tube
+    B = s["y0"].shape[0]
+    taus = torch.linspace(0, 1, steps + 1, device=s["y0"].device)
+    frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
+    grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
+    Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
+    return taut(Lg, model.tube_eps(s)) if "tube" in s else Lg
+
+
+def _blur(v, ax, sig):
+    # Gaussian blur of v (B, C, T, H, W) along axis ax (2: t, 3: y, 4: x), one sigma per sample (B,), zeros outside
+    B, C = v.shape[:2]
+    r = int(math.ceil(3 * float(sig.max())))
+    if r == 0:
+        return v
+    x = torch.arange(-r, r + 1, device=v.device, dtype=v.dtype)
+    k = torch.exp(-0.5 * (x / sig[:, None].clamp(min=1e-3)) ** 2)
+    k = (k / k.sum(1, keepdim=True)).repeat_interleave(C, 0)
+    shape, pad = [B * C, 1, 1, 1, 1], [0, 0, 0]
+    shape[ax], pad[ax - 2] = 2 * r + 1, r
+    return F.conv3d(v.reshape(1, B * C, *v.shape[2:]), k.view(shape), padding=tuple(pad), groups=B * C).view_as(v)
+
+
+def xt_loss(model, s, ev, dt, Lg, blur=(2.0, 2.0)):
+    # x-t / y-t loss: the ON / OFF events the path is expected to make (rise / C_on, fall / C_off, plus background) against
+    # the real events, both cut into x-t slices (one per row, blurred in x and t) and y-t slices (one per column, blurred
+    # in y and t), compared slice by slice with the generalized KL of counts (0 when equal). The blur (px, ms) compares the
+    # curves, not single events: which pixel fires when inside a curve is the sensor's randomness
+    b, pix, tau, pol = ev
+    B, _, H, W = s["y0"].shape
+    steps = Lg.shape[1] - 1
+    T = XT_BINS if steps % XT_BINS == 0 else steps
+    C, _, nu, _ = model.sensor(s["ds"])
+
+    def run(Lg):
+        dL = (Lg[:, 1:] - Lg[:, :-1]).view(B, T, steps // T, H * W)
+        m = torch.stack([F.relu(dL).sum(2) / C[:, :1, None], F.relu(-dL).sum(2) / C[:, 1:, None]], 1)
+        m = (m + (nu * dt / (2 * T))[:, None, None, None]).view(B, 2, T, H, W)
+        key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
+        g = torch.zeros(B * 2 * T * H * W, device=m.device, dtype=m.dtype).index_add_(0, key, torch.ones_like(tau, dtype=m.dtype)).view_as(m)
+        st = blur[1] * 1e-3 / dt * T  # time blur in bins, per sample
+        px = torch.full_like(st, float(blur[0]))
+        mt, gt = _blur(m, 2, st), _blur(g, 2, st)
+        out = 0
+        for ax in (4, 3):  # x-t slices: blur along x; y-t slices: blur along y
+            mb, gb = _blur(mt, ax, px), _blur(gt, ax, px)
+            out = out + (mb - gb + torch.xlogy(gb, gb) - gb * mb.clamp(min=1e-12).log()).sum() / 2
+        return out / (B * H * W)
+
+    return checkpoint(run, Lg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg)
+
+
+def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
@@ -51,14 +105,12 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX):
     # over each pixel's events sums over it (the last crossing is among the `mix` events before, or there was none since the
     # gap started). Every pixel pays for
     # the texture events it expects, a * total variation of its path * (1/C_on + 1/C_off) / 2
+    # Lg: the path on the grid from path_grid (computed here if not given)
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     taus = torch.linspace(0, 1, steps + 1, device=tau.device)
-    frame = lambda t: model.render(s, t.expand(B))[0][:, 0]
-    grad = torch.is_grad_enabled()  # recompute renders in backward: memory stays flat as the grid gets finer
-    Lg = torch.stack([checkpoint(frame, t, use_reentrant=False) if grad else frame(t) for t in taus], 1).flatten(2)
-    if "tube" in s:
-        Lg = taut(Lg, model.tube_eps(s))
+    grad = torch.is_grad_enabled()
+    Lg = path_grid(model, s, steps) if Lg is None else Lg
     C, K, nu, R = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
     nu = nu * dt
     c, k = C[b], K[b, None]  # per event
@@ -271,18 +323,24 @@ def compute(model, batch, w, stage):
     terms = {}
     if stage in ("teacher", "joint"):
         z = model.encode(p, batch["voxel"])
-        s = model.decode(p, z)
-        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX)), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
+        n = None
+        if model.detail:  # the random part of the detail image, read from the events (a sample: the KL prices it)
+            n, terms["detail_kl"] = model.detail_code(p, batch["voxel"])
+        s = model.decode(p, z, n)
+        Lg = path_grid(model, s, w["grid"])
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX), Lg), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=sigreg_loss(z))
+        if w.get("xt", 0) > 0:
+            terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, w.get("xt_blur", (2.0, 2.0)))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
-        s = model.decode(p, zh)
+        s = model.decode(p, zh)  # detail image: its random part drawn from the prior, as in generation
         terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX)))
         if stage == "student":
             terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
-    weight = dict(w, nll_student=w["nll"])
+    weight = dict(w, nll_student=w["nll"], detail_kl=w.get("detail_kl", 1.0))
     return sum(weight[k] * v for k, v in terms.items()), terms
 
 
@@ -290,11 +348,19 @@ def compute(model, batch, w, stage):
 def diagnostics(model, batch, w, student=True):
     # does the decoder use z (shuffled / zero codes must hurt), and how much can the student predict (gap)?
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
+    # detail image: the teacher's codes use its posterior mean; nll_no_detail drops the random part (how much it helps);
+    # the student draws it from the prior, as in generation
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     z = model.encode(p, batch["voxel"])
-    nll = lambda code: event_nll(model, model.decode(p, code), ev, batch["dt"], w["grid"], w.get("mix", MIX)).item()
+    n, kl = model.detail_code(p, batch["voxel"], sample=False) if model.detail else (None, None)
+    nll = lambda code, n=n: event_nll(model, model.decode(p, code, n), ev, batch["dt"], w["grid"], w.get("mix", MIX)).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
+    if model.detail:
+        out.update(nll_no_detail=nll(z, torch.zeros_like(n)), detail_kl=kl.item())
+    if w.get("xt", 0) > 0:
+        s = model.decode(p, z, n)
+        out["xt"] = xt_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("xt_blur", (2.0, 2.0))).item()
     if student:
-        out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]))
+        out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]), None)
         out["gap"] = out["nll_student"] - out["nll"]
     return out

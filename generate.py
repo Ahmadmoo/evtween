@@ -28,6 +28,7 @@ print("sensor:", {k: float(f"{v:.4g}") for k, v in prof.items()})
 if args.save_profile:
     yaml.safe_dump(prof, open(args.save_profile, "w"), sort_keys=False)
 sim = Simulator(model, prof, int(S["min_steps"]), int(S["max_steps"]), int(S["seed"]))
+torch.manual_seed(int(S["seed"]))  # the detail image's random part (model.detail) is drawn in decode
 
 seq, c, parts = Sequence(args.seq), ck["cfg"]["data"]["context"], []
 N, ts = len(seq), seq.ts

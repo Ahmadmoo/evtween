@@ -10,13 +10,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from data import JointBatches, JointDataset, collate, datasets
 from losses import compute, diagnostics
-from model import build_model
+from model import build_model, head_rows
 
 # which parameters each stage trains (pretrained RAFT / video backbone always stay frozen)
 TRAIN = {"probe": ("student.", "to_counts."),
-         "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
+         "teacher": ("teacher.", "detail_enc.", "decoder.", "log_", "w_rgb"),
          "student": ("student.", "to_z."),
-         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
+         "joint": ("teacher.", "detail_enc.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
 
 
 def load_cfg(argv):
@@ -62,17 +62,26 @@ torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 
 model = build_model(cfg).to(dev)
 if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
-    sd, own = torch.load(T["init"], map_location=dev, weights_only=False)["model"], model.state_dict()
+    ck0 = torch.load(T["init"], map_location=dev, weights_only=False)
+    sd, own = ck0["model"], model.state_dict()
     sd = {k: v.expand_as(own[k]).clone() if k in own and v.dim() == 0 and own[k].dim() == 1 else v for k, v in sd.items()}  # one sensor -> all
-    grow = [k for k in ("decoder.head.weight",) if k in sd and k in own and own[k].shape[1:] == sd[k].shape[1:]
-            and own[k].shape[0] > sd[k].shape[0]]  # decoder outputs added at the end (e.g. the tube factor): old ones kept, new ones 0
-    sd.update({k: torch.cat([sd[k], own[k][len(sd[k]):]]) for k in grow})
+    # decoder outputs added or removed (tube factor, texture, detail image): rows matched by name, new ones start at 0
+    old, new = head_rows(ck0["cfg"]["model"]), head_rows(cfg["model"])
+    k = "decoder.head.weight"
+    grow = [k] if k in sd and k in own and len(sd[k]) == sum(old.values()) and own[k].shape[1:] == sd[k].shape[1:] and old != new else []
+    if grow:
+        at = lambda rows, name: sum(list(rows.values())[:list(rows).index(name)])  # first row of an output
+        w = own[k].clone()
+        for name in old.keys() & new.keys():
+            if old[name] == new[name]:
+                w[at(new, name):at(new, name) + new[name]] = sd[k][at(old, name):at(old, name) + old[name]]
+        sd[k] = w
     skip = sorted({k.split(".")[0] for k, v in sd.items() if k in own and own[k].shape != v.shape})
     model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
     if rank == 0 and grow:
-        print("init: more outputs, old ones loaded:", grow, flush=True)
+        print(f"init: decoder outputs {list(old)} -> {list(new)}, matched by name, new ones start at 0", flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
 params = [p for p in model.parameters() if p.requires_grad]
