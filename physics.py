@@ -1,19 +1,11 @@
 import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from model import taut, wiggle_k
 
 TUBE_STEPS = 128  # with the tube the path is fixed on a grid first, at least as fine as the likelihood's (loss.grid)
-
-
-def _hash(cx, cy, salt):
-    # uniform numbers in [0, 1) from integer cell coordinates (any cell, also outside the image) and a salt
-    h = (cx.long() * 73856093) ^ (cy.long() * 19349663) ^ (salt * 83492791)
-    for _ in range(3):
-        h = h & 0xFFFFFFFF
-        h = ((h >> 16) ^ h) * 0x45D9F3B
-    return ((h >> 8) & 0xFFFFFF).double().div(1 << 24).float()
 
 
 def first_root(a, b, c, lo, hi):
@@ -61,16 +53,17 @@ class Simulator:
     # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture.
     # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it.
     # With s["wiggle"] (texture as a hidden brightness wiggle of size A, as in losses.event_nll): each pixel's thresholds
-    # get the wider spread model.wiggle_k (a curve's events move in time, same polarity), and the up-and-down pairs come
-    # from specks on the frame-0 image (one per pixel cell, at a random place), swept by the point of the image each pixel
-    # sees (p + F0(tau), the path's own flow). A speck entering a pixel fires a pair with probability
-    # A exp(-|dL/dtau| / (A speed)) / (C_on + C_off), the expected rate of the likelihood, decided by the speck's own
-    # random number: the pixels it crosses one after the other make the same choice, so pairs form streaks along the
-    # motion, OFF then ON for a dark speck (ON then OFF for a bright one, one pixel of motion later). Pairs are texture
-    # events: they leave the pixel's state alone
-    def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
+    # get the wider spread model.wiggle_k (a curve's events move in time, same polarity), and the up-and-down events come
+    # from a texture: smooth random brightness on the frame-0 image (white noise blurred over `grain` px, a new one every
+    # gap), scaled per pixel so that one pixel of motion changes it by A on average, and moved by the path's own flow (each
+    # pixel sees the point p + F0(tau)). A pixel fires each time the texture it sees crosses a level of a ladder with
+    # rungs (C_on + C_off) / 2 apart, at its own random height: ON going up, OFF going down, kept with probability
+    # exp(-|dL/dtau| / (A speed)) (none on steep curves). The expected count is the likelihood's (model.wiggle_rate per
+    # polarity); a bright blob gives ON on its front and OFF on its back, and nearby pixels see the same blob, so texture
+    # events form soft curved patches along the motion. They are texture events: they leave the pixel's state alone
+    def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64, grain=2.0):
         self.m, self.p = model, profile or resolve(model)
-        self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
+        self.min_steps, self.max_steps, self.max_events, self.grain = min_steps, max_steps, max_events, grain
         self.gen = torch.Generator().manual_seed(seed)
         self.ref = self.last = None
 
@@ -116,13 +109,12 @@ class Simulator:
             self.ref = g[:, 0].clone() if fresh else self.ref + g[:, 0] - self.last
             self.last = g[:, -1]
         if A is not None:
-            csum = p["pos_thres"] + p["neg_thres"]
-            B_, _, Hh, Ww = A.shape
+            Hh, Ww = A.shape[-2:]
             gy, gx = torch.meshgrid(torch.arange(Hh, device=self.dev, dtype=torch.float32),
                                     torch.arange(Ww, device=self.dev, dtype=torch.float32), indexing="ij")
             seen = [torch.stack([gx, gy])[None] + m.flows(s, tau(i / S).view(1, 1, 1, 1))[0] for i in range(S + 1)]
-            salt = int(torch.randint(1 << 20, (4,), generator=self.gen)[0])  # a new speck field every gap
-            self.specks = dict(salt=salt, csum=csum)
+            tex_at, phase = self._texture(seen), self._u(A.shape).float()
+            level = [A * tex_at(q) / ((p["pos_thres"] + p["neg_thres"]) / 2) + phase for q in seen]  # in rungs
         H, out, a = 1.0 / S, [], s.get("texture")
         for i in range(S):
             if g is not None:  # linear between grid points
@@ -134,7 +126,9 @@ class Simulator:
             tex = None if a is None else a * (Lb - La).abs() / H / (2 * self.c)  # texture events per unit time, ON / OFF
             self._cross(La, Da, alpha, H, t0 + dt * i * H, dt, out, tex)
             if A is not None:
-                self._specks(seen[i], seen[i + 1], (Lb - La).abs()[:, 0] / H, A[:, 0], H, t0 + dt * i * H, dt, t1, out)
+                speed = (seen[i + 1] - seen[i]).norm(dim=1, keepdim=True) / H  # px per gap
+                keep = torch.exp(-(Lb - La).abs() / H / (A * speed + 1e-6))
+                self._rungs(level[i], level[i + 1], keep, H, t0 + dt * i * H, dt, out)
             if g is None:
                 La, Da = Lb, Db
         t, x, y, p, src = (torch.cat(v).cpu().numpy() for v in zip(*out)) if out else ([np.zeros(0)] * 5)
@@ -146,35 +140,30 @@ class Simulator:
         # (reference, thresholds, blind time) instead of the stationary guess, so the first events of the gap are no burst
         self.run(s, t0, t1)
 
-    def _specks(self, sa, sb, slope, A, H, ta, dt, t1, out):
-        # texture pairs in this step: the image point each pixel sees moves from sa to sb (frame-0 px, (B, 2, H, W)); the
-        # specks of the 4 cells around sb that came within half a pixel of it (both axes) during the step have entered.
-        # The speck field covers the whole plane (hashed from the cell), so texture coming in from outside frame 0 has specks too
-        sp = self.specks
-        speed = (sb - sa).norm(dim=1) / H  # px per gap
-        prob = (A * torch.exp(-slope / (A * speed + 1e-6)) / sp["csum"]).clamp(max=1)
-        base = (sb - 0.5).floor()
-        for oy in (0, 1):
-            for ox in (0, 1):
-                cx, cy = base[:, 0] + ox, base[:, 1] + oy
-                at = lambda n: _hash(cx, cy, sp["salt"] * 4 + n)  # this cell's speck: place (x, y), its choice, dark or bright
-                zx, zy = cx + at(0), cy + at(1)
-                near = lambda q: ((zx - q[:, 0]).abs() < 0.5) & ((zy - q[:, 1]).abs() < 0.5)
-                enter = near(sb) & ~near(sa) & (at(2) < prob)
-                if not enter.any():
-                    continue
-                f = torch.zeros_like(cx)  # when it entered: the later of the two axes along the straight step
-                for z, a_, b_ in ((zx, sa[:, 0], sb[:, 0]), (zy, sa[:, 1], sb[:, 1])):
-                    d = b_ - a_
-                    f = torch.maximum(f, torch.where(d > 0, (z - 0.5 - a_) / d, torch.where(d < 0, (z + 0.5 - a_) / d, -1.0)))
-                t = ta + dt * H * f.clamp(0, 1).double()
-                t2 = t + dt / speed.double().clamp(min=1e-6)  # its far side: one pixel of motion later
-                lead = torch.where(at(3) < 0.5, -1, 1)
-                i = enter.nonzero(as_tuple=True)
-                j = (enter & (t2 <= t1)).nonzero(as_tuple=True)
-                two = lambda n: torch.full((n,), 2, dtype=torch.int8, device=t.device)
-                out.append((t[i], i[2], i[1], lead[i], two(len(i[0]))))
-                out.append((t2[j], j[2], j[1], -lead[j], two(len(j[0]))))
+    def _texture(self, seen):
+        # the texture of this gap on the frame-0 plane, wide enough for every point the pixels see (seen: (B, 2, H, W) per
+        # step): white noise blurred over `grain` px, scaled to a mean slope of 1 per px; returns points -> texture (B, 1, H, W)
+        r, M = math.ceil(3 * self.grain), max(seen[0].shape[-2:])  # (no texture further than M px outside the image)
+        lo = torch.stack([q.amin((0, 2, 3)) for q in seen]).amin(0).floor().clamp(min=-M) - 1
+        hi = torch.stack([q.amax((0, 2, 3)) for q in seen]).amax(0).ceil().clamp(max=2 * M) + 1
+        n = (hi - lo).long() + 1  # x, y size
+        w = torch.randn((seen[0].shape[0], 1, int(n[1]) + 2 * r, int(n[0]) + 2 * r), generator=self.gen).to(self.dev)
+        k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=self.dev) / max(self.grain, 1e-6)) ** 2)
+        w = F.conv2d(F.conv2d(w, (k / k.sum()).view(1, 1, 1, -1)), (k / k.sum()).view(1, 1, -1, 1))
+        w = w / torch.cat([(w[..., 1:] - w[..., :-1]).flatten(1), (w[..., 1:, :] - w[..., :-1, :]).flatten(1)], 1).abs().mean(1).view(-1, 1, 1, 1)
+        size = (n - 1).float().view(1, 2, 1, 1)
+        return lambda q: F.grid_sample(w, ((q - lo.view(1, 2, 1, 1)) / size * 2 - 1).permute(0, 2, 3, 1), align_corners=True)
+
+    def _rungs(self, ua, ub, keep, H, ta, dt, out):
+        # texture events in this step: the texture level a pixel sees (in rungs, with its random height) goes from ua to ub,
+        # linear in between; each whole number crossed is an event (ON up, OFF down), kept with probability keep
+        fa, fb, up = ua.floor(), ub.floor(), ub > ua
+        n = (fb - fa).abs()
+        for j in range(int(n.max().item())):
+            hit = (n > j) & (self._u(ua.shape) < keep)
+            t = ta + dt * H * ((torch.where(up, fa + 1 + j, fa - j) - ua) / (ub - ua)).double()
+            i = hit.nonzero(as_tuple=True)
+            out.append((t[i], i[3], i[2], torch.where(up, 1, -1)[i], torch.full((len(i[0]),), 2, dtype=torch.int8, device=t.device)))
 
     def _cross(self, La, Da, alpha, H, ta, dt, out, tex=None):
         q = lambda h: La + Da * h + alpha * h * h
