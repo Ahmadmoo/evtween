@@ -2,9 +2,18 @@ import math
 import numpy as np
 import torch
 import yaml
-from model import taut
+from model import taut, wiggle_k
 
 TUBE_STEPS = 128  # with the tube the path is fixed on a grid first, at least as fine as the likelihood's (loss.grid)
+
+
+def _hash(cx, cy, salt):
+    # uniform numbers in [0, 1) from integer cell coordinates (any cell, also outside the image) and a salt
+    h = (cx.long() * 73856093) ^ (cy.long() * 19349663) ^ (salt * 83492791)
+    for _ in range(3):
+        h = h & 0xFFFFFFFF
+        h = ((h >> 16) ^ h) * 0x45D9F3B
+    return ((h >> 8) & 0xFFFFFF).double().div(1 << 24).float()
 
 
 def first_root(a, b, c, lo, hi):
@@ -50,7 +59,15 @@ class Simulator:
     # With s["texture"] random texture events come on top, at rate a |dL/dtau| / (2 C_pol) (as in losses.event_nll);
     # then texture and background events leave the pixel's state alone (only real crossings reset it).
     # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture.
-    # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it
+    # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it.
+    # With s["wiggle"] (texture as a hidden brightness wiggle of size A, as in losses.event_nll): each pixel's thresholds
+    # get the wider spread model.wiggle_k (a curve's events move in time, same polarity), and the up-and-down pairs come
+    # from specks on the frame-0 image (one per pixel cell, at a random place), swept by the point of the image each pixel
+    # sees (p + F0(tau), the path's own flow). A speck entering a pixel fires a pair with probability
+    # A exp(-|dL/dtau| / (A speed)) / (C_on + C_off), the expected rate of the likelihood, decided by the speck's own
+    # random number: the pixels it crosses one after the other make the same choice, so pairs form streaks along the
+    # motion, OFF then ON for a dark speck (ON then OFF for a bright one, one pixel of motion later). Pairs are texture
+    # events: they leave the pixel's state alone
     def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64):
         self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events = min_steps, max_steps, max_events
@@ -73,6 +90,8 @@ class Simulator:
         m, dt = self.m, t1 - t0
         p = self.p
         self.dev, self.k, self.nu, self.R = s["d"].device, max(p["sigma_event"], 1e-3) ** -2, p["shot_noise_rate_hz"], p["refractory_period_s"]
+        if "wiggle" in s:  # per pixel: the wiggle spreads a curve's events in time
+            self.k = wiggle_k(self.k, s["wiggle"].double(), p["pos_thres"] + p["neg_thres"])
         tau = lambda v: torch.full((1,), v, device=self.dev)
         La, Da, _ = m.render(s, tau(0.0))
         fresh = self.ref is None
@@ -88,14 +107,22 @@ class Simulator:
 
         speed = max(m.render(s, tau(v))[1].abs().flatten().quantile(0.999).item() for v in (0.0, 0.5, 1.0))
         S = int(min(max(math.ceil(2 * speed / self.c.min().item()), self.min_steps), self.max_steps))
-        g = None
-        if "tube" in s:
+        g, A = None, s.get("wiggle")
+        if "tube" in s or A is not None:
             S = max(S, TUBE_STEPS)
             L = torch.stack([m.render(s, tau(i / S))[0] for i in range(S + 1)], 1)
-            g = taut(L.flatten(2), m.tube_eps(s)).view_as(L)
-            # each gap's path starts free inside the tube: the jump from the last gap's end fires nothing
+            g = taut(L.flatten(2), m.tube_eps(s)).view_as(L) if "tube" in s else L
+        if "tube" in s:  # each gap's path starts free inside the tube: the jump from the last gap's end fires nothing
             self.ref = g[:, 0].clone() if fresh else self.ref + g[:, 0] - self.last
             self.last = g[:, -1]
+        if A is not None:
+            csum = p["pos_thres"] + p["neg_thres"]
+            B_, _, Hh, Ww = A.shape
+            gy, gx = torch.meshgrid(torch.arange(Hh, device=self.dev, dtype=torch.float32),
+                                    torch.arange(Ww, device=self.dev, dtype=torch.float32), indexing="ij")
+            seen = [torch.stack([gx, gy])[None] + m.flows(s, tau(i / S).view(1, 1, 1, 1))[0] for i in range(S + 1)]
+            salt = int(torch.randint(1 << 20, (4,), generator=self.gen)[0])  # a new speck field every gap
+            self.specks = dict(salt=salt, csum=csum)
         H, out, a = 1.0 / S, [], s.get("texture")
         for i in range(S):
             if g is not None:  # linear between grid points
@@ -106,6 +133,8 @@ class Simulator:
                 alpha = (Lb - La - Da * H) / H ** 2
             tex = None if a is None else a * (Lb - La).abs() / H / (2 * self.c)  # texture events per unit time, ON / OFF
             self._cross(La, Da, alpha, H, t0 + dt * i * H, dt, out, tex)
+            if A is not None:
+                self._specks(seen[i], seen[i + 1], (Lb - La).abs()[:, 0] / H, A[:, 0], H, t0 + dt * i * H, dt, t1, out)
             if g is None:
                 La, Da = Lb, Db
         t, x, y, p, src = (torch.cat(v).cpu().numpy() for v in zip(*out)) if out else ([np.zeros(0)] * 5)
@@ -116,6 +145,36 @@ class Simulator:
         # run a gap and drop its events (e.g. the gap before the one of interest): the pixels then start in a real state
         # (reference, thresholds, blind time) instead of the stationary guess, so the first events of the gap are no burst
         self.run(s, t0, t1)
+
+    def _specks(self, sa, sb, slope, A, H, ta, dt, t1, out):
+        # texture pairs in this step: the image point each pixel sees moves from sa to sb (frame-0 px, (B, 2, H, W)); the
+        # specks of the 4 cells around sb that came within half a pixel of it (both axes) during the step have entered.
+        # The speck field covers the whole plane (hashed from the cell), so texture coming in from outside frame 0 has specks too
+        sp = self.specks
+        speed = (sb - sa).norm(dim=1) / H  # px per gap
+        prob = (A * torch.exp(-slope / (A * speed + 1e-6)) / sp["csum"]).clamp(max=1)
+        base = (sb - 0.5).floor()
+        for oy in (0, 1):
+            for ox in (0, 1):
+                cx, cy = base[:, 0] + ox, base[:, 1] + oy
+                at = lambda n: _hash(cx, cy, sp["salt"] * 4 + n)  # this cell's speck: place (x, y), its choice, dark or bright
+                zx, zy = cx + at(0), cy + at(1)
+                near = lambda q: ((zx - q[:, 0]).abs() < 0.5) & ((zy - q[:, 1]).abs() < 0.5)
+                enter = near(sb) & ~near(sa) & (at(2) < prob)
+                if not enter.any():
+                    continue
+                f = torch.zeros_like(cx)  # when it entered: the later of the two axes along the straight step
+                for z, a_, b_ in ((zx, sa[:, 0], sb[:, 0]), (zy, sa[:, 1], sb[:, 1])):
+                    d = b_ - a_
+                    f = torch.maximum(f, torch.where(d > 0, (z - 0.5 - a_) / d, torch.where(d < 0, (z + 0.5 - a_) / d, -1.0)))
+                t = ta + dt * H * f.clamp(0, 1).double()
+                t2 = t + dt / speed.double().clamp(min=1e-6)  # its far side: one pixel of motion later
+                lead = torch.where(at(3) < 0.5, -1, 1)
+                i = enter.nonzero(as_tuple=True)
+                j = (enter & (t2 <= t1)).nonzero(as_tuple=True)
+                two = lambda n: torch.full((n,), 2, dtype=torch.int8, device=t.device)
+                out.append((t[i], i[2], i[1], lead[i], two(len(i[0]))))
+                out.append((t2[j], j[2], j[1], -lead[j], two(len(j[0]))))
 
     def _cross(self, La, Da, alpha, H, ta, dt, out, tex=None):
         q = lambda h: La + Da * h + alpha * h * h

@@ -11,6 +11,21 @@ NOISE_BINS = 16  # brightness bins of the measured frame noise (tube width)
 C_RANGE = (0.5, 2.0)  # |L1 - L0| of the pixels that measure the thresholds: above the frame noise, below the sensor's speed limit
 TEX0 = 0.01  # texture at z = 0 (extra up-and-down change per unit of path change)
 DETAIL0 = 0.01  # spread of the random detail image at z = 0 (log units)
+WIGGLE0 = 0.01  # texture wiggle size at z = 0 (log units)
+
+
+def wiggle_rate(A, slope, speed, C):
+    # texture pairs from a hidden brightness wiggle of size A (log units) riding on the path: per unit tau and per polarity,
+    # A per pixel of motion (speed: px per gap) over the two thresholds, and none where the path's own change |dL/dtau|
+    # outruns the wiggle (a wiggle can't turn a steep curve around: there it only moves the curve's events in time)
+    v = A * speed
+    return v * torch.exp(-slope / (v + 1e-6)) / C
+
+
+def wiggle_k(K, A, C):
+    # inverse-Gaussian shape of the thresholds with the wiggle: its level noise A between two events (variance 2 A^2)
+    # adds to the threshold spread (C / sqrt(K) at the mean threshold C / 2 = (C_on + C_off) / 2)
+    return 1 / (1 / K + 8 * A ** 2 / C ** 2)
 
 
 def luminance(img, gamma=2.2):
@@ -299,7 +314,7 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False):
+                 measure_c=False, detail=False, wiggle=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -312,7 +327,9 @@ class EvTween(nn.Module):
         # detail image: three more outputs (its mean at frame 0 and at frame 1, the spread of its random part) and a
         # full-resolution teacher branch that reads the random part from the events
         self.detail = detail
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture) + 3 * int(detail), width, depth)
+        self.wiggle = wiggle  # one more output: size of the hidden brightness wiggle (texture as brightness, not as events)
+        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture) + 3 * int(detail) + int(wiggle),
+                               width, depth)
         if detail:
             self.detail_enc = UNet(2 * bins + 12, 2, 32, (1, 1, 2))
             nn.init.zeros_(self.detail_enc.head[1].weight)
@@ -498,8 +515,9 @@ class EvTween(nn.Module):
             out = self.decoder(p["x"], z)
         H, W, B = p["H"], p["W"], z.shape[0]
         crop = lambda t: t[..., :H, :W]
-        a, b, d, u, g, q, e = crop(out.float()).split(
-            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture), 3 * int(self.detail)], 1)
+        a, b, d, u, g, q, e, w = crop(out.float()).split(
+            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture), 3 * int(self.detail),
+             int(self.wiggle)], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
         s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
                  a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
@@ -522,6 +540,8 @@ class EvTween(nn.Module):
             s["sig_detail"] = sig
             s["frame0"], s["frame1"] = s["y0"], s["y1"]  # the frames themselves (noise table, tube width)
             s["y0"], s["y1"] = s["y0"] * s["D0"].exp(), s["y1"] * s["D1"].exp()
+        if self.wiggle:  # size of the hidden brightness wiggle (log units), 0.01 at z = 0, up to 1.5
+            s["wiggle"] = WIGGLE0 * bound(w, 5.0).exp()
         return s
 
     def flows(self, s, tau):
@@ -562,7 +582,8 @@ class EvTween(nn.Module):
 def head_rows(m):
     # decoder outputs in order, name -> number of channels, for a config's "model" section (defaults as in build_model)
     K, on = m.get("K", 3), lambda key: int(bool(m.get(key, False)))
-    return dict(a=2 * K, b=2 * K, d=K + 1, sig=on("uncertainty"), tube=on("tube"), texture=on("texture"), detail=3 * on("detail"))
+    return dict(a=2 * K, b=2 * K, d=K + 1, sig=on("uncertainty"), tube=on("tube"), texture=on("texture"), detail=3 * on("detail"),
+                wiggle=on("wiggle"))
 
 
 def build_model(cfg):
@@ -570,5 +591,6 @@ def build_model(cfg):
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, **cfg["model"]},
+    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, "wiggle": False,
+                      **cfg["model"]},
                    bins=cfg["data"]["bins"], gammas=gammas)

@@ -6,7 +6,7 @@ Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
 A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the frame noise, so noise in the frames makes no events.
-Small things the frames cannot show live in a **detail image** on the keyframes, moved by the same flow: the teacher reads it from the events, generation draws it. The thresholds are **measured** from the data, not learned.
+Texture the frames cannot show is a hidden **brightness wiggle** per pixel: on a curve it spreads the curve's events in time (same polarity), on a moving surface it makes up-and-down pairs, drawn as specks that move with the flow. The thresholds are **measured** from the data, not learned.
 At test time only RGB is needed.
 
 ```
@@ -20,7 +20,39 @@ TEST
  video ──> student ──> ẑ, n ~ N(0,1) ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v6-detail`)
+### This version (`v6-wiggle`)
+
+Built on `v5-texture`, fine-tuned from a v5 checkpoint. Trained longer, v5 gets the number and place of events close to GT (0.8–1.35× GT events, against 0.15–0.77× for v4; lower nll on every checked sample), but:
+- **ON and OFF are mixed on each curve** in x-t / y-t. v5's texture events take a coin-flip polarity, and their rate `a·|dL/dτ|` is highest exactly on the curves, so an OFF curve gets about as many texture ON events as OFF.
+- **The dots form a cloud around the curves, not streaks**: every pixel draws its texture events alone.
+
+Real texture is brightness, not events: small wiggles riding on the path. On a steep curve a wiggle only moves the curve's events in time (to make an event of the other polarity it would have to rise a full threshold against the fall); where the path is flat and the surface moves, it makes up-and-down pairs, in order (OFF then ON for a dark speck).
+
+| Change | What it does |
+|---|---|
+| **Wiggle** (`model.wiggle`, replaces `model.texture`) | One decoder output per pixel: the wiggle size `A` (log brightness, 0.01 at `z = 0`, up to 1.5). **On curves:** the thresholds get the wider spread `1/k_A = 1/k + 2A² / c̄²` (`c̄ = (C_on + C_off)/2`, `model.wiggle_k`): the curve's events scatter in time, with the curve's polarity. **Pairs:** per unit τ and per polarity, `A · speed · exp(−|dL/dτ| / (A · speed)) / (C_on + C_off)` (`model.wiggle_rate`), with `speed = |dF0/dτ|` the speed (px per gap) of the image point the pixel sees: a wiggle of `A` per pixel of motion, and none where the path's own change outruns the wiggle. Pair events don't reset the pixel; the likelihood sums over which events were crossings with v5's forward pass (`loss.mix`). The slope and speed in the rate carry no gradient: the wiggle size is learned, the path and flow are not bent to make texture |
+| **Specks moved by the flow** (`physics.Simulator`) | The pairs come from specks on the image plane (one per pixel cell, at a hashed random place, so also outside frame 0), swept by the point `p + F0(τ)` each pixel sees. A speck entering a pixel fires a pair with probability `A · exp(−|dL/dτ| / (A · speed)) / (C_on + C_off)` (the likelihood's rate), decided by the speck's own random number, so the pixels it crosses one after the other make the same choice: streaks along the motion. A dark speck gives OFF, then ON one pixel of motion later; a bright one the reverse. A new speck field every gap |
+| **x-t / y-t loss counts texture** (`loss.xt` 1.0) | The texture events the model expects (pairs, or v5's texture) are added to the expected ON / OFF counts, so a 50/50 texture inside a one-polarity curve costs directly |
+| From `v6-detail` (kept, off) | The x-t / y-t loss, decoder outputs matched by name on `train.init`, the detail image (`model.detail: false`) |
+
+Checks (CPU, simulated events; a soft edge moving 20 px per gap over a slowly varying background):
+- **Old configs** (v5 texture, v4-like): same losses, gradients and sampled events as `v5-texture`, bit for bit.
+- **Counts:** the sampler makes 31,935 ± 437 texture events (5 seeds) where the likelihood expects 33,023 (3% short: a pair's second event past the end of the gap is dropped).
+- **Likelihood vs sampler:** on events sampled with wiggle `A`, the likelihood over `A × (0.25, 0.5, 0.7, 1, 1.4, 2, 4)` is lowest at ×1.
+- **Polarity on a curve:** on an OFF curve, 92% of the events near it are OFF with the wiggle, 74% with v5's texture.
+- **Streaks:** 94% of the texture events have a same-polarity texture event one pixel further along the motion, one pixel of motion later (v5's texture: 34%).
+- **x-t / y-t loss:** its gradient reaches the wiggle size.
+- **Init from a v5-config checkpoint:** path rows kept, texture row dropped, wiggle row 0. Teacher, student, `generate.py`, `check.py` on toy data.
+
+Train: fine-tune from the v5 checkpoint (empty `train.out`). The optimizer and schedule start fresh, so use fewer steps and a lower lr than a run from scratch:
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.init=runs/teacher_v5/last.pt train.lr=1e-4 train.steps=60000 train.out=runs/teacher_v6
+```
+
+The wiggle starts at 0.01 everywhere (v5's texture output means something else), so the event count first drops toward v4's and comes back as the wiggle grows. The validation line adds `wiggle` (mean size) and `xt`.
+
+### `v6-detail` (detail image, separate branch)
 
 Built on `v5-texture` (below). What the v4 / v5 checks showed, per dataset (HQ-EVFI / BS-ERGB / EDS):
 - v4 makes 0.50× / 0.17× / 0.55× of GT's events. Most missing events are up-and-down pairs (HQ 98%), most likely small things passing that the frames don't show.
@@ -45,7 +77,7 @@ Checks (CPU, toy data and simulated events):
 
 Cost: the detail branch (UNet at full resolution, 32 / 64 / 128 channels); the x-t / y-t loss keeps two `2 × 64 × H × W` volumes per sample (recomputed in backward, a few GB at peak for batch 8 and 256² crops).
 
-Train each run from scratch (`train.out` empty), one change at a time:
+Train each run from scratch (`train.out` empty), one change at a time (on the `v6-detail` branch, whose config has `detail: true`, `xt: 0.1`):
 
 ```bash
 torchrun --nproc_per_node 4 train.py train.stage=teacher model.detail=false loss.xt=0 train.out=runs/teacher_v6_base
@@ -105,6 +137,7 @@ Tube width, no hand-set value:
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends), `ε` = measured frame noise × learned factor. Used by both the likelihood and the sampler (`model.tube`) |
 | Detail image | `s["D0"]`, `s["D1"]`: log brightness added to the keyframes (`model.detail`). Mean per frame from the decoder; random part `σ·n` at frame 0, moved to frame 1 by the path's flow. Teacher: `n` from `detail_code` (events); generation: `n ~ N(0, 1)`. `decode(p, z, n)`; `n = None` draws it |
+| Wiggle | `s["wiggle"] = A` per pixel (`model.wiggle`): wider threshold spread on curves (`model.wiggle_k`) and up-and-down pairs at `model.wiggle_rate`, drawn as specks moved by the flow; pairs don't reset the pixel |
 | Texture | v5, off by default: `s["texture"] = a` per pixel, random ON/OFF pairs at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel (`model.texture`) |
 | Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on` and refractory `R` are learned **per dataset** (each dataset is its own camera; with `model.measure_c` the thresholds are measured from frame change vs real event counts instead); the noise (`k` via `model.sigma_event`, `ν` via `model.nu`) is fixed in the config, because when learned it soaks up the path's errors and the sampler spreads them as noise; brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. With the tube: the taut path on a grid of at least 128 steps, exact crossing of its linear pieces; between gaps the pixel reference moves with the path's free start, so the jump fires nothing |
@@ -119,7 +152,7 @@ Tube width, no hand-set value:
 | `sigreg` | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to model later) |
 | `jepa` | Student code vs teacher code (`stopgrad` in the student stage, joint in the joint stage) |
 | `smooth` | Edge-aware smoothness of the path coefficients (not the detail image) |
-| `xt` | Expected vs real ON / OFF events on blurred x-t and y-t slices (generalized KL of counts) |
+| `xt` | Expected vs real ON / OFF events (crossings, texture, background) on blurred x-t and y-t slices (generalized KL of counts) |
 | `detail_kl` | Price of the detail image's random part: KL of the teacher's posterior to the prior `N(0, 1)`, nats per pixel |
 
 ---
@@ -249,6 +282,7 @@ python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out
 | `nll_no_detail` | Teacher code without the detail image's random part | Above `nll` once the teacher finds details |
 | `detail_kl` | Nats per pixel the teacher spends on the detail image | Grows from 0 where the events show small things |
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
+| `wiggle` | Mean wiggle size (log units) | Grows from 0.01 where the events show texture |
 
 The teacher's values use the detail's posterior mean; `nll_student` draws it from the prior, as generation does.
 
@@ -292,10 +326,11 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 | `model.tube` | Events from the least-event path in the frame-noise tube; the width is measured, not set. `false` = the old path (old configs build without it) |
 | `model.texture` | Random ON/OFF pairs for texture the frames don't show, at a learned per-pixel rate (likelihood + sampler) |
 | `model.measure_c` | Thresholds measured from frame change vs real ON/OFF counts per dataset (`c_init` until the first batch of a dataset) |
+| `model.wiggle` | Texture as a hidden brightness wiggle per pixel: spread on curves, pairs on moving surfaces drawn as specks moved by the flow |
 | `model.detail` | Detail image on the keyframes, moved by the flow (teacher reads it from the events, generation draws it) |
-| `loss.xt`, `loss.xt_blur` | Weight of the x-t / y-t loss (0.1; 0 = off) and its blur (2 px, 2 ms) |
+| `loss.xt`, `loss.xt_blur` | Weight of the x-t / y-t loss (1.0; 0 = off; texture events counted) and its blur (2 px, 2 ms) |
 | `loss.detail_kl` | Price of the detail image (1.0, the proper value; higher keeps it emptier) |
-| `loss.mix` | With texture: how far back, in events, the likelihood looks for a pixel's last real crossing (16; cost grows with it) |
+| `loss.mix` | With texture or wiggle: how far back, in events, the likelihood looks for a pixel's last real crossing (16; cost grows with it) |
 | `loss.smooth` | Edge-aware smoothness of the path coefficients, tube factor and log texture (0.05); not the detail image |
 | `model.K` | Polynomial order of the path in time |
 | `loss.grid` | τ steps for the likelihood clocks |
@@ -324,6 +359,7 @@ Known limits:
 - The tube adds a loop over the τ grid (forward and backward in time) per likelihood call.
 - Texture: a real crossing more than `loss.mix` events back is not found (the "no crossing since the start" case still is). Texture events have random times: they get the density right, not the exact streaks.
 - Measured thresholds assume the stationary start state, like the likelihood. A real pixel remembers its last direction (dead zone), which pushes the fit up on small changes (about 10% on the toy data for `0.5 ≤ |d| ≤ 2`).
+- Wiggle: the likelihood treats a pair's two events as independent (per polarity), the sampler draws them as pairs; the counts match. The specks are one per pixel cell (a pixel crossing a cell fires at most one pair there), and each gap draws a new speck field, so streaks don't continue across gaps.
 - Detail image: generation draws its random part as white noise per pixel moved by the flow; real texture has more structure. Each gap draws a new one (with the tube the jump at the gap start fires nothing, but the texture does not carry over). The teacher reads it from 16 time bins (2–3 ms each).
 - Notebooks and scripts that call `decode(p, z)` for a teacher get a random detail image; pass `n = model.detail_code(p, voxel, sample=False)[0]` (as `check.py` and the validation do).
 - The student is deterministic, so ambiguous gaps (same endpoints, different timing) get an average code. A stochastic student `p(z | video)` is the next step.

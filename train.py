@@ -81,7 +81,7 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
     if rank == 0 and grow:
-        print(f"init: decoder outputs {list(old)} -> {list(new)}, matched by name, new ones start at 0", flush=True)
+        print(f"init: decoder outputs {old} -> {new}, matched by name, new ones start at 0", flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
 params = [p for p in model.parameters() if p.requires_grad]

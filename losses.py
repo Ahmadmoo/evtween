@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import lejepa
-from model import taut
+from model import taut, wiggle_k, wiggle_rate
 
 SIGREG = lejepa.multivariate.SlicingUnivariateTest(univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=256)
 
@@ -44,6 +44,32 @@ def path_grid(model, s, steps=128):
     return taut(Lg, model.tube_eps(s)) if "tube" in s else Lg
 
 
+def wiggle_grid(model, s, Lg):
+    # texture events per unit tau and per polarity on each grid step (B, steps, H*W), from the wiggle size s["wiggle"]:
+    # model.wiggle_rate with the path's own slope and the speed of the surface point the pixel sees (|dF0/dtau|, px per gap).
+    # Slope and speed are taken as they are (no gradient): the wiggle size is learned, the path and the flow are not bent
+    # to make texture
+    B, steps = Lg.shape[0], Lg.shape[1] - 1
+    with torch.no_grad():
+        mid = (torch.arange(steps, device=Lg.device, dtype=Lg.dtype) + 0.5) / steps
+        speed = torch.stack([model.flows(s, t.expand(B).view(B, 1, 1, 1))[1].norm(dim=1).flatten(1) for t in mid], 1)
+        slope = (Lg[:, 1:] - Lg[:, :-1]).abs() * steps
+    C = model.sensor(s["ds"])[0].sum(1)
+    return wiggle_rate(s["wiggle"].flatten(1)[:, None], slope, speed, C[:, None, None])
+
+
+def other_grid(model, s, Lg):
+    # texture events (no reset) the path is expected to make on each grid step, ON and OFF: (B, 2, steps, H*W), or None
+    steps = Lg.shape[1] - 1
+    if "texture" in s:  # v5: a |dL| / (2 C_pol)
+        C = model.sensor(s["ds"])[0]
+        dL = (Lg[:, 1:] - Lg[:, :-1]).abs() * s["texture"].flatten(1)[:, None]
+        return torch.stack([dL / (2 * C[:, :1, None]), dL / (2 * C[:, 1:, None])], 1)
+    if "wiggle" in s:  # pairs: as many ON as OFF
+        return (wiggle_grid(model, s, Lg) / steps)[:, None].expand(-1, 2, -1, -1)
+    return None
+
+
 def _blur(v, ax, sig):
     # Gaussian blur of v (B, C, T, H, W) along axis ax (2: t, 3: y, 4: x), one sigma per sample (B,), zeros outside
     B, C = v.shape[:2]
@@ -59,7 +85,7 @@ def _blur(v, ax, sig):
 
 
 def xt_loss(model, s, ev, dt, Lg, blur=(2.0, 2.0)):
-    # x-t / y-t loss: the ON / OFF events the path is expected to make (rise / C_on, fall / C_off, plus background) against
+    # x-t / y-t loss: the ON / OFF events the path is expected to make (rise / C_on, fall / C_off, texture, background) against
     # the real events, both cut into x-t slices (one per row, blurred in x and t) and y-t slices (one per column, blurred
     # in y and t), compared slice by slice with the generalized KL of counts (0 when equal). The blur (px, ms) compares the
     # curves, not single events: which pixel fires when inside a curve is the sensor's randomness
@@ -72,6 +98,9 @@ def xt_loss(model, s, ev, dt, Lg, blur=(2.0, 2.0)):
     def run(Lg):
         dL = (Lg[:, 1:] - Lg[:, :-1]).view(B, T, steps // T, H * W)
         m = torch.stack([F.relu(dL).sum(2) / C[:, :1, None], F.relu(-dL).sum(2) / C[:, 1:, None]], 1)
+        oth = other_grid(model, s, Lg)  # texture events count too: a 50/50 texture inside a one-polarity curve costs
+        if oth is not None:
+            m = m + oth.reshape(B, 2, T, steps // T, H * W).sum(3)
         m = (m + (nu * dt / (2 * T))[:, None, None, None]).view(B, 2, T, H, W)
         key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
         g = torch.zeros(B * 2 * T * H * W, device=m.device, dtype=m.dtype).index_add_(0, key, torch.ones_like(tau, dtype=m.dtype)).view_as(m)
@@ -105,6 +134,9 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     # over each pixel's events sums over it (the last crossing is among the `mix` events before, or there was none since the
     # gap started). Every pixel pays for
     # the texture events it expects, a * total variation of its path * (1/C_on + 1/C_off) / 2
+    # With s["wiggle"] (A per pixel) the texture is a hidden brightness wiggle instead: on a curve it only moves the curve's
+    # events in time (wider threshold spread per pixel, model.wiggle_k, same polarity as the curve); where the path is flat
+    # and the surface moves it makes up-and-down pairs at model.wiggle_rate per polarity (summed over like v5's texture)
     # Lg: the path on the grid from path_grid (computed here if not given)
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
@@ -113,7 +145,10 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     Lg = path_grid(model, s, steps) if Lg is None else Lg
     C, K, nu, R = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
     nu = nu * dt
-    c, k = C[b], K[b, None]  # per event
+    Kp = K[:, None].expand(B, H * W)  # threshold spread per pixel
+    if "wiggle" in s:
+        Kp = wiggle_k(K[:, None], s["wiggle"].flatten(1), C.sum(1, keepdim=True))
+    c, k = C[b], Kp[b, pix][:, None]  # per event
 
     key = b * H * W + pix
     first = torch.ones_like(key, dtype=torch.bool)
@@ -129,12 +164,17 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     own = (pol < 0).long()[:, None]
     L0 = Lg[:, 0]  # pixels without events: no crossing over the whole path (the same for every warp)
     whole = (torch.stack([Lg.amax(1) - L0, L0 - Lg.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
-    still = ig_logs(whole, K.repeat_interleave(H * W)[:, None])[2].sum(1)
-    tex, cost = s.get("texture"), 0
+    still = ig_logs(whole, Kp.reshape(-1)[:, None])[2].sum(1)
+    tex, cost, Rw = s.get("texture"), 0, None
     if tex is not None:
         tex = tex.flatten(1)
         cost = (tex * (Lg[:, 1:] - Lg[:, :-1]).abs().sum(1) * (1 / C).sum(1, keepdim=True) / 2).sum()
         tex = tex[b, pix] / (2 * c.gather(1, own)[:, 0])  # per event: texture rate per unit |dL/dtau|, its own polarity
+    elif "wiggle" in s:
+        Rw = wiggle_grid(model, s, Lg)  # texture events per unit tau and polarity on each grid step
+        cost = 2 * Rw.sum() / steps  # every pixel pays for the pairs it expects
+    other = tex is not None or Rw is not None
+    if other:
         # candidates for the last crossing before each event: the q-th event before it (q <= rank), or none since the gap
         # started (always allowed, so every event sequence has an explanation)
         gs = torch.arange(len(tau), device=tau.device)
@@ -198,13 +238,17 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
 
         end = phi((tau + Rt).clamp(max=1))
         tail = ig_logs(reach(end, torch.full_like(end, 1 + 0.5 / steps), at(end)), k)[1].sum(1)  # to the end of the path
-        if tex is None:  # every event resets the pixel: crossing or background
+        if not other:  # every event resets the pixel: crossing or background
             signal, log_s = crossing(wake, awake, first)
             log_ev = torch.logaddexp(signal, (nu[b] / 2).log()) + log_s
             ll = torch.zeros(B * H * W, device=tau.device).index_add(0, key, log_ev).index_add(0, key[last], tail[last])
             return torch.where(seen, ll, still)
 
-        log_o = (nu[b] / 2 + tex * Di.abs()).log()  # background + texture events of this polarity (no reset)
+        if Rw is None:
+            log_o = (nu[b] / 2 + tex * Di.abs()).log()  # background + texture events of this polarity (no reset)
+        else:
+            j = (t * steps).floor().clamp(0, steps - 1).long()
+            log_o = (nu[b] / 2 + Rw[b, j, pix] * dphi(tau).abs()).log()  # (abs: as v5's |Di|, for coarse grids)
         O = log_o.double().cumsum(0)  # sums of "other" events between two of a pixel's events: differences of this (float64)
         Ob = O - log_o
         signal, log_s = crossing(torch.zeros_like(tau), torch.ones_like(tau), torch.ones_like(first))
@@ -299,7 +343,7 @@ def smooth_loss(s, img):
     # edge-aware first-order smoothness of the path coefficients (and of the tube factor and log texture when present):
     # neighbouring pixels get the same path over the whole gap, so an edge reaches them at consistent times
     x = torch.cat([s["a"].flatten(1, 2), s["b"].flatten(1, 2), s["d"]] + ([s["tube"]] if "tube" in s else [])
-                  + ([s["texture"].log()] if "texture" in s else []), 1)
+                  + ([s["texture"].log()] if "texture" in s else []) + ([s["wiggle"].log()] if "wiggle" in s else []), 1)
     dx = lambda t: t[..., :, 1:] - t[..., :, :-1]
     dy = lambda t: t[..., 1:, :] - t[..., :-1, :]
     wx = torch.exp(-10 * dx(img).abs().mean(1, keepdim=True))
@@ -357,9 +401,11 @@ def diagnostics(model, batch, w, student=True):
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
     if model.detail:
         out.update(nll_no_detail=nll(z, torch.zeros_like(n)), detail_kl=kl.item())
+    s = model.decode(p, z, n)
     if w.get("xt", 0) > 0:
-        s = model.decode(p, z, n)
         out["xt"] = xt_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("xt_blur", (2.0, 2.0))).item()
+    if "wiggle" in s:
+        out["wiggle"] = s["wiggle"].mean().item()  # mean wiggle size (log units)
     if student:
         out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]), None)
         out["gap"] = out["nll_student"] - out["nll"]
