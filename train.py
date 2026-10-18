@@ -136,11 +136,19 @@ def validate(val):
     return {k: v / max(n, 1) for k, v in sums.items()}
 
 
+def hms(sec):
+    sec = int(sec)
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
 os.makedirs(T["out"], exist_ok=True)
 model.train()
-tic = time.time()
+world = dist.get_world_size() if ddp else 1
+tic = t_log = t_mark = time.time()
+n_log, t_data, start, t_save = 0, 0.0, step, 0.0  # since the last log line: steps, time waiting for data; last save + val
 while step < T["steps"]:
     for batch in loader:  # endless
+        t_data += time.time() - t_mark
         batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
@@ -149,7 +157,7 @@ while step < T["steps"]:
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(params, T["clip"])
         opt.step()
-        step += 1
+        step, n_log = step + 1, n_log + 1
 
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
@@ -157,13 +165,25 @@ while step < T["steps"]:
             C, K, nu, R = (v[0] for v in model.sensor(batch["ds"][:1]))
             print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {C[0].item():.3f} r {(C[1] / C[0]).item():.3f} "
                   f"k {K.item():.2f} nu {nu.item():.2f} R {R.item() * 1e6:.0f}us "
-                  f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} {time.time() - tic:.0f}s", flush=True)
+                  f"gn {gnorm.item():.2f} lr {lr_at(step):.1e}", flush=True)
+            now = time.time()
+            sec = (now - t_log) / n_log  # per step, validation and saving left out
+            print(f"  time {sec:.2f}s/step, {sec / (T['batch'] * world) * 1e3:.0f}ms/sample ({T['batch']} x {world} GPUs), "
+                  f"data wait {100 * t_data / (now - t_log):.0f}%, elapsed {hms(now - tic)}, "
+                  f"ETA {hms((T['steps'] - step) * sec + (T['steps'] - step) // T['save_every'] * t_save)} "
+                  f"({step - start} steps this run)", flush=True)
+            t_log, n_log, t_data = now, 0, 0.0
         if rank == 0 and (step % T["save_every"] == 0 or step == T["steps"]):
+            t_val = time.time()
             torch.save(dict(model=model.state(), opt=opt.state_dict(), step=step, cfg=cfg), ckpt)
             for name, val in vals.items():
                 print(f"val {name} " + " ".join(f"{k} {v:.4f}" for k, v in validate(val).items()), flush=True)
+            t_save = time.time() - t_val
+            print(f"  save + validation {t_save:.0f}s", flush=True)
+            t_log, n_log, t_data = time.time(), 0, 0.0
         if step >= T["steps"]:
             break
+        t_mark = time.time()
 
 if ddp:
     dist.destroy_process_group()

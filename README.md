@@ -286,6 +286,8 @@ python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out
 
 The teacher's values use the detail's posterior mean; `nll_student` draws it from the prior, as generation does.
 
+Every log line is followed by a time line: seconds per step and milliseconds per sample (batch × GPUs), the share of time spent waiting for data (high: raise `data.workers`), time since the start, and the ETA to `train.steps` (validation and saving included, from the last one). After each save: how long saving and validation took.
+
 The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT and backbone weights.
 
 ### Smoke test (CPU, a few minutes)
