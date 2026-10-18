@@ -12,6 +12,8 @@ C_RANGE = (0.5, 2.0)  # |L1 - L0| of the pixels that measure the thresholds: abo
 TEX0 = 0.01  # texture at z = 0 (extra up-and-down change per unit of path change)
 DETAIL0 = 0.01  # spread of the random detail image at z = 0 (log units)
 WIGGLE0 = 0.01  # texture wiggle size at z = 0 (log units)
+PAINT_NOISE = 4  # noise channels the texture painter draws from
+PAINT_GRAIN = 2.0  # the painter starts from Gaussian noise blurred over this many px (v6's hand-made texture)
 
 
 def wiggle_rate(A, slope, speed, C):
@@ -26,6 +28,17 @@ def wiggle_k(K, A, C):
     # inverse-Gaussian shape of the thresholds with the wiggle: its level noise A between two events (variance 2 A^2)
     # adds to the threshold spread (C / sqrt(K) at the mean threshold C / 2 = (C_on + C_off) / 2)
     return 1 / (1 / K + 8 * A ** 2 / C ** 2)
+
+
+def gauss_blur(x, sig):
+    # separable Gaussian blur over the last two axes, per channel, zeros outside
+    r, C = math.ceil(3 * sig), x.shape[1]
+    if r == 0:
+        return x
+    k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) / sig) ** 2)
+    k = (k / k.sum()).repeat(C, 1)
+    x = F.conv2d(x, k.view(C, 1, 1, -1), padding=(0, r), groups=C)
+    return F.conv2d(x, k.view(C, 1, -1, 1), padding=(r, 0), groups=C)
 
 
 def luminance(img, gamma=2.2):
@@ -310,11 +323,32 @@ class Decoder(nn.Module):
         return self.head(self.feat(x) * g)
 
 
+class Painter(nn.Module):
+    # learned texture for the wiggle: noise + frame features (zero outside the image, plus an inside mask) -> one brightness
+    # channel on the frame-0 plane, added to Gaussian noise blurred over PAINT_GRAIN px times a learned scale (the
+    # hand-made texture it starts from: the last layer starts at 0, the scale at 1). Dilated convolutions reach 15 px.
+    # It needs no events: teacher and student draw
+    # texture the same way. Trained by losses.stats_loss (how real texture looks in x-t / y-t)
+    def __init__(self, cin, width=32):
+        super().__init__()
+        layers, c = [], cin + PAINT_NOISE
+        for d in (1, 2, 4, 8):
+            layers += [nn.Conv2d(c, width, 3, padding=d, dilation=d), nn.GELU()]
+            c = width
+        self.net = nn.Sequential(*layers, nn.Conv2d(width, 1, 1))
+        self.base = nn.Parameter(torch.ones(()))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False, wiggle=False):
+                 measure_c=False, detail=False, wiggle=False, painter=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -328,6 +362,8 @@ class EvTween(nn.Module):
         # full-resolution teacher branch that reads the random part from the events
         self.detail = detail
         self.wiggle = wiggle  # one more output: size of the hidden brightness wiggle (texture as brightness, not as events)
+        assert wiggle or not painter, "model.painter draws the wiggle's texture: it needs model.wiggle"
+        self.painter = Painter(13) if painter else None  # learned look of the wiggle's texture (else blurred noise)
         self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture) + 3 * int(detail) + int(wiggle),
                                width, depth)
         if detail:
@@ -542,7 +578,38 @@ class EvTween(nn.Module):
             s["y0"], s["y1"] = s["y0"] * s["D0"].exp(), s["y1"] * s["D1"].exp()
         if self.wiggle:  # size of the hidden brightness wiggle (log units), 0.01 at z = 0, up to 1.5
             s["wiggle"] = WIGGLE0 * bound(w, 5.0).exp()
+        if self.painter is not None:
+            s["feat"] = crop(p["x"])  # frame features for the texture painter
         return s
+
+    def paint(self, s, seen, randn, grain=PAINT_GRAIN):
+        # the wiggle's texture for this gap on the frame-0 plane, wide enough for every point the pixels see (seen: (B, 2,
+        # H, W) per tau step, frame-0 px): the painter, or without it Gaussian noise blurred over `grain` px. Scaled so one
+        # pixel of motion along the flow changes it by 1 on average over ~16 px around, so its events match the likelihood's
+        # count (model.wiggle_rate) everywhere and the painter only sets the look. randn(shape) draws the noise.
+        # Returns: points (B, 2, H, W) -> texture (B, 1, H, W)
+        B, (H, W) = seen[0].shape[0], seen[0].shape[-2:]
+        M = max(H, W)  # no texture further than M px outside the image
+        lo = torch.stack([q.amin((0, 2, 3)) for q in seen]).amin(0).floor().clamp(min=-M) - 1
+        hi = torch.stack([q.amax((0, 2, 3)) for q in seen]).amax(0).ceil().clamp(max=2 * M) + 1
+        nx, ny = (int(v) + 1 for v in hi - lo)
+        r = math.ceil(3 * grain) + 16  # margin for the blur and the painter's reach, cut off at the end
+        x0, y0 = r - int(lo[0]), r - int(lo[1])  # where image pixel (0, 0) sits on the padded canvas
+        pad = (x0, nx + 2 * r - x0 - W, y0, ny + 2 * r - y0 - H)
+        if self.painter is None:
+            T = gauss_blur(randn((B, 1, ny + 2 * r, nx + 2 * r)), grain)
+        else:
+            z = randn((B, PAINT_NOISE, ny + 2 * r, nx + 2 * r))
+            feat = F.pad(torch.cat([s["feat"], torch.ones_like(s["feat"][:, :1])], 1), pad)
+            T = self.painter.base * gauss_blur(z[:, :1], PAINT_GRAIN) + self.painter(torch.cat([feat, z], 1))
+        u = F.pad(s["f01"], pad, mode="replicate")  # direction of motion (frame 0 -> 1), extended past the image
+        n = u.norm(dim=1, keepdim=True)
+        u = u / n.clamp(min=1e-6)
+        dx, dy = F.pad(T[..., 1:] - T[..., :-1], (0, 1)), F.pad(T[..., 1:, :] - T[..., :-1, :], (0, 0, 0, 1))
+        slope = torch.where(n > 0.5, (u[:, :1] * dx + u[:, 1:] * dy).abs(), (dx.abs() + dy.abs()) / 2)
+        T = (T * gauss_blur(torch.ones_like(T), 8.0) / (gauss_blur(slope, 8.0) + 1e-6))[..., r:-r, r:-r]
+        size = torch.tensor([nx - 1, ny - 1], device=T.device, dtype=T.dtype).view(1, 2, 1, 1)
+        return lambda q: F.grid_sample(T, ((q - lo.view(1, 2, 1, 1)) / size * 2 - 1).permute(0, 2, 3, 1), align_corners=True)
 
     def flows(self, s, tau):
         # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:
@@ -592,5 +659,5 @@ def build_model(cfg):
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
     return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, "wiggle": False,
-                      **cfg["model"]},
+                      "painter": False, **cfg["model"]},
                    bins=cfg["data"]["bins"], gammas=gammas)

@@ -15,9 +15,9 @@ from model import build_model, head_rows
 
 # which parameters each stage trains (pretrained RAFT / video backbone always stay frozen)
 TRAIN = {"probe": ("student.", "to_counts."),
-         "teacher": ("teacher.", "detail_enc.", "decoder.", "log_", "w_rgb"),
+         "teacher": ("teacher.", "detail_enc.", "painter.", "decoder.", "log_", "w_rgb"),
          "student": ("student.", "to_z."),
-         "joint": ("teacher.", "detail_enc.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
+         "joint": ("teacher.", "detail_enc.", "painter.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
 
 
 def load_cfg(argv):
@@ -85,10 +85,14 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
         print(f"init: decoder outputs {old} -> {new}, matched by name, new ones start at 0", flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
-params = [p for p in model.parameters() if p.requires_grad]
-opt = torch.optim.AdamW([{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
-                         {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}],
-                        lr=T["lr"], betas=(0.9, 0.99))
+params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("painter.")]
+paint = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("painter.")]
+groups = [{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
+          {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}]
+if paint:  # the texture painter starts from scratch even in a fine-tune: its own, larger learning rate (x train.painter_lr)
+    groups.append({"params": paint, "weight_decay": 0.0, "scale": float(T.get("painter_lr", 10.0))})
+params = params + paint
+opt = torch.optim.AdamW(groups, lr=T["lr"], betas=(0.9, 0.99))
 ckpt, step = os.path.join(T["out"], "last.pt"), 0
 if os.path.exists(ckpt):
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
@@ -144,7 +148,7 @@ while step < T["steps"]:
     for batch in loader:  # endless
         batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
         for g in opt.param_groups:
-            g["lr"] = lr_at(step)
+            g["lr"] = lr_at(step) * g.get("scale", 1.0)
         loss, terms = net(batch)
         opt.zero_grad(set_to_none=True)
         loss.backward()

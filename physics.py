@@ -1,7 +1,6 @@
 import math
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from model import taut, wiggle_k
 
@@ -54,16 +53,18 @@ class Simulator:
     # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it.
     # With s["wiggle"] (texture as a hidden brightness wiggle of size A, as in losses.event_nll): each pixel's thresholds
     # get the wider spread model.wiggle_k (a curve's events move in time, same polarity), and the up-and-down events come
-    # from a texture: smooth random brightness on the frame-0 image (white noise blurred over `grain` px, a new one every
-    # gap), scaled per pixel so that one pixel of motion changes it by A on average, and moved by the path's own flow (each
-    # pixel sees the point p + F0(tau)). A pixel fires each time the texture it sees crosses a level of a ladder with
+    # from a texture on the frame-0 image (model.paint: the learned painter, or white noise blurred over `grain` px; a new
+    # one every gap), scaled per pixel so that one pixel of motion changes it by A on average, and moved by the path's own
+    # flow (each pixel sees the point p + F0(tau)). A pixel fires each time the texture it sees crosses a level of a ladder with
     # rungs (C_on + C_off) / 2 apart, at its own random height: ON going up, OFF going down, kept with probability
     # exp(-|dL/dtau| / (A speed)) (none on steep curves). The expected count is the likelihood's (model.wiggle_rate per
     # polarity); a bright blob gives ON on its front and OFF on its back, and nearby pixels see the same blob, so texture
-    # events form soft curved patches along the motion. They are texture events: they leave the pixel's state alone
-    def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64, grain=2.0):
+    # events form patches along the motion. They are texture events: they leave the pixel's state alone.
+    # texture_events=False leaves out all texture events (v5's and the wiggle's): the path's own events only
+    def __init__(self, model, profile=None, min_steps=4, max_steps=256, seed=0, max_events=64, grain=2.0, texture_events=True):
         self.m, self.p = model, profile or resolve(model)
         self.min_steps, self.max_steps, self.max_events, self.grain = min_steps, max_steps, max_events, grain
+        self.texture_events = texture_events
         self.gen = torch.Generator().manual_seed(seed)
         self.ref = self.last = None
 
@@ -100,7 +101,7 @@ class Simulator:
 
         speed = max(m.render(s, tau(v))[1].abs().flatten().quantile(0.999).item() for v in (0.0, 0.5, 1.0))
         S = int(min(max(math.ceil(2 * speed / self.c.min().item()), self.min_steps), self.max_steps))
-        g, A = None, s.get("wiggle")
+        g, A = None, s.get("wiggle") if self.texture_events else None
         if "tube" in s or A is not None:
             S = max(S, TUBE_STEPS)
             L = torch.stack([m.render(s, tau(i / S))[0] for i in range(S + 1)], 1)
@@ -113,9 +114,10 @@ class Simulator:
             gy, gx = torch.meshgrid(torch.arange(Hh, device=self.dev, dtype=torch.float32),
                                     torch.arange(Ww, device=self.dev, dtype=torch.float32), indexing="ij")
             seen = [torch.stack([gx, gy])[None] + m.flows(s, tau(i / S).view(1, 1, 1, 1))[0] for i in range(S + 1)]
-            tex_at, phase = self._texture(seen), self._u(A.shape).float()
+            tex_at = m.paint(s, seen, lambda shape: torch.randn(shape, generator=self.gen).to(self.dev), self.grain)
+            phase = self._u(A.shape).float()
             level = [A * tex_at(q) / ((p["pos_thres"] + p["neg_thres"]) / 2) + phase for q in seen]  # in rungs
-        H, out, a = 1.0 / S, [], s.get("texture")
+        H, out, a = 1.0 / S, [], s.get("texture") if self.texture_events else None
         for i in range(S):
             if g is not None:  # linear between grid points
                 La, Lb = g[:, i], g[:, i + 1]
@@ -139,20 +141,6 @@ class Simulator:
         # run a gap and drop its events (e.g. the gap before the one of interest): the pixels then start in a real state
         # (reference, thresholds, blind time) instead of the stationary guess, so the first events of the gap are no burst
         self.run(s, t0, t1)
-
-    def _texture(self, seen):
-        # the texture of this gap on the frame-0 plane, wide enough for every point the pixels see (seen: (B, 2, H, W) per
-        # step): white noise blurred over `grain` px, scaled to a mean slope of 1 per px; returns points -> texture (B, 1, H, W)
-        r, M = math.ceil(3 * self.grain), max(seen[0].shape[-2:])  # (no texture further than M px outside the image)
-        lo = torch.stack([q.amin((0, 2, 3)) for q in seen]).amin(0).floor().clamp(min=-M) - 1
-        hi = torch.stack([q.amax((0, 2, 3)) for q in seen]).amax(0).ceil().clamp(max=2 * M) + 1
-        n = (hi - lo).long() + 1  # x, y size
-        w = torch.randn((seen[0].shape[0], 1, int(n[1]) + 2 * r, int(n[0]) + 2 * r), generator=self.gen).to(self.dev)
-        k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=self.dev) / max(self.grain, 1e-6)) ** 2)
-        w = F.conv2d(F.conv2d(w, (k / k.sum()).view(1, 1, 1, -1)), (k / k.sum()).view(1, 1, -1, 1))
-        w = w / torch.cat([(w[..., 1:] - w[..., :-1]).flatten(1), (w[..., 1:, :] - w[..., :-1, :]).flatten(1)], 1).abs().mean(1).view(-1, 1, 1, 1)
-        size = (n - 1).float().view(1, 2, 1, 1)
-        return lambda q: F.grid_sample(w, ((q - lo.view(1, 2, 1, 1)) / size * 2 - 1).permute(0, 2, 3, 1), align_corners=True)
 
     def _rungs(self, ua, ub, keep, H, ta, dt, out):
         # texture events in this step: the texture level a pixel sees (in rungs, with its random height) goes from ua to ub,

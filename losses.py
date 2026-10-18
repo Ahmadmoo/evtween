@@ -116,6 +116,119 @@ def xt_loss(model, s, ev, dt, Lg, blur=(2.0, 2.0)):
     return checkpoint(run, Lg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg)
 
 
+def _counts(ev, B, T, H, W, dtype):
+    # real events binned into (B, 2 (ON, OFF), T, H, W)
+    b, pix, tau, pol = ev
+    key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
+    return torch.zeros(B * 2 * T * H * W, device=tau.device, dtype=dtype).index_add_(0, key, torch.ones_like(tau, dtype=dtype)).view(B, 2, T, H, W)
+
+
+def painted_grid(model, s, Lg, T):
+    # wiggle texture events (ON, OFF) on each of T time steps, (B, 2, T, H*W), from one texture drawn by model.paint, as
+    # the sampler makes them: the level A * texture each pixel sees, in rungs of (C_on + C_off) / 2 from a random height,
+    # every rung crossed an event (ON up, OFF down), kept with probability exp(-|dL/dtau| / (A speed)). The counts are a
+    # draw; the gradient is the expected count's (straight-through). Path and flow carry no gradient; the painter and A do
+    B, steps = Lg.shape[0], Lg.shape[1] - 1
+    H, W = s["y0"].shape[-2:]
+    A = s["wiggle"]
+    with torch.no_grad():
+        gy, gx = torch.meshgrid(torch.arange(H, device=A.device, dtype=A.dtype), torch.arange(W, device=A.device, dtype=A.dtype),
+                                indexing="ij")
+        taus = torch.linspace(0, 1, T + 1, device=A.device)
+        seen = [torch.stack([gx, gy])[None] + model.flows(s, t.expand(B).view(B, 1, 1, 1))[0] for t in taus]
+        speed = torch.stack([(seen[i + 1] - seen[i]).norm(dim=1).flatten(1) * T for i in range(T)], 1)  # px per gap
+        Lt = Lg[:, torch.linspace(0, steps, T + 1, device=A.device).round().long()]
+        slope = (Lt[:, 1:] - Lt[:, :-1]).abs() * T
+    tex = model.paint(s, seen, lambda shape: torch.randn(shape, device=A.device))
+    rung = model.sensor(s["ds"])[0].sum(1).view(B, 1, 1) / 2
+    u = torch.stack([(A * tex(q)).flatten(1) for q in seen], 1) / rung + torch.rand(B, 1, H * W, device=A.device)
+    keep = torch.exp(-slope / (A.flatten(1)[:, None] * speed + 1e-6))
+    d = u[:, 1:] - u[:, :-1]
+    mean = torch.stack([F.relu(d), F.relu(-d)], 1) * keep[:, None]
+    with torch.no_grad():
+        n = u.floor()
+        n = torch.stack([F.relu(n[:, 1:] - n[:, :-1]), F.relu(n[:, :-1] - n[:, 1:])], 1)
+        draw = torch.distributions.Binomial(n, keep[:, None].expand_as(n).clamp(0, 1)).sample()
+    return draw + mean - mean.detach()
+
+
+def path_events(Lg, C, T):
+    # the path's own ON / OFF events in each of T time steps, (B, 2, T, H*W), drawn with fixed thresholds C_on / C_off from
+    # a random start (no threshold noise, no blind time): regular like a real pixel, not a Poisson count. No gradient
+    B, steps = Lg.shape[0], Lg.shape[1] - 1
+    con, coff = C[:, :1], C[:, 1:]
+    ref = Lg[:, 0] - torch.rand_like(Lg[:, 0]) * (con + coff) + coff
+    out = []
+    for i in range(1, steps + 1):
+        n_on = ((Lg[:, i] - ref) / con).floor().clamp(min=0)
+        ref = ref + n_on * con
+        n_off = ((ref - Lg[:, i]) / coff).floor().clamp(min=0)
+        ref = ref - n_off * coff
+        out.append(torch.stack([n_on, n_off], 1))
+    return torch.stack(out, 2).view(B, 2, T, steps // T, -1).sum(3)
+
+
+_FILTERS = {}
+
+
+def _filters(device, n=64):
+    # fixed random 3D filters over (ON, OFF) x (t, y, x) 5 x 5 x 5, zero mean, unit norm, the same in every run: their rectified
+    # responses, averaged over a block, describe which small x-y-t patterns occur and how often (an OFF line with an ON line
+    # one pixel behind it, a slanted streak, a lone dot), beyond what a spectrum can tell
+    if device not in _FILTERS:
+        w = torch.randn(n, 2, 5, 5, 5, generator=torch.Generator().manual_seed(0))
+        w = w - w.mean((1, 2, 3, 4), keepdim=True)
+        _FILTERS[device] = (w / w.flatten(1).norm(dim=1).view(-1, 1, 1, 1, 1)).to(device)
+    return _FILTERS[device]
+
+
+def stats_loss(model, s, ev, dt, Lg, block=(16, 32), power=2, blocks=8, kind="features"):
+    # x-t / y-t pattern loss: the model's events (its path's, plus those of one texture drawn by the painter) against the
+    # real events, compared by statistics of small x-y-t blocks (block: time bins of the gap's 64, px) at the same place,
+    # not pixel by pixel. A block holds every x-t and y-t slice through it. kind "features": the mean rectified response
+    # of fixed random 3D filters at two scales (which small patterns occur, and how often); "spectrum": band powers of
+    # ON + OFF and ON - OFF (line width, slope, spacing). Compared as the squared difference of log. Both sides are draws
+    # of events (the real sensor is far more regular than a Poisson count, so an expected count would not compare); the
+    # gradient comes through the texture's expected count (straight-through). `blocks` random blocks per sample (features).
+    # Trains the painter and the wiggle size, not the path
+    B, steps = Lg.shape[0], Lg.shape[1] - 1
+    H, W = s["y0"].shape[-2:]
+    T = XT_BINS if steps % XT_BINS == 0 else steps
+    bt, bp = block
+    with torch.no_grad():
+        path = path_events(Lg.detach(), model.sensor(s["ds"])[0], T)
+    m = (path + painted_grid(model, s, Lg.detach(), T)).view(B, 2, T, H, W)
+    g = _counts(ev, B, T, H, W, m.dtype)
+    nt, ny, nx = T // bt, H // bp, W // bp
+    if kind == "features":
+        w, h = _filters(m.device), 4  # halo: the filters' reach at the larger scale
+        pick = torch.randint(nt * ny * nx, (B, blocks), device=m.device)
+        it, iy, ix = pick // (ny * nx), pick // nx % ny, pick % nx
+        ar = lambda n: torch.arange(-h, n + h, device=m.device)
+        ti = (it[..., None] * bt + ar(bt)).clamp(0, T - 1)
+        yi = (iy[..., None] * bp + ar(bp)).clamp(0, H - 1)
+        xi = (ix[..., None] * bp + ar(bp)).clamp(0, W - 1)
+        bi = torch.arange(B, device=m.device).view(B, 1, 1, 1, 1)
+
+        def feats(v):  # random blocks with a halo -> mean rectified responses (B * blocks, 2 x 64)
+            c = v.permute(0, 2, 3, 4, 1)[bi, ti[..., :, None, None], yi[..., None, :, None], xi[..., None, None, :]]
+            c = c.flatten(0, 1).permute(0, 4, 1, 2, 3)
+            f = [F.relu(F.conv3d(c, w, dilation=d, padding=2 * d))[..., h:-h, h:-h, h:-h].mean((2, 3, 4)) for d in (1, 2)]
+            return torch.cat(f + [c[..., h:-h, h:-h, h:-h].mean((2, 3, 4))], 1)
+
+        return ((feats(m) + 0.01).log() - (feats(g) + 0.01).log()).abs().pow(power).mean()
+    win = torch.hann_window(bt + 2, periodic=False, device=m.device)[1:-1].view(-1, 1, 1) * \
+          torch.outer(*[torch.hann_window(bp + 2, periodic=False, device=m.device)[1:-1]] * 2)
+
+    def bands(v):  # (B, 2, T, H, W) -> band powers of ON + OFF and ON - OFF per block
+        v = v[:, :, :nt * bt, :ny * bp, :nx * bp].reshape(B, 2, nt, bt, ny, bp, nx, bp).permute(0, 2, 4, 6, 1, 3, 5, 7)
+        x = torch.stack([v[..., 0, :, :, :] + v[..., 1, :, :, :], v[..., 0, :, :, :] - v[..., 1, :, :, :]], -4) * win
+        P = torch.fft.fftshift(torch.fft.rfftn(x, dim=(-3, -2, -1)).abs() ** 2, dim=(-3, -2))
+        return F.adaptive_avg_pool3d(P.flatten(0, 4), (bt // 2, bp // 4, bp // 8)).view(*x.shape[:5], -1)
+
+    return ((bands(m) + 1).log() - (bands(g) + 1).log()).abs().pow(power).mean()
+
+
 def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
@@ -377,6 +490,8 @@ def compute(model, batch, w, stage):
                      sigreg=sigreg_loss(z))
         if w.get("xt", 0) > 0:
             terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, w.get("xt_blur", (2.0, 2.0)))
+        if w.get("stats", 0) > 0 and model.painter is not None:
+            terms["stats"] = stats_loss(model, s, ev, batch["dt"], Lg, w.get("stats_block", (16, 32)), kind=w.get("stats_kind", "features"))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
@@ -404,6 +519,9 @@ def diagnostics(model, batch, w, student=True):
     s = model.decode(p, z, n)
     if w.get("xt", 0) > 0:
         out["xt"] = xt_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("xt_blur", (2.0, 2.0))).item()
+    if w.get("stats", 0) > 0 and model.painter is not None:
+        out["stats"] = stats_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("stats_block", (16, 32)),
+                                  kind=w.get("stats_kind", "features")).item()
     if "wiggle" in s:
         out["wiggle"] = s["wiggle"].mean().item()  # mean wiggle size (log units)
     if student:
