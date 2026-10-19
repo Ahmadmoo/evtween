@@ -348,7 +348,7 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False, wiggle=False, painter=False):
+                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -381,6 +381,9 @@ class EvTween(nn.Module):
         self.log_nu = full(0.2)                                       # background events per pixel per second
         self.log_R = full(5e-5)                                       # refractory time (s); grows from below to the real floor
         self.R_max = 2e-3                                             # soft cap: with few events per pixel R is weakly pinned
+        assert texture or not texture_pol, "model.texture_pol sets the polarity of model.texture's events: it needs model.texture"
+        if texture_pol:  # texture follows the slope's polarity: share q of its events (logit, per dataset; 0 = 0.5, v5's coin flip)
+            self.log_q_odds = nn.Parameter(torch.zeros(n))
         # sensor noise set in the config instead of learned (None = learned): learned, it soaks up the path's errors and the
         # sampler then spreads them as noise. sigma_event: threshold spread per event (fraction of c), nu: events / px / s
         self.k_fixed, self.nu_fixed, self.sig_max = None if sigma_event is None else sigma_event ** -2, nu, sig_max
@@ -564,6 +567,8 @@ class EvTween(nn.Module):
             s["tube"] = torch.where(g < 0, 3 * torch.tanh(g / 3), torch.tanh(g))
         if self.texture:  # extra up-and-down change per unit of path change (texture the frames do not show), 0.01 at z = 0
             s["texture"] = TEX0 * bound(q, 8.0).exp()
+            if hasattr(self, "log_q_odds"):  # share of texture events with the polarity of the path's slope (per sample)
+                s["tex_q"] = torch.sigmoid(self.log_q_odds[p["ds"]])
         if self.detail:
             # detail image (log brightness) on both keyframes: a mean per frame (e.g. sharper edges, +-2) and a random part
             # sigma * n that lives at frame 0 and is moved to frame 1 by the path's own flow, so render() moves it with the
@@ -659,5 +664,5 @@ def build_model(cfg):
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
     return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, "wiggle": False,
-                      "painter": False, **cfg["model"]},
+                      "painter": False, "texture_pol": False, **cfg["model"]},
                    bins=cfg["data"]["bins"], gammas=gammas)

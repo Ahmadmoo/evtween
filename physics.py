@@ -48,7 +48,8 @@ class Simulator:
     # sigma_thres adds a fixed per-pixel threshold offset (sampler only).
     # With the tube (s["tube"]) the pixel sees the least-event path in the frame-noise tube, linear between grid points.
     # With s["texture"] random texture events come on top, at rate a |dL/dtau| / (2 C_pol) (as in losses.event_nll);
-    # then texture and background events leave the pixel's state alone (only real crossings reset it).
+    # then texture and background events leave the pixel's state alone (only real crossings reset it). With s["tex_q"]
+    # (model.texture_pol) a share q of the texture events takes the polarity of the path's slope, 1 - q the other one.
     # Output "s": where each event comes from, 0 threshold crossing, 1 background, 2 texture.
     # With the detail image (model.detail) nothing changes here: decode() puts it on the keyframes and render() moves it.
     # With s["wiggle"] (texture as a hidden brightness wiggle of size A, as in losses.event_nll): each pixel's thresholds
@@ -126,6 +127,9 @@ class Simulator:
                 Lb, Db, _ = m.render(s, tau((i + 1) * H))
                 alpha = (Lb - La - Da * H) / H ** 2
             tex = None if a is None else a * (Lb - La).abs() / H / (2 * self.c)  # texture events per unit time, ON / OFF
+            if a is not None and "tex_q" in s:  # a share q of them with the slope's polarity (q = 0.5: the line above)
+                qv, rise, fall = s["tex_q"].view(-1, 1, 1, 1), torch.relu(Lb - La) / H, torch.relu(La - Lb) / H
+                tex = a * torch.stack([qv * rise + (1 - qv) * fall, qv * fall + (1 - qv) * rise]) / self.c
             self._cross(La, Da, alpha, H, t0 + dt * i * H, dt, out, tex)
             if A is not None:
                 speed = (seen[i + 1] - seen[i]).norm(dim=1, keepdim=True) / H  # px per gap

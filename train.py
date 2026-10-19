@@ -85,13 +85,16 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
         print(f"init: decoder outputs {old} -> {new}, matched by name, new ones start at 0", flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
-params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("painter.")]
+params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(("painter.", "log_q_odds"))]
 paint = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("painter.")]
+qs = [p for n, p in model.named_parameters() if p.requires_grad and n == "log_q_odds"]
 groups = [{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
           {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}]
 if paint:  # the texture painter starts from scratch even in a fine-tune: its own, larger learning rate (x train.painter_lr)
     groups.append({"params": paint, "weight_decay": 0.0, "scale": float(T.get("painter_lr", 10.0))})
-params = params + paint
+if qs:  # one number per dataset (texture polarity share): at a fine-tune lr it would take ~20k steps to move, so x train.q_lr
+    groups.append({"params": qs, "weight_decay": 0.0, "scale": float(T.get("q_lr", 30.0))})
+params = params + paint + qs
 opt = torch.optim.AdamW(groups, lr=T["lr"], betas=(0.9, 0.99))
 ckpt, step = os.path.join(T["out"], "last.pt"), 0
 if os.path.exists(ckpt):

@@ -63,6 +63,10 @@ def other_grid(model, s, Lg):
     steps = Lg.shape[1] - 1
     if "texture" in s:  # v5: a |dL| / (2 C_pol)
         C = model.sensor(s["ds"])[0]
+        if "tex_q" in s:  # a share q with the slope's polarity (model.texture_pol)
+            a, q, dL = s["texture"].flatten(1)[:, None], s["tex_q"].view(-1, 1, 1), Lg[:, 1:] - Lg[:, :-1]
+            up, down = F.relu(dL) * a, F.relu(-dL) * a
+            return torch.stack([(q * up + (1 - q) * down) / C[:, :1, None], (q * down + (1 - q) * up) / C[:, 1:, None]], 1)
         dL = (Lg[:, 1:] - Lg[:, :-1]).abs() * s["texture"].flatten(1)[:, None]
         return torch.stack([dL / (2 * C[:, :1, None]), dL / (2 * C[:, 1:, None])], 1)
     if "wiggle" in s:  # pairs: as many ON as OFF
@@ -229,7 +233,36 @@ def stats_loss(model, s, ev, dt, Lg, block=(16, 32), power=2, blocks=8, kind="fe
     return ((bands(m) + 1).log() - (bands(g) + 1).log()).abs().pow(power).mean()
 
 
-def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
+def polarity_loss(model, s, ev, dt, Lg, win=1.0):
+    # the polarity part, per real event: of the events the model expects at that pixel within +-win ms (crossings: the
+    # path's rise / C_on and fall / C_off; texture with its polarity share; background), the share with the event's
+    # polarity; -log of it, averaged over events. It asks only "which polarity", not "how many" or "exactly when".
+    # (Every event's score splits into "an event here, now" and "this polarity"; this weighs the second part again)
+    b, pix, tau, pol = ev
+    steps = Lg.shape[1] - 1
+    C, _, nu, _ = model.sensor(s["ds"])
+    dL = Lg[:, 1:] - Lg[:, :-1]
+    zero = torch.zeros_like(Lg[:, :1])
+    up, down = torch.cat([zero, F.relu(dL).cumsum(1)], 1), torch.cat([zero, F.relu(-dL).cumsum(1)], 1)  # rise / fall so far
+
+    def at(cum, t):
+        j = t * steps
+        j0 = j.floor().clamp(0, steps - 1).long()
+        f = j - j0
+        return cum[b, j0, pix] * (1 - f) + cum[b, j0 + 1, pix] * f
+
+    lo, hi = (tau - win * 1e-3 / dt[b]).clamp(0, 1), (tau + win * 1e-3 / dt[b]).clamp(0, 1)
+    r, f, c = at(up, hi) - at(up, lo), at(down, hi) - at(down, lo), C[b]
+    on, off = r / c[:, 0], f / c[:, 1]
+    if "texture" in s:
+        a, q = s["texture"].flatten(1)[b, pix], s["tex_q"][b] if "tex_q" in s else 0.5
+        on, off = on + a * (q * r + (1 - q) * f) / c[:, 0], off + a * (q * f + (1 - q) * r) / c[:, 1]
+    n = nu[b] * dt[b] * (hi - lo) / 2
+    own = torch.where(pol > 0, on, off) + n
+    return -(own / (on + off + 2 * n)).clamp(min=1e-12).log().mean()
+
+
+def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None, patch=1):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator:
     # after every event the pixel draws thresholds X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L;
     # ON fires when the running max of (L - ref)/C_on reaches X_on (OFF: running max of (ref - L)/C_off);
@@ -250,6 +283,9 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     # With s["wiggle"] (A per pixel) the texture is a hidden brightness wiggle instead: on a curve it only moves the curve's
     # events in time (wider threshold spread per pixel, model.wiggle_k, same polarity as the curve); where the path is flat
     # and the surface moves it makes up-and-down pairs at model.wiggle_rate per polarity (summed over like v5's texture)
+    # With s["tex_q"] (model.texture_pol) a share q of the texture events has the polarity of the path's slope, 1 - q the
+    # other (v5: q = 0.5). patch > 1: the timing shift d is shared by each patch x patch block of pixels (wrong motion moves
+    # a whole region's events together), not drawn per pixel.
     # Lg: the path on the grid from path_grid (computed here if not given)
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
@@ -279,10 +315,17 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     whole = (torch.stack([Lg.amax(1) - L0, L0 - Lg.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
     still = ig_logs(whole, Kp.reshape(-1)[:, None])[2].sum(1)
     tex, cost, Rw = s.get("texture"), 0, None
+    qe = s["tex_q"][b] if "tex_q" in s and tex is not None else None  # per event: texture share with the slope's polarity
     if tex is not None:
         tex = tex.flatten(1)
-        cost = (tex * (Lg[:, 1:] - Lg[:, :-1]).abs().sum(1) * (1 / C).sum(1, keepdim=True) / 2).sum()
-        tex = tex[b, pix] / (2 * c.gather(1, own)[:, 0])  # per event: texture rate per unit |dL/dtau|, its own polarity
+        if qe is None:
+            cost = (tex * (Lg[:, 1:] - Lg[:, :-1]).abs().sum(1) * (1 / C).sum(1, keepdim=True) / 2).sum()
+            tex = tex[b, pix] / (2 * c.gather(1, own)[:, 0])  # per event: texture rate per unit |dL/dtau|, its own polarity
+        else:
+            q, dLg = s["tex_q"][:, None], Lg[:, 1:] - Lg[:, :-1]
+            up, down = F.relu(dLg).sum(1), F.relu(-dLg).sum(1)
+            cost = (tex * (up * (q / C[:, :1] + (1 - q) / C[:, 1:]) + down * (q / C[:, 1:] + (1 - q) / C[:, :1]))).sum()
+            tex = tex[b, pix] / c.gather(1, own)[:, 0]  # per event: per unit |dL/dtau|, before the polarity share
     elif "wiggle" in s:
         Rw = wiggle_grid(model, s, Lg)  # texture events per unit tau and polarity on each grid step
         cost = 2 * Rw.sum() / steps  # every pixel pays for the pairs it expects
@@ -358,7 +401,8 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
             return torch.where(seen, ll, still)
 
         if Rw is None:
-            log_o = (nu[b] / 2 + tex * Di.abs()).log()  # background + texture events of this polarity (no reset)
+            share = 1 if qe is None else torch.where((Di >= 0) == (pol > 0), qe, 1 - qe)
+            log_o = (nu[b] / 2 + tex * share * Di.abs()).log()  # background + texture events of this polarity (no reset)
         else:
             j = (t * steps).floor().clamp(0, steps - 1).long()
             log_o = (nu[b] / 2 + Rw[b, j, pix] * dphi(tau).abs()).log()  # (abs: as v5's |Di|, for coarse grids)
@@ -412,7 +456,13 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, Lg=None):
     lls = torch.stack([checkpoint(pixel_ll, Lg, q / steps, use_reentrant=False) if grad else pixel_ll(Lg, q / steps) for q in shifts])
     if len(shifts) > 1:
         d = torch.tensor(shifts, device=tau.device, dtype=torch.float32) / steps
-        logw = (-0.5 * (d[:, None] / s["sig"].flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
+        sig = s["sig"]
+        if patch > 1:  # one shift per patch: sum the patch's pixels for each shift, then average over shifts
+            ph, pw = -H % patch, -W % patch
+            lls = F.pad(lls.view(len(shifts), B, H, W), (0, pw, 0, ph)).view(
+                len(shifts), B, (H + ph) // patch, patch, (W + pw) // patch, patch).sum((3, 5)).flatten(1)
+            sig = F.avg_pool2d(F.pad(sig, (0, pw, 0, ph), mode="replicate"), patch)
+        logw = (-0.5 * (d[:, None] / sig.flatten()[None]) ** 2 + torch.gradient(d)[0].log()[:, None]).log_softmax(0)
         lls = torch.logsumexp(logw + lls, 0, keepdim=True)
     return -(lls[0].sum() - (nu * H * W).sum() - cost) / (B * H * W)
 
@@ -485,21 +535,27 @@ def compute(model, batch, w, stage):
             n, terms["detail_kl"] = model.detail_code(p, batch["voxel"])
         s = model.decode(p, z, n)
         Lg = path_grid(model, s, w["grid"])
-        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX), Lg), photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
+        terms.update(nll=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX), Lg, w.get("sig_patch", 1)),
+                     photo=photo_loss(model, s, batch["mid"], batch["mid_tau"]),
                      cmax=cmax_loss(model, s, ev), smooth=smooth_loss(s, batch["i0"]),
                      sigreg=sigreg_loss(z))
         if w.get("xt", 0) > 0:
             terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, w.get("xt_blur", (2.0, 2.0)))
+        if w.get("nll_pol", 0) > 0:
+            terms["nll_pol"] = polarity_loss(model, s, ev, batch["dt"], Lg, w.get("pol_win", 1.0))
         if w.get("stats", 0) > 0 and model.painter is not None:
             terms["stats"] = stats_loss(model, s, ev, batch["dt"], Lg, w.get("stats_block", (16, 32)), kind=w.get("stats_kind", "features"))
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)  # detail image: its random part drawn from the prior, as in generation
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX)))
+        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX),
+                                                                   patch=w.get("sig_patch", 1)))
+        if w.get("nll_pol", 0) > 0:
+            terms["nll_pol_student"] = polarity_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("pol_win", 1.0))
         if stage == "student":
             terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
-    weight = dict(w, nll_student=w["nll"], detail_kl=w.get("detail_kl", 1.0))
+    weight = dict(w, nll_student=w["nll"], detail_kl=w.get("detail_kl", 1.0), nll_pol_student=w.get("nll_pol", 0))
     return sum(weight[k] * v for k, v in terms.items()), terms
 
 
@@ -512,7 +568,8 @@ def diagnostics(model, batch, w, student=True):
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
     z = model.encode(p, batch["voxel"])
     n, kl = model.detail_code(p, batch["voxel"], sample=False) if model.detail else (None, None)
-    nll = lambda code, n=n: event_nll(model, model.decode(p, code, n), ev, batch["dt"], w["grid"], w.get("mix", MIX)).item()
+    nll = lambda code, n=n: event_nll(model, model.decode(p, code, n), ev, batch["dt"], w["grid"], w.get("mix", MIX),
+                                      patch=w.get("sig_patch", 1)).item()
     out = dict(nll=nll(z), nll_shuffled=nll(z.roll(1, 0)), nll_zero=nll(torch.zeros_like(z)))
     if model.detail:
         out.update(nll_no_detail=nll(z, torch.zeros_like(n)), detail_kl=kl.item())
@@ -522,6 +579,10 @@ def diagnostics(model, batch, w, student=True):
     if w.get("stats", 0) > 0 and model.painter is not None:
         out["stats"] = stats_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("stats_block", (16, 32)),
                                   kind=w.get("stats_kind", "features")).item()
+    if w.get("nll_pol", 0) > 0:
+        out["nll_pol"] = polarity_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("pol_win", 1.0)).item()
+    if "tex_q" in s:
+        out["q"] = s["tex_q"].mean().item()  # texture share with the slope's polarity
     if "wiggle" in s:
         out["wiggle"] = s["wiggle"].mean().item()  # mean wiggle size (log units)
     if student:

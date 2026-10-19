@@ -6,7 +6,7 @@ Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
 A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the frame noise, so noise in the frames makes no events.
-Texture the frames cannot show is a hidden **brightness wiggle** per pixel: on a curve it spreads the curve's events in time (same polarity), on a moving surface it makes up-and-down events, from a texture that a small learned network paints (trained on how real texture looks in x-t / y-t) and the flow moves. The thresholds are **measured** from the data, not learned.
+Texture the frames cannot show adds random **texture events** on top of the crossings (v5); in v5.1 a learned share of them takes the polarity of the path's slope, so curves keep one polarity. The thresholds are **measured** from the data, not learned. (Branch `v6-wiggle` has the alternative: texture as a hidden brightness wiggle with a learned painter.)
 At test time only RGB is needed.
 
 ```
@@ -20,7 +20,37 @@ TEST
  video ──> student ──> ẑ, n ~ N(0,1) ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v6-wiggle`)
+### This version (`v5.1`)
+
+v5 fine-tuned, to fix its main problem: **ON and OFF mixed on each curve** in x-t / y-t. The cause is in v5's loss. v5's texture events take a coin-flip polarity at a rate `a·|dL/dτ|` that is highest on the curves, so the likelihood can explain any wrong-polarity event on a curve as cheap texture, and no other loss checks polarity. Three changes to the likelihood, plus the x-t / y-t loss (which v5 never had):
+
+| Change | What it does |
+|---|---|
+| **Texture follows the slope's polarity** (`model.texture_pol`) | A share `q` of the texture events takes the polarity of the path's slope, `1 − q` the other one: per unit τ, ON `a·(q·rise + (1−q)·fall)/C_on`, OFF `a·(q·fall + (1−q)·rise)/C_off`. `q` is learned per dataset (`log_q_odds`, own learning rate `train.q_lr` × `train.lr`) and starts at 0.5, which is exactly v5. GT has 9–21% opposite-polarity events near curves, so `q` should settle near 0.8–0.9. Likelihood, its cost term, the x-t loss and the sampler all use it |
+| **Polarity part again** (`loss.nll_pol` 1.0, `losses.polarity_loss`) | Every event's score splits into "an event here, now" and "this polarity". This weighs the second part again: per real event, of the events the model expects at that pixel within ±`loss.pol_win` ms (1 ms; crossings, texture with its share, background), the share with the event's polarity; −log of it, averaged. It asks only which polarity |
+| **Timing shift shared per patch** (`loss.sig_patch` 8) | The likelihood's timing uncertainty (a shift `d ~ N(0, sig²)` it averages over) is shared by each 8×8 block of pixels, not drawn per pixel. Wrong motion moves a whole region's events together; scattering single pixels in time now costs more |
+| **x-t / y-t loss on** (`loss.xt` 1.0) | ON and OFF maps on blurred x-t / y-t slices, texture counted with its polarity share |
+
+`config.yaml` holds v5's sizes (`model.depth [4, 4, 8, 4]`, `model.z_dim 64`, `data.min_events 1500`), so a v5 checkpoint loads whole.
+
+Checks (CPU, toy: a soft edge moving 20 px per gap over a slowly varying background, v5 texture):
+- **Old configs** (v5, tube only, v6 wiggle): same losses, gradients and sampled events as before, bit for bit.
+- **`q = 0.5` is v5:** same nll, same expected texture, same events (10,773 = 10,773).
+- **Sampler = likelihood:** 5,657–5,676 texture events where 5,601 are expected; share of texture events on the edge with its polarity 0.51 at `q = 0.5`, 0.86 at `q = 0.85`.
+- **The likelihood finds `q`:** on events made with `q = 0.85`, the nll over `q ∈ {0.5, 0.7, 0.8, 0.85, 0.9, 0.97}` is lowest at 0.85.
+- **Polarity term:** 0.27 on the model's own events, 0.37 with `q = 0.5`, 2.39 with every polarity flipped (coin flip: 0.69); its gradient reaches the path, the texture and `q`.
+- **Shared timing shift:** moving a whole curve 0.6 ms late costs +0.10 (per pixel: +0.19); moving each pixel 0.6 ms early or late at random costs +0.36 (per pixel: +0.20).
+- **From a v5-config checkpoint:** loads whole, `q` starts at 0.5; teacher (with resume), student, `generate.py`, the v5.1 notebook.
+
+Train (empty `train.out`):
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.init=runs/teacher_v5/last.pt train.lr=1e-4 train.steps=60000 train.out=runs/teacher_v51
+```
+
+The validation line adds `xt`, `nll_pol` (lower = polarity closer to GT) and `q`. The nll is not comparable with v5's: the shared timing shift scores differently.
+
+### `v6-wiggle` (separate branch)
 
 Built on `v5-texture`, fine-tuned from a v5 checkpoint. Trained longer, v5 gets the number and place of events close to GT (0.8–1.35× GT events, against 0.15–0.77× for v4; lower nll on every checked sample), but:
 - **ON and OFF are mixed on each curve** in x-t / y-t. v5's texture events take a coin-flip polarity, and their rate `a·|dL/dτ|` is highest exactly on the curves, so an OFF curve gets about as many texture ON events as OFF.
@@ -153,7 +183,7 @@ Tube width, no hand-set value:
 | Detail image | `s["D0"]`, `s["D1"]`: log brightness added to the keyframes (`model.detail`). Mean per frame from the decoder; random part `σ·n` at frame 0, moved to frame 1 by the path's flow. Teacher: `n` from `detail_code` (events); generation: `n ~ N(0, 1)`. `decode(p, z, n)`; `n = None` draws it |
 | Wiggle | `s["wiggle"] = A` per pixel (`model.wiggle`): wider threshold spread on curves (`model.wiggle_k`) and up-and-down events at `model.wiggle_rate`, drawn from a texture moved by the flow (`model.paint`); they don't reset the pixel |
 | Painter | `model.Painter` (`model.painter`): noise + frame features → the wiggle's texture; without it, noise blurred over `sensor.grain` px |
-| Texture | v5, off by default: `s["texture"] = a` per pixel, random ON/OFF pairs at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel (`model.texture`) |
+| Texture | `s["texture"] = a` per pixel (`model.texture`, on in v5 / v5.1): random ON/OFF events at `a·|dL/dτ| / (2·C_pol)` on top of the crossings, not resetting the pixel. v5.1 (`model.texture_pol`): a learned share `q` (`s["tex_q"]`) takes the slope's polarity |
 | Sensor | One model for training and generation. After each event the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Background events at rate `ν` (per second, half per polarity) also reset the pixel. `C_on`, `r = C_off/C_on` and refractory `R` are learned **per dataset** (each dataset is its own camera; with `model.measure_c` the thresholds are measured from frame change vs real event counts instead); the noise (`k` via `model.sigma_event`, `ν` via `model.nu`) is fixed in the config, because when learned it soaks up the path's errors and the sampler spreads them as noise; brightness per dataset: learned RGB weights, then `PNG^gamma` (gamma from `data.sets`); under a Bayer filter (CED) each pixel uses its own channel |
 | Events | `physics.Simulator` samples that same model with the learned parameters: exact crossing of the local quadratic of `L` with the random thresholds, plus background events. With the tube: the taut path on a grid of at least 128 steps, exact crossing of its linear pieces; between gaps the pixel reference moves with the path's free start, so the jump fires nothing |
 
@@ -168,6 +198,7 @@ Tube width, no hand-set value:
 | `jepa` | Student code vs teacher code (`stopgrad` in the student stage, joint in the joint stage) |
 | `smooth` | Edge-aware smoothness of the path coefficients (not the detail image) |
 | `xt` | Expected vs real ON / OFF events (crossings, texture, background) on blurred x-t and y-t slices (generalized KL of counts) |
+| `nll_pol` | Polarity part again: per real event, the share of the model's expected events nearby (same pixel, ±1 ms) with its polarity, −log |
 | `stats` | Pattern loss: statistics of x-y-t blocks (random-filter responses or spectra), model events (path + painted texture) vs real, at the same place; trains the painter and the wiggle size |
 | `detail_kl` | Price of the detail image's random part: KL of the teacher's posterior to the prior `N(0, 1)`, nats per pixel |
 
@@ -343,6 +374,9 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 | `model.texture` | Random ON/OFF pairs for texture the frames don't show, at a learned per-pixel rate (likelihood + sampler) |
 | `model.measure_c` | Thresholds measured from frame change vs real ON/OFF counts per dataset (`c_init` until the first batch of a dataset) |
 | `model.wiggle` | Texture as a hidden brightness wiggle per pixel: spread on curves, up-and-down events on moving surfaces drawn from a texture moved by the flow |
+| `model.texture_pol`, `train.q_lr` | v5.1: a learned share `q` of texture events takes the slope's polarity (needs `model.texture`), and its learning rate as a multiple of `train.lr` (30) |
+| `loss.nll_pol`, `loss.pol_win` | v5.1: weight of the extra polarity term (1.0; 0 = off) and its window (1 ms) |
+| `loss.sig_patch` | v5.1: the likelihood's timing shift is shared per patch of this size (8; 1 = per pixel, as v5) |
 | `model.painter`, `train.painter_lr` | The wiggle's texture painted by a small learned network (needs `model.wiggle`), and its learning rate as a multiple of `train.lr` (10) |
 | `loss.stats`, `loss.stats_kind`, `loss.stats_block` | Pattern loss weight (1.0; 0 = off), its statistic (`features` or `spectrum`) and blocks (16 time bins, 32 px) |
 | `model.detail` | Detail image on the keyframes, moved by the flow (teacher reads it from the events, generation draws it) |
