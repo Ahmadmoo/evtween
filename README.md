@@ -358,6 +358,15 @@ python generate.py --ckpt ... --seq ... --set noise=0 mismatch=0.05 refractory=5
 
 `my_video/` needs only `frames/` and `frame_ts.npy`. Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
 
+### Event-guided frame interpolation (proof of concept)
+
+The teacher's path is also a reconstructor: from I0, I1 and the real events it gives the frames at any time in the gap. `eval_interp.py` renders it in RGB at the hidden frame times (warping and blending the RGB keyframes exactly as `render()` does, in linear light) and scores it against the real hidden frames (PSNR, SSIM, and LPIPS if `pip install lpips`), next to a plain blend, the frames-only path (`z = 0`, the SloMo path) and optionally the student (`--student`). It also saves one example with error maps.
+
+```bash
+python eval_interp.py --ckpt runs/teacher_v51/last.pt --split test --n 200
+python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # BS-ERGB is trained with skip 0; large crop = full frames
+```
+
 ---
 
 ## 7. Main knobs
