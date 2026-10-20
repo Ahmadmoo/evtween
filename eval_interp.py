@@ -23,8 +23,11 @@ args = ap.parse_args()
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
 cfg = ck["cfg"]
+if not args.student:  # the frozen video backbone is only needed by the student: don't load it
+    cfg["model"]["backbone"] = "none"
 model = build_model(cfg).to(dev).eval()
-model.load_state_dict(ck["model"], strict=False)
+own = model.state_dict()
+model.load_state_dict({k: v for k, v in ck["model"].items() if k in own and own[k].shape == v.shape}, strict=False)
 D = cfg["data"]
 D["crop"] = args.crop or D["crop"]
 for kv in args.skip:
