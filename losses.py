@@ -518,7 +518,7 @@ def compute(model, batch, w, stage):
     # stage: probe | teacher | student | joint
     ev = (batch["ev_b"], batch["ev_pix"], batch["ev_tau"], batch["ev_pol"])
     if stage == "probe":
-        target = torch.log1p(F.avg_pool2d(batch["voxel"], 16) * 256)
+        target = torch.log1p(F.avg_pool2d(batch["voxel"], model.patch) * model.patch ** 2)
         loss = F.mse_loss(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"], head="counts"), target)
         return loss, dict(probe=loss)
 

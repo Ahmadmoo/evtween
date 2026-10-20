@@ -20,7 +20,27 @@ TEST
  video ──> student ──> ẑ, n ~ N(0,1) ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v5.1`)
+### This version (`v5.2`)
+
+v5.1's validation numbers flattened out (`nll_pol` ≈ 0.48 at every check, `q` stuck near 0.6–0.67): the path cannot put an edge at the right time at each pixel, so events fall back on texture. Two limits sit before the losses: one path code per 16×16 px, and the teacher sees events in 16 time bins (~2.3 ms each) while the losses check timing at ±1 ms. Trained from scratch:
+
+| Change | v5.1 | v5.2 |
+|---|---|---|
+| Path code cell (`model.patch`) | 16 px | 8 px: one code per 8×8 px; the teacher has one level less, the student predicts on the 8×8 grid (2×2 queries per V-JEPA token); the decoder already resizes z |
+| Teacher time bins (`data.bins`) | 16 | 32 (~1.1 ms each) |
+| Teacher blocks per level (`model.enc_depth`) | 1 | 6 (teacher 8.0M parameters with the v5 width; trainable total ~33M) |
+| `loss.photo` | 1 | 10: at 1 its value (~0.05) barely pulled the path toward the real frames |
+| `loss.xt` | 1 | 2 |
+
+Datasets trained with `skip: 0` (BS-ERGB) have no hidden frames, so no `photo` loss; see 4. Data.
+
+Checks (CPU, toy): with `patch: 16`, `enc_depth: 1` the teacher and student losses and all gradients equal v5.1, bit for bit (and old v5 / v6 configs as before); at patch 8: teacher, student, `generate.py`, `eval_interp.py`.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.steps=80000 train.out=runs/teacher_v52
+```
+
+### `v5.1` (separate branch)
 
 v5 fine-tuned, to fix its main problem: **ON and OFF mixed on each curve** in x-t / y-t. The cause is in v5's loss. v5's texture events take a coin-flip polarity at a rate `a·|dL/dτ|` that is highest on the curves, so the likelihood can explain any wrong-polarity event on a curve as cheap texture, and no other loss checks polarity. Three changes to the likelihood, plus the x-t / y-t loss (which v5 never had):
 
@@ -385,6 +405,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # BS-ERGB is t
 | `model.wiggle` | Texture as a hidden brightness wiggle per pixel: spread on curves, up-and-down events on moving surfaces drawn from a texture moved by the flow |
 | `model.texture_pol`, `train.q_lr` | v5.1: a learned share `q` of texture events takes the slope's polarity (needs `model.texture`), and its learning rate as a multiple of `train.lr` (30) |
 | `loss.nll_pol`, `loss.pol_win` | v5.1: weight of the extra polarity term (1.0; 0 = off) and its window (1 ms) |
+| `model.patch`, `model.enc_depth` | v5.2: path code cell (8 or 16 px; 16 = v5.1) and teacher blocks per level (6; 1 = v5.1) |
 | `loss.sig_patch` | v5.1: the likelihood's timing shift is shared per patch of this size (8; 1 = per pixel, as v5) |
 | `model.painter`, `train.painter_lr` | The wiggle's texture painted by a small learned network (needs `model.wiggle`), and its learning rate as a multiple of `train.lr` (10) |
 | `loss.stats`, `loss.stats_kind`, `loss.stats_block` | Pattern loss weight (1.0; 0 = off), its statistic (`features` or `spectrum`) and blocks (16 time bins, 32 px) |

@@ -264,8 +264,9 @@ class Backbone(nn.Module):
 
 class Student(nn.Module):
     # frozen video backbone on the context frames + small transformer that fills the gap
-    def __init__(self, backbone, dim, depth):
+    def __init__(self, backbone, dim, depth, patch=16):
         super().__init__()
+        self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 queries per 16 x 16 token)
         self.backbone = Backbone(backbone, dim)
         self.inp = nn.Linear(self.backbone.dim, dim)
         self.pos = nn.Linear(64, dim)
@@ -288,21 +289,26 @@ class Student(nn.Module):
         gy, gx = torch.meshgrid(torch.arange(h, device=tok.device), torch.arange(w, device=tok.device), indexing="ij")
         mem = self.inp(tok) + self.embed(gy.expand(B, n, h, w), gx.expand(B, n, h, w),
                                          tt.view(B, n, 1, 1).expand(B, n, h, w), dt.view(B, 1, 1, 1).expand(B, n, h, w))
-        q = self.query + self.embed(gy.expand(B, h, w), gx.expand(B, h, w),
-                                    torch.full((B, h, w), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, h, w))
+        u = self.up
+        qy, qx = torch.meshgrid((torch.arange(h * u, device=tok.device) + 0.5) / u - 0.5,
+                                (torch.arange(w * u, device=tok.device) + 0.5) / u - 0.5, indexing="ij")  # in token units
+        q = self.query + self.embed(qy.expand(B, h * u, w * u), qx.expand(B, h * u, w * u),
+                                    torch.full((B, h * u, w * u), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, h * u, w * u))
         out = self.dec(q.flatten(1, 2), mem.flatten(1, 3))
-        return out.transpose(1, 2).reshape(B, -1, h, w)
+        return out.transpose(1, 2).reshape(B, -1, h * u, w * u)
 
 
 class EventEncoder(nn.Module):
-    # teacher: real events in the gap (time-binned) + I0, I1 -> path code on the 16x16 patch grid
-    def __init__(self, cin, z_dim, width):
+    # teacher: real events in the gap (time-binned) + I0, I1 -> path code on the patch grid (patch = 2 ** levels px);
+    # depth blocks per level, max(2, depth) at the end (levels 4, depth 1: the v5 encoder, same layers)
+    def __init__(self, cin, z_dim, width, levels=4, depth=1):
         super().__init__()
-        ch = [width, 2 * width, 4 * width, 4 * width, 4 * width]
+        ch = [width, 2 * width, 4 * width, 4 * width, 4 * width][:levels + 1]
         layers = [nn.Conv2d(cin, ch[0], 3, padding=1)]
         for a, b in zip(ch, ch[1:]):
-            layers += [Block(a), LayerNorm2d(a), nn.Conv2d(a, b, 2, stride=2)]
-        self.net = nn.Sequential(*layers, Block(ch[-1]), Block(ch[-1]), LayerNorm2d(ch[-1]), nn.Conv2d(ch[-1], z_dim, 1))
+            layers += [Block(a) for _ in range(depth)] + [LayerNorm2d(a), nn.Conv2d(a, b, 2, stride=2)]
+        self.net = nn.Sequential(*layers, *[Block(ch[-1]) for _ in range(max(2, depth))], LayerNorm2d(ch[-1]),
+                                 nn.Conv2d(ch[-1], z_dim, 1))
 
     def forward(self, x):
         return self.net(x)
@@ -348,12 +354,14 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False):
+                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False, patch=16, enc_depth=1):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
         self.flow = FlowPrior(flow_prior)
-        self.teacher = EventEncoder(2 * bins + 6, z_dim, width)
+        assert patch in (4, 8, 16), "model.patch: 4, 8 or 16 px"
+        self.patch = patch  # path code cell size (px): one z per patch x patch pixels
+        self.teacher = EventEncoder(2 * bins + 6, z_dim, width, int(math.log2(patch)), enc_depth)
         self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
         self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
         self.texture = texture  # one more output: up-and-down change the frames do not show (random ON / OFF pairs)
@@ -370,7 +378,7 @@ class EvTween(nn.Module):
             self.detail_enc = UNet(2 * bins + 12, 2, 32, (1, 1, 2))
             nn.init.zeros_(self.detail_enc.head[1].weight)
             nn.init.zeros_(self.detail_enc.head[1].bias)
-        self.student = Student(backbone, pred_dim, pred_depth)
+        self.student = Student(backbone, pred_dim, pred_depth, patch)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
         # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample

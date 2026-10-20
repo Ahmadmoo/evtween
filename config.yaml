@@ -11,7 +11,7 @@ data:
                                # also gets its own learned sensor (c, r, k, nu, R) and RGB weights
   crop: 256                    # multiple of 16
   context: 4                   # frames per side for the student, taken at the gap's stride (even for vjepa2_1: 2-frame tubelets)
-  bins: 16                     # time bins of the teacher's event input
+  bins: 32                     # time bins of the teacher's event input (v5.2: ~1.1 ms each; v5.1: 16)
   min_events: 1500             # retry crops with fewer events (v5's value)
   workers: 8
 
@@ -19,7 +19,9 @@ model:
   width: 64
   depth: [4, 4, 8, 4]          # decoder UNet levels (v5's size, so v5 checkpoints load whole)
   K: 3                         # polynomial order of the path in time
-  z_dim: 64                    # path code per 16x16 patch (v5's size)
+  z_dim: 64                    # path code per patch (v5's size)
+  patch: 8                     # v5.2: one path code per 8x8 px (v5.1: 16); the student predicts it on this grid too
+  enc_depth: 6                 # v5.2: blocks per level of the teacher's event encoder (v5.1: 1)
   flow_prior: raft             # raft | none
   flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
   gamma: 1.0                   # PNG -> linear light for datasets without their own gamma in data.sets
@@ -45,10 +47,10 @@ model:
 
 loss:
   nll: 1.0                     # exact-time event likelihood
-  photo: 1.0                   # hidden real frames
+  photo: 10.0                  # hidden real frames (v5.2: 10; at 1 its value, ~0.05, barely pulled the path)
   cmax: 0.0                    # contrast maximization (off: unbounded score lets flows collapse events onto few pixels)
   smooth: 0.05                 # neighbours agree on their path over the whole gap (continuous x-t / y-t)
-  xt: 1.0                      # x-t / y-t loss: expected vs real ON / OFF events (texture included) on blurred x-t, y-t slices
+  xt: 2.0                      # x-t / y-t loss: expected vs real ON / OFF events (texture included) on blurred x-t, y-t slices
   xt_blur: [2, 2]              # its blur (px, ms): compares curves, not single events
   nll_pol: 1.0                 # v5.1: polarity part again, per real event: share of the expected events within +-pol_win ms with its polarity
   pol_win: 1.0                 # its window (ms)
