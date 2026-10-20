@@ -17,6 +17,7 @@ ap.add_argument("--n", type=int, default=200, help="samples per dataset, spread 
 ap.add_argument("--crop", type=int, default=None, help="center crop size (default: the checkpoint's data.crop; large = full frame)")
 ap.add_argument("--skip", nargs="*", default=[], help="hidden frames per gap, e.g. bsergb=3 (default: as trained)")
 ap.add_argument("--student", action="store_true", help="also the student (needs a trained student in the checkpoint)")
+ap.add_argument("--offsets", nargs="*", type=float, default=[], help="also the teacher at tau + offset (ms): finds an event-frame time offset")
 ap.add_argument("--out", default="interp.png")
 args = ap.parse_args()
 
@@ -77,7 +78,7 @@ for name, ds in datasets(D, args.split, False).items():
         print(f"{name}: no hidden frames (skip 0); pass --skip {name}=N")
         continue
     idx = torch.linspace(0, len(ds) - 1, min(args.n, len(ds))).long().tolist()
-    tot, cnt = {m: 0 for m in names}, 0
+    tot, cnt, off = {m: 0 for m in names}, 0, {o: 0 for o in args.offsets}
     for b in DataLoader(Subset(ds, idx), batch_size=1, collate_fn=collate, num_workers=2):
         b = {k: v.to(dev) for k, v in b.items()}
         g = model.gammas[b["ds"]].view(-1, 1, 1, 1)
@@ -95,6 +96,9 @@ for name, ds in datasets(D, args.split, False).items():
                 pred.update({m: render_rgb(s[m], b["i0"], b["i1"], tau, g) for m in s})
                 for m in names:
                     tot[m] = tot[m] + scores(pred[m], gt).sum(0)
+                for o in args.offsets:
+                    t = (tau + o * 1e-3 / b["dt"]).clamp(0, 1)
+                    off[o] = off[o] + scores(render_rgb(s["teacher (frames + events)"], b["i0"], b["i1"], t, g), gt).sum(0)
                 cnt += gt.shape[0]
                 if shown is None and j == b["mid"].shape[1] // 2:
                     shown = (name, gt[0], {m: pred[m][0] for m in names})
@@ -102,6 +106,8 @@ for name, ds in datasets(D, args.split, False).items():
     print(f"  {'':28}" + "".join(f"{c:>9}" for c in cols))
     for m in names:
         print(f"  {m:28}" + "".join(f"{v:9.4f}" for v in (tot[m] / cnt).tolist()))
+    for o in args.offsets:
+        print(f"  {'teacher at tau %+.1f ms' % o:28}" + "".join(f"{v:9.4f}" for v in (off[o] / cnt).tolist()))
 
 if shown is not None:
     import matplotlib
