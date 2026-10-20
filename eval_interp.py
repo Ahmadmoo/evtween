@@ -18,6 +18,7 @@ ap.add_argument("--crop", type=int, default=None, help="center crop size (defaul
 ap.add_argument("--skip", nargs="*", default=[], help="hidden frames per gap, e.g. bsergb=3 (default: as trained)")
 ap.add_argument("--student", action="store_true", help="also the student (needs a trained student in the checkpoint)")
 ap.add_argument("--offsets", nargs="*", type=float, default=[], help="also the teacher at tau + offset (ms): finds an event-frame time offset")
+ap.add_argument("--datasets", nargs="*", default=None, help="only these, e.g. eds (the figure shows the first)")
 ap.add_argument("--out", default="interp.png")
 args = ap.parse_args()
 
@@ -74,6 +75,8 @@ names = ["blend", "frames only (z=0)"] + (["student (frames)"] if args.student e
 cols = ["PSNR", "SSIM"] + (["LPIPS"] if lp is not None else [])
 shown = None
 for name, ds in datasets(D, args.split, False).items():
+    if args.datasets and name not in args.datasets:
+        continue
     if not len(ds) or ds.skip == 0:
         print(f"{name}: no hidden frames (skip 0); pass --skip {name}=N")
         continue
