@@ -11,7 +11,7 @@ At test time only RGB is needed.
 
 ```
 TRAIN
- I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 16×16 patch)
+ I0, I1 + real events in the gap ──> teacher (v5.3: frame + trajectory attention) ──> z   (per 8×8 patch)
                                   ──> detail branch (teacher)  ──> n        (per pixel, priced by its KL)
  context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
  z or ẑ, n + I0, I1 ──> physics decoder ──> L(u,τ) ──> taut path in the noise tube ──> exact-time likelihood + x-t / y-t loss
@@ -20,7 +20,36 @@ TEST
  video ──> student ──> ẑ, n ~ N(0,1) ──> physics decoder ──> L(u,τ) ──> taut path ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v5.2`)
+### This version (`v5.3`)
+
+A stronger teacher: attention on the path-code grid instead of v5.2's convolutional encoder (`model.teacher: traj`). Decoder, student, sensor and losses as v5.2, plus one training signal for the teacher (B below). Trained from scratch.
+
+| | v5.2 teacher (`conv`) | v5.3 teacher (`traj`) |
+|---|---|---|
+| Event input | counts in 32 time bins (~1.1 ms) | exact event times: each event goes through a small learned function of its time inside its slice and its polarity (a learned time kernel, the idea of EST; own code), summed per pixel |
+| Tokens | none: one image of 2×32 + 6 channels | one token per 8×8 px cell for each of 8 event slices (~4.4 ms each) and for I0, I1 (frame + its RAFT flow to the other one): 10 token frames, in time order |
+| Blocks | ConvNeXt, 6 per level, 3 levels | 6 × (window attention inside each token frame, 8×8 cells, shifted every other block → trajectory attention → MLP) |
+| Trajectory attention | – | a token of cell c at time t_q attends to the 3×3 cells around `c + F0(t_q) − F0(t_k)` in every token frame k: where the prior flow (RAFT + SloMo, nothing learned) puts it. No global attention |
+| Readout | 1×1 conv | a learned query per cell attends to the cell's 10 tokens → z (64) |
+| Size | 8.0M parameters | 4.15M (0.20M of them the masked-slice head) |
+
+**B: masked slices** (`loss.mask` 1.0, training only). A second teacher pass on a quarter of each batch (`loss.mask_share`) hides 2–3 random event slices (`loss.mask_slices`). A linear head on each hidden slice's tokens guesses its ON / OFF events per pixel (8 time bins per slice). It is scored like the x-t loss (blurred x-t / y-t slices, generalized KL); the visible slices enter as the real counts, so only the hidden ones count. A hidden slice can only be guessed from the other slices along the motion and from the frames, so this trains the trajectory attention to carry what moves. A quarter of the batch every step costs about one full pass every 4 steps, and every parameter is in every step's graph (DDP). **A** is the rest: `nll` + `xt` reach the teacher through the decoder, as before.
+
+Checks (CPU, toy):
+- `model.teacher: conv`: teacher and student losses, all gradients and the validation values equal v5.2, bit for bit.
+- Trajectory keys: for a constant motion `v`, the centre key of cell c in frame k sits at `c + (t_k − t_q)·v` within rounding (≤ 0.5 cell, 468 checked); attention returns the value at that key.
+- Hidden slices leak nothing: changing their events changes the guess by 0.0; changing a visible slice changes it.
+- The motion is used: texture moving 64 px per gap (1 cell per slice), masked-slice guess trained 300 steps: validation 1.16 → 0.97 with the true prior flow, flat at 1.16 with zero flow (keys at the same cell).
+- With motion, every teacher parameter gets a finite gradient. Toy teacher (40 steps; val `nll` 2.23 < `nll_shuffled` 2.30 < `nll_zero` 2.48), student, `eval_interp.py`, `check.py` run.
+- Cost per sample at crop 256 (counted on CPU): v5.2's teacher 792 GFLOPs forward + backward and 2.18 GB kept for the backward pass (fp32); v5.3's 300 GFLOPs and 2.19 GB. Same memory, fewer FLOPs, but its key gathers are memory-bound: watch samples/s.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.steps=80000 train.out=runs/teacher_v53
+```
+
+The validation line adds `mask`: the masked-slice guess on all validation samples (lower: hidden events guessed better).
+
+### `v5.2` (separate branch)
 
 v5.1's validation numbers flattened out (`nll_pol` ≈ 0.48 at every check, `q` stuck near 0.6–0.67): the path cannot put an edge at the right time at each pixel, so events fall back on texture. Two limits sit before the losses: one path code per 16×16 px, and the teacher sees events in 16 time bins (~2.3 ms each) while the losses check timing at ±1 ms. Trained from scratch:
 
@@ -195,7 +224,7 @@ Tube width, no hand-set value:
 
 | Part | What it does |
 |---|---|
-| Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 16×16 patch grid. Training only |
+| Teacher | `model.teacher: traj` (v5.3): exact event times + I0, I1 → tokens per 8×8 cell, window + trajectory attention → `z`; `conv` (v5.2): ConvNeXt encoder on time-binned events + I0, I1. Training only |
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
 | Decoder | UNet features **gated by `z`**: every path coefficient is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path and the decoder cannot ignore the code |
 | Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + learned corrections), blend with a time-varying visibility mask. `L(0)`, `L(1)` equal the frames by construction |
@@ -221,6 +250,7 @@ Tube width, no hand-set value:
 | `nll_pol` | Polarity part again: per real event, the share of the model's expected events nearby (same pixel, ±1 ms) with its polarity, −log |
 | `stats` | Pattern loss: statistics of x-y-t blocks (random-filter responses or spectra), model events (path + painted texture) vs real, at the same place; trains the painter and the wiggle size |
 | `detail_kl` | Price of the detail image's random part: KL of the teacher's posterior to the prior `N(0, 1)`, nats per pixel |
+| `mask` | v5.3: the teacher guesses the events of hidden event slices (extra pass, part of the batch); x-t loss on the hidden slices |
 
 ---
 
@@ -349,6 +379,7 @@ python train.py train.stage=teacher train.init=runs/teacher_v4/last.pt train.out
 | `nll_no_detail` | Teacher code without the detail image's random part | Above `nll` once the teacher finds details |
 | `detail_kl` | Nats per pixel the teacher spends on the detail image | Grows from 0 where the events show small things |
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
+| `mask` | v5.3: masked-slice guess (hidden event slices from the rest) | Falls with training |
 | `wiggle` | Mean wiggle size (log units) | Grows from 0.01 where the events show texture |
 
 The teacher's values use the detail's posterior mean; `nll_student` draws it from the prior, as generation does.
@@ -406,6 +437,8 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # BS-ERGB is t
 | `model.texture_pol`, `train.q_lr` | v5.1: a learned share `q` of texture events takes the slope's polarity (needs `model.texture`), and its learning rate as a multiple of `train.lr` (30) |
 | `loss.nll_pol`, `loss.pol_win` | v5.1: weight of the extra polarity term (1.0; 0 = off) and its window (1 ms) |
 | `model.patch`, `model.enc_depth` | v5.2: path code cell (8 or 16 px; 16 = v5.1) and teacher blocks per level (6; 1 = v5.1) |
+| `model.teacher`, `model.traj` | v5.3: `traj` (attention) or `conv` (v5.2's encoder); `traj`: token width (192), blocks (6), heads (6), event slices per gap (8), window (8 cells per side) |
+| `loss.mask`, `loss.mask_share`, `loss.mask_slices` | v5.3, `traj` teacher: masked-slice weight (1.0; 0 = off, no head), share of each batch (0.25), hidden slices per sample (2–3) |
 | `loss.sig_patch` | v5.1: the likelihood's timing shift is shared per patch of this size (8; 1 = per pixel, as v5) |
 | `model.painter`, `train.painter_lr` | The wiggle's texture painted by a small learned network (needs `model.wiggle`), and its learning rate as a multiple of `train.lr` (10) |
 | `loss.stats`, `loss.stats_kind`, `loss.stats_block` | Pattern loss weight (1.0; 0 = off), its statistic (`features` or `spectrum`) and blocks (16 time bins, 32 px) |

@@ -87,7 +87,7 @@ for name, ds in datasets(D, args.split, False).items():
         g = model.gammas[b["ds"]].view(-1, 1, 1, 1)
         with torch.no_grad():
             p = model.prepare(b["i0"], b["i1"], b["ds"], b.get("cfa"))
-            zt = model.encode(p, b["voxel"])
+            zt = model.encode(p, b["voxel"], (b["ev_b"], b["ev_pix"], b["ev_tau"], b["ev_pol"]))
             z = {"frames only (z=0)": torch.zeros_like(zt), "teacher (frames + events)": zt}
             if args.student:
                 z["student (frames)"] = model.predict(b["ctx"], b["ctx_tau"], b["dt"])

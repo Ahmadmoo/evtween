@@ -21,7 +21,10 @@ model:
   K: 3                         # polynomial order of the path in time
   z_dim: 64                    # path code per patch (v5's size)
   patch: 8                     # v5.2: one path code per 8x8 px (v5.1: 16); the student predicts it on this grid too
-  enc_depth: 6                 # v5.2: blocks per level of the teacher's event encoder (v5.1: 1)
+  enc_depth: 6                 # v5.2: blocks per level of the teacher's event encoder (v5.1: 1); conv teacher only
+  teacher: traj                # v5.3: attention teacher on the exact event times (conv: v5.2's convolutional event encoder)
+  traj: {dim: 192, depth: 6, heads: 6, slices: 8, window: 8}   # v5.3 teacher: token width, blocks (window attention ->
+                               # trajectory attention -> MLP), heads, event slices per gap (+ I0, I1), window (tokens per side)
   flow_prior: raft             # raft | none
   flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
   gamma: 1.0                   # PNG -> linear light for datasets without their own gamma in data.sets
@@ -55,6 +58,10 @@ loss:
   nll_pol: 1.0                 # v5.1: polarity part again, per real event: share of the expected events within +-pol_win ms with its polarity
   pol_win: 1.0                 # its window (ms)
   sig_patch: 8                 # v5.1: the likelihood's timing shift is shared by each 8x8 px patch (1 = per pixel, as v5)
+  mask: 1.0                    # v5.3 (B), traj teacher: masked-slice loss: a second teacher pass with some event slices hidden
+                               # guesses their ON / OFF events per pixel (x-t loss on the hidden slices only)
+  mask_share: 0.25             # share of each batch that gets this pass (2 of 8: about one full pass every 4 steps)
+  mask_slices: [2, 3]          # hidden slices per sample (of model.traj.slices), random
   stats: 0.0                   # v6 (painter): x-t / y-t pattern loss: statistics of x-y-t blocks, model (path + painted texture) vs real
   stats_kind: features         # features: mean responses of fixed random 3D filters (which small patterns occur) | spectrum
   stats_block: [16, 32]        # its blocks: time bins (of 64 per gap), px

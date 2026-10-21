@@ -109,15 +109,40 @@ def xt_loss(model, s, ev, dt, Lg, blur=(2.0, 2.0)):
         key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
         g = torch.zeros(B * 2 * T * H * W, device=m.device, dtype=m.dtype).index_add_(0, key, torch.ones_like(tau, dtype=m.dtype)).view_as(m)
         st = blur[1] * 1e-3 / dt * T  # time blur in bins, per sample
-        px = torch.full_like(st, float(blur[0]))
-        mt, gt = _blur(m, 2, st), _blur(g, 2, st)
-        out = 0
-        for ax in (4, 3):  # x-t slices: blur along x; y-t slices: blur along y
-            mb, gb = _blur(mt, ax, px), _blur(gt, ax, px)
-            out = out + (mb - gb + torch.xlogy(gb, gb) - gb * mb.clamp(min=1e-12).log()).sum() / 2
-        return out / (B * H * W)
+        return _xt_kl(m, g, st, torch.full_like(st, float(blur[0]))) / (B * H * W)
 
     return checkpoint(run, Lg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg)
+
+
+def _xt_kl(m, g, st, px):
+    # expected counts m vs real counts g (B, 2, T, H, W): blurred in t (st bins), then x-t slices (blurred along x) and y-t
+    # slices (blurred along y), each compared with the generalized KL of counts (0 when equal); summed, mean of the two
+    mt, gt = _blur(m, 2, st), _blur(g, 2, st)
+    out = 0
+    for ax in (4, 3):
+        mb, gb = _blur(mt, ax, px), _blur(gt, ax, px)
+        out = out + (mb - gb + torch.xlogy(gb, gb) - gb * mb.clamp(min=1e-12).log()).sum() / 2
+    return out
+
+
+def mask_loss(model, p, ev, dt, share=0.25, hidden=(2, 3), blur=(2.0, 2.0)):
+    # v5.3 (B), traj teacher: a second teacher pass on the first share of the batch with 2-3 random event slices hidden;
+    # the teacher guesses their ON / OFF events per pixel (from the other slices along the motion, and the frames), scored
+    # like the x-t loss (blurred x-t / y-t slices, generalized KL) where the visible slices are the real counts, so only
+    # the hidden slices count (blur reaches across their edges)
+    b, pix, tau, pol = ev
+    n, S, H, W = max(1, round(len(dt) * share)), model.teacher.S, p["H"], p["W"]
+    hide = torch.rand(n, S, device=dt.device).argsort(1).argsort(1) < torch.randint(hidden[0], hidden[1] + 1, (n, 1), device=dt.device)
+    keep = b < n
+    e = (b[keep], pix[keep], tau[keep], pol[keep])
+    q = {k: v[:n] if torch.is_tensor(v) and v.dim() else v for k, v in p.items()}
+    rate = model.encode(q, None, e, hide)[..., :H, :W].exp()
+    T = rate.shape[2]
+    g = _counts(e, n, T, H, W, rate.dtype)
+    m = torch.where(hide.repeat_interleave(T // S, 1).view(n, 1, T, 1, 1), rate, g)
+    st = blur[1] * 1e-3 / dt[:n] * T
+    px = torch.full_like(st, float(blur[0]))
+    return (checkpoint(_xt_kl, m, g, st, px, use_reentrant=False) if torch.is_grad_enabled() else _xt_kl(m, g, st, px)) / (n * H * W)
 
 
 def _counts(ev, B, T, H, W, dtype):
@@ -529,7 +554,7 @@ def compute(model, batch, w, stage):
         model.measure_thresholds(p, batch["ev_b"], batch["ev_pix"], batch["ev_pol"])
     terms = {}
     if stage in ("teacher", "joint"):
-        z = model.encode(p, batch["voxel"])
+        z = model.encode(p, batch["voxel"], ev)
         n = None
         if model.detail:  # the random part of the detail image, read from the events (a sample: the KL prices it)
             n, terms["detail_kl"] = model.detail_code(p, batch["voxel"])
@@ -545,8 +570,11 @@ def compute(model, batch, w, stage):
             terms["nll_pol"] = polarity_loss(model, s, ev, batch["dt"], Lg, w.get("pol_win", 1.0))
         if w.get("stats", 0) > 0 and model.painter is not None:
             terms["stats"] = stats_loss(model, s, ev, batch["dt"], Lg, w.get("stats_block", (16, 32)), kind=w.get("stats_kind", "features"))
+        if w.get("mask", 0) > 0 and hasattr(model.teacher, "guess"):
+            terms["mask"] = mask_loss(model, p, ev, batch["dt"], w.get("mask_share", 0.25), w.get("mask_slices", (2, 3)),
+                                      w.get("xt_blur", (2.0, 2.0)))
     if stage in ("student", "joint"):
-        zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
+        zt = model.encode(p, batch["voxel"], ev).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
         s = model.decode(p, zh)  # detail image: its random part drawn from the prior, as in generation
         terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX),
@@ -566,7 +594,7 @@ def diagnostics(model, batch, w, student=True):
     # detail image: the teacher's codes use its posterior mean; nll_no_detail drops the random part (how much it helps);
     # the student draws it from the prior, as in generation
     p = model.prepare(batch["i0"], batch["i1"], batch.get("ds"), batch.get("cfa"))
-    z = model.encode(p, batch["voxel"])
+    z = model.encode(p, batch["voxel"], ev)
     n, kl = model.detail_code(p, batch["voxel"], sample=False) if model.detail else (None, None)
     nll = lambda code, n=n: event_nll(model, model.decode(p, code, n), ev, batch["dt"], w["grid"], w.get("mix", MIX),
                                       patch=w.get("sig_patch", 1)).item()
@@ -581,6 +609,8 @@ def diagnostics(model, batch, w, student=True):
                                   kind=w.get("stats_kind", "features")).item()
     if w.get("nll_pol", 0) > 0:
         out["nll_pol"] = polarity_loss(model, s, ev, batch["dt"], path_grid(model, s, w["grid"]), w.get("pol_win", 1.0)).item()
+    if w.get("mask", 0) > 0 and hasattr(model.teacher, "guess"):  # masked-slice guess, all samples
+        out["mask"] = mask_loss(model, p, ev, batch["dt"], 1.0, w.get("mask_slices", (2, 3)), w.get("xt_blur", (2.0, 2.0))).item()
     if "tex_q" in s:
         out["q"] = s["tex_q"].mean().item()  # texture share with the slope's polarity
     if "wiggle" in s:

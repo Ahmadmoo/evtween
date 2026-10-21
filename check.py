@@ -34,9 +34,9 @@ for name, S in sets.items():
             b = {k: v.to(dev) for k, v in b.items()}
             with torch.no_grad():
                 p = model.prepare(b["i0"], b["i1"], b["ds"], b["cfa"])
-                z = model.encode(p, b["voxel"])
-                nd = model.detail_code(p, b["voxel"], sample=False)[0] if model.detail else None  # detail image: posterior mean
                 ev = (b["ev_b"], b["ev_pix"], b["ev_tau"], b["ev_pol"])
+                z = model.encode(p, b["voxel"], ev)
+                nd = model.detail_code(p, b["voxel"], sample=False)[0] if model.detail else None  # detail image: posterior mean
                 nll = lambda code, e=ev: event_nll(model, model.decode(p, code, nd), e, b["dt"], cfg["loss"]["grid"]).item()
                 s = model.decode(p, z, nd)
                 out = dict(nll=nll(z), shuffled=nll(z.roll(1, 0)), zero=nll(torch.zeros_like(z)),

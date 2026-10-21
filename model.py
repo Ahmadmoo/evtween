@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # official V-JEPA 2.1 ViT-L checkpoint (the hub file in facebookresearch/vjepa2 points its downloads to localhost)
@@ -14,6 +15,7 @@ DETAIL0 = 0.01  # spread of the random detail image at z = 0 (log units)
 WIGGLE0 = 0.01  # texture wiggle size at z = 0 (log units)
 PAINT_NOISE = 4  # noise channels the texture painter draws from
 PAINT_GRAIN = 2.0  # the painter starts from Gaussian noise blurred over this many px (v6's hand-made texture)
+GUESS_BINS = 8  # v5.3 masked-slice head: time bins per hidden slice it guesses (8 slices: 64 per gap, as the x-t loss)
 
 
 def wiggle_rate(A, slope, speed, C):
@@ -314,6 +316,141 @@ class EventEncoder(nn.Module):
         return self.net(x)
 
 
+def _traj_attend(q, kv, idx, ok, bias, heads):
+    # trajectory attention of one token frame: q (B, h, w, D); kv (B, keys, 2D) of all token frames; idx, ok (B, h * w, K):
+    # each query's K keys and whether they are inside the grid; bias (heads, K)
+    B, h, w, D = q.shape
+    k, v = kv[torch.arange(B, device=kv.device).view(B, 1, 1), idx].view(B, h * w, -1, 2, heads, D // heads).unbind(3)
+    a = torch.einsum("bnhd,bnkhd->bnhk", q.reshape(B, h * w, heads, -1), k) * (D // heads) ** -0.5 + bias
+    a = a.masked_fill(~ok[:, :, None], float("-inf")).softmax(-1)
+    return torch.einsum("bnhk,bnkhd->bnhd", a.to(v.dtype), v).reshape(B, h, w, D)
+
+
+class TrajBlock(nn.Module):
+    # one block of the v5.3 teacher on tokens (B, frames, h, w, D): position (depthwise conv inside each token frame), window
+    # attention inside each token frame (shifted by half a window every other block), trajectory attention, MLP
+    def __init__(self, dim, heads, window, shift, frames):
+        super().__init__()
+        self.heads, self.win, self.shift = heads, window, shift
+        self.pos = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.n1, self.n2, self.n3 = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.qkv, self.proj1 = nn.Linear(dim, 3 * dim), nn.Linear(dim, dim)
+        self.q, self.kv, self.proj2 = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
+        self.bias = nn.Parameter(torch.zeros(heads, frames, frames * 9))  # per query frame, key frame and cell of the 3 x 3
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def window(self, x):
+        N, h, w, D = x.shape
+        W, s = self.win, self.shift
+        pad = (0, 0, s, -(w + s) % W, s, -(h + s) % W)
+        x = F.pad(x, pad)
+        Hn, Wn = x.shape[1] // W, x.shape[2] // W
+        part = lambda t: t.reshape(t.shape[0], Hn, W, Wn, W, -1).transpose(2, 3).reshape(-1, W * W, t.shape[-1])
+        q, k, v = self.qkv(part(x)).view(-1, W * W, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
+        mask = None
+        if any(pad):  # padded cells take no part
+            keep = part(F.pad(x.new_ones(1, h, w, 1), pad)) > 0
+            mask = keep.view(1, Hn * Wn, 1, 1, W * W).expand(N, -1, -1, -1, -1).reshape(N * Hn * Wn, 1, 1, W * W)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
+        o = o.reshape(N, Hn, Wn, W, W, D).transpose(2, 3).reshape(N, Hn * W, Wn * W, D)
+        return self.proj1(o[:, s:s + h, s:s + w])
+
+    def trajectory(self, x, idx, ok):
+        B, n, h, w, D = x.shape
+        q, kv = self.q(x), self.kv(x).view(B, n * h * w, 2 * D)
+        out = []
+        for f in range(n):  # one token frame at a time, recomputed in the backward pass: the gathered keys stay small
+            args = (q[:, f], kv, idx[:, f], ok[:, f], self.bias[:, f], self.heads)
+            out.append(checkpoint(_traj_attend, *args, use_reentrant=False) if torch.is_grad_enabled() and q.requires_grad
+                       else _traj_attend(*args))
+        return self.proj2(torch.stack(out, 1))
+
+    def forward(self, x, idx, ok):
+        B, n, h, w, D = x.shape
+        x = x + self.pos(x.reshape(B * n, h, w, D).permute(0, 3, 1, 2)).permute(0, 2, 3, 1).reshape(x.shape)
+        x = x + self.window(self.n1(x).reshape(B * n, h, w, D)).reshape(x.shape)
+        x = x + self.trajectory(self.n2(x), idx, ok)
+        return x + self.mlp(self.n3(x))
+
+
+class TrajTeacher(nn.Module):
+    # v5.3 teacher. Tokens on the path-code grid (one per patch x patch px) for S event slices of the gap and for I0, I1:
+    # 10 token frames in time order (I0, slices, I1). An event slice token: each event through a small learned function of its
+    # exact time inside the slice and its polarity (a learned time kernel, like EST), summed per pixel, asinh, patch embedding.
+    # A keyframe token: the frame and its RAFT flow to the other keyframe. Blocks: window attention inside each token frame,
+    # then trajectory attention: each token attends to the 3 x 3 cells around where the prior flow (RAFT + SloMo, nothing
+    # learned) puts it in every token frame. No global attention. Readout: a learned query per cell attends to the cell's
+    # 10 tokens -> z. guess: the masked-slice head (loss.mask): ON / OFF events per pixel and time bin of a hidden slice
+    def __init__(self, z_dim, patch=8, dim=192, depth=6, heads=6, slices=8, window=8, guess=False):
+        super().__init__()
+        self.P, self.S, self.heads = patch, slices, heads
+        self.kernel = nn.Sequential(nn.Linear(18, 32), nn.GELU(), nn.Linear(32, 16))
+        self.ev_embed = nn.Conv2d(16, dim, patch, stride=patch)
+        self.key_embed = nn.Conv2d(5, dim, patch, stride=patch)
+        self.when = nn.Parameter(0.02 * torch.randn(slices + 2, dim))  # which token frame
+        self.blocks = nn.ModuleList(TrajBlock(dim, heads, window, window // 2 * (i % 2), slices + 2) for i in range(depth))
+        self.norm = nn.LayerNorm(dim)
+        self.query = nn.Parameter(torch.zeros(dim))
+        self.read, self.out = nn.Linear(dim, 2 * dim), nn.Linear(dim, z_dim)
+        if guess:
+            self.hidden = nn.Parameter(torch.zeros(dim))  # token of a hidden slice
+            self.guess = nn.Linear(dim, 2 * GUESS_BINS * patch * patch)
+            nn.init.zeros_(self.guess.weight)
+            nn.init.constant_(self.guess.bias, -4.0)  # ~0.02 events per pixel and bin
+
+    def times(self, ref):
+        # token frame times in the gap: I0, slice centres, I1
+        return torch.cat([ref.new_zeros(1), (torch.arange(self.S, device=ref.device, dtype=ref.dtype) + 0.5) / self.S, ref.new_ones(1)])
+
+    def tokens(self, p, ev, hide):
+        b, pix, tau, pol = ev
+        B, _, Hp, Wp = p["i0"].shape
+        W, S = p["W"], self.S
+        s = (tau * S).long().clamp(0, S - 1)
+        f = self.kernel(torch.cat([fourier(tau * S - s), (pol > 0).float()[:, None], (pol < 0).float()[:, None]], 1))
+        key = ((b * S + s) * Hp + pix // W) * Wp + pix % W
+        vol = torch.zeros(B * S * Hp * Wp, f.shape[1], device=f.device).index_add_(0, key, f.float())
+        x = self.ev_embed(torch.asinh(vol.view(B * S, Hp, Wp, -1).permute(0, 3, 1, 2)))
+        x = x.view(B, S, *x.shape[1:]).permute(0, 1, 3, 4, 2)
+        if hide is not None:
+            x = torch.where(hide.view(B, S, 1, 1, 1), self.hidden.to(x.dtype), x)
+        k0, k1 = (self.key_embed(torch.cat([p[img], p[flow] / 32], 1)).permute(0, 2, 3, 1)[:, None]
+                  for img, flow in (("i0", "f01"), ("i1", "f10")))
+        return torch.cat([k0, x, k1], 1) + self.when.view(1, -1, 1, 1, self.when.shape[1]).to(x.dtype)
+
+    def paths(self, p, h, w):
+        # keys of the trajectory attention: the token of cell c in frame q looks at the 3 x 3 cells around
+        # c + F0(t_q) - F0(t_k) in frame k, F0(t) = SloMo backward flow to frame 0 (prior: RAFT, no learned part), taken at c.
+        # Flat key indices into (frames, h, w) and whether each key is inside the grid: (B, frames, h * w, frames * 9)
+        f01, f10 = (F.avg_pool2d(p[k], self.P) / self.P for k in ("f01", "f10"))
+        B, n = f01.shape[0], self.S + 2
+        t = self.times(f01).view(1, n, 1, 1, 1)
+        F0 = -t * (1 - t) * f01[:, None] + t ** 2 * f10[:, None]
+        d = (F0[:, :, None] - F0[:, None]).round().long()  # (B, query frame, key frame, xy, h, w)
+        r = torch.arange(-1, 2, device=d.device)
+        ky = d[:, :, :, 1, :, :, None, None] + (torch.arange(h, device=d.device).view(h, 1, 1, 1) + r.view(3, 1))
+        kx = d[:, :, :, 0, :, :, None, None] + (torch.arange(w, device=d.device).view(1, w, 1, 1) + r.view(1, 3))
+        ok = (ky >= 0) & (ky < h) & (kx >= 0) & (kx < w)
+        idx = (torch.arange(n, device=d.device).view(1, 1, n, 1, 1, 1, 1) * h + ky.clamp(0, h - 1)) * w + kx.clamp(0, w - 1)
+        flat = lambda a: a.permute(0, 1, 3, 4, 2, 5, 6).reshape(B, n, h * w, n * 9)
+        return flat(idx), flat(ok)
+
+    def forward(self, p, ev, hide=None):
+        x = self.tokens(p, ev, hide)
+        B, n, h, w, D = x.shape
+        idx, ok = self.paths(p, h, w)
+        for blk in self.blocks:
+            x = blk(x, idx, ok)
+        x = self.norm(x)
+        if hide is not None:  # log rate of ON / OFF events per pixel and time bin, all slices: (B, 2, S * GUESS_BINS, H, W)
+            g = self.guess(x[:, 1:-1]).view(B, self.S, h, w, 2, GUESS_BINS, self.P, self.P)
+            return g.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(B, 2, self.S * GUESS_BINS, h * self.P, w * self.P)
+        k, v = self.read(x).permute(0, 2, 3, 1, 4).reshape(B * h * w, n, 2, self.heads, -1).unbind(2)
+        a = (torch.einsum("hd,nkhd->nhk", self.query.view(self.heads, -1).to(k.dtype), k) * k.shape[-1] ** -0.5).softmax(-1)
+        o = torch.einsum("nhk,nkhd->nhd", a.to(v.dtype), v).reshape(B, h, w, D)
+        return self.out(o).permute(0, 3, 1, 2)
+
+
 class Decoder(nn.Module):
     # frames + path code -> per-pixel path coefficients; every coefficient is gated by z,
     # so z = 0 gives exactly the plain SloMo path and the decoder cannot ignore the code
@@ -354,14 +491,19 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
                  uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False, patch=16, enc_depth=1):
+                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False, patch=16, enc_depth=1,
+                 teacher="conv", traj=None, guess=False):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
         self.flow = FlowPrior(flow_prior)
         assert patch in (4, 8, 16), "model.patch: 4, 8 or 16 px"
         self.patch = patch  # path code cell size (px): one z per patch x patch pixels
-        self.teacher = EventEncoder(2 * bins + 6, z_dim, width, int(math.log2(patch)), enc_depth)
+        assert teacher in ("conv", "traj"), "model.teacher: conv (v5.2) or traj (v5.3)"
+        if teacher == "traj":  # v5.3: frame + trajectory attention on exact event times (guess: head of the masked-slice loss)
+            self.teacher = TrajTeacher(z_dim, patch, guess=guess, **(traj or {}))
+        else:
+            self.teacher = EventEncoder(2 * bins + 6, z_dim, width, int(math.log2(patch)), enc_depth)
         self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
         self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
         self.texture = texture  # one more output: up-and-down change the frames do not show (random ON / OFF pairs)
@@ -534,7 +676,12 @@ class EvTween(nn.Module):
         x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
         return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W, ds=ds, cfa=cfa)
 
-    def encode(self, p, voxel):
+    def encode(self, p, voxel, ev=None, hide=None):
+        # path code z from the gap's events (conv teacher: the time-binned voxel; traj teacher: the exact event list
+        # ev = (b, pix, tau, pol)) and the keyframes. hide (B, slices): the masked-slice pass, returns the guessed log rates
+        if isinstance(self.teacher, TrajTeacher):
+            with self._ac(p["i0"]):
+                return self.teacher(p, ev, hide).float()
         x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
         with self._ac(x):
             return self.teacher(x).float()
@@ -673,4 +820,4 @@ def build_model(cfg):
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
     return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, "wiggle": False,
                       "painter": False, "texture_pol": False, **cfg["model"]},
-                   bins=cfg["data"]["bins"], gammas=gammas)
+                   bins=cfg["data"]["bins"], gammas=gammas, guess=(cfg.get("loss") or {}).get("mask", 0) > 0)
