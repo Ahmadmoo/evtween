@@ -39,19 +39,9 @@ def decode_times(timestamp_us, start, end, sampler_fps=30.):
     return start + relative[keep] * (end-start), keep
 
 
-def main():
+def load_generator(assets):
     import torch
-    assets, run = map(lambda p: Path(p).resolve(), sys.argv[1:3])
-    out = run / 'v2ce'
-    meta = json.loads((run / 'input.json').read_text())
-    ts = np.load(run / 'input/frame_ts.npy')
-    paths = sorted((run / 'input/frames').glob('*.png'))
-    if len(paths) != len(ts) or len(ts) < 17 or np.any(np.diff(ts) <= 0):
-        raise ValueError('V2CE requires at least 17 frames and increasing timestamps')
-    if (meta['height'], meta['width']) != (260, 346):
-        raise ValueError('V2CE requires the shared 260x346 crop')
-    if not torch.cuda.is_available():
-        raise RuntimeError('The installed V2CE network requires CUDA')
+    from rng_snapshot import rng_reset
     source = assets / 'third_party/v2ce'
     weights = assets / 'weights/v2ce_3d.pt'
     sys.path.insert(0, str(source))
@@ -63,33 +53,55 @@ def main():
     np.random.seed(123)
     torch.manual_seed(123)
     model = module.get_trained_mode(str(weights))
-    voxels = module.video_to_voxels(model, image_paths=list(map(str, paths)), batch_size=1)
-    expected = (len(ts)-1, 2, 10, 260, 346)
-    if voxels.shape != expected or not np.isfinite(voxels).all():
-        raise ValueError(f'Unexpected V2CE output: {voxels.shape}; expected {expected}')
-    chunks, discarded = [], 0
-    for i in range(len(ts)-1):
-        # Decode separately to retain pair identity, including boundary timestamps.
-        ev = module.sample_voxel_statistical(
-            torch.as_tensor(voxels[i:i+1], device='cuda'), fps=30.,
-            bidirectional=False, additional_events_strategy='slope')[0]
-        t, keep = decode_times(ev['timestamp'], ts[i], ts[i+1])
-        discarded += int((~keep).sum())
-        chunks.append(np.column_stack((t, ev['x'][keep], ev['y'][keep], ev['polarity'][keep])))
-    events = np.concatenate(chunks) if chunks else np.empty((0, 4))
-    save_events(out / 'events.npz', *events.T, meta['duration'], meta['width'], meta['height'])
-    record = dict(variant='V2CE with per-pair physical-time LDATI adapter',
-                  input_frames='Unmodified shared crop; no temporal frame interpolation',
-                  clock='t = frame_ts[i] + timestamp_us * 1e-6 * 30 * diff(frame_ts)[i]',
-                  sampler_fps=30., seed=123, dropped_endpoint_events=discarded,
-                  frame_intervals_s=np.diff(ts).tolist(),
-                  upstream_sha256=sha256(source / 'v2ce.py'),
+    reset = rng_reset(torch)
+    hashes = dict(upstream_sha256=sha256(source / 'v2ce.py'),
                   sampler_sha256=sha256(source / 'scripts/LDATI.py'),
-                  weights_sha256=sha256(weights),
-                  limitations=['Network has no dt input; variable-cadence accuracy is not established.',
-                               'Nominal sampler timestamps are quantized to microseconds before mapping.',
-                               'This adapter differs from the upstream fixed-FPS CLI protocol.'])
-    (out / 'representation.json').write_text(json.dumps(record, indent=2))
+                  weights_sha256=sha256(weights))
+
+    def generate(run):
+        reset()
+        out = run / 'v2ce'
+        meta = json.loads((run / 'input.json').read_text())
+        ts = np.load(run / 'input/frame_ts.npy')
+        paths = sorted((run / 'input/frames').glob('*.png'))
+        if len(paths) != len(ts) or len(ts) < 17 or np.any(np.diff(ts) <= 0):
+            raise ValueError('V2CE requires at least 17 frames and increasing timestamps')
+        if (meta['height'], meta['width']) != (260, 346):
+            raise ValueError('V2CE requires the shared 260x346 crop')
+        if not torch.cuda.is_available():
+            raise RuntimeError('The installed V2CE network requires CUDA')
+        voxels = module.video_to_voxels(model, image_paths=list(map(str, paths)), batch_size=1)
+        expected = (len(ts)-1, 2, 10, 260, 346)
+        if voxels.shape != expected or not np.isfinite(voxels).all():
+            raise ValueError(f'Unexpected V2CE output: {voxels.shape}; expected {expected}')
+        chunks, discarded = [], 0
+        for i in range(len(ts)-1):
+            # Decode separately to retain pair identity, including boundary timestamps.
+            ev = module.sample_voxel_statistical(
+                torch.as_tensor(voxels[i:i+1], device='cuda'), fps=30.,
+                bidirectional=False, additional_events_strategy='slope')[0]
+            t, keep = decode_times(ev['timestamp'], ts[i], ts[i+1])
+            discarded += int((~keep).sum())
+            chunks.append(np.column_stack((t, ev['x'][keep], ev['y'][keep], ev['polarity'][keep])))
+        events = np.concatenate(chunks) if chunks else np.empty((0, 4))
+        save_events(out / 'events.npz', *events.T, meta['duration'], meta['width'], meta['height'])
+        record = dict(variant='V2CE with per-pair physical-time LDATI adapter',
+                      input_frames='Unmodified shared crop; no temporal frame interpolation',
+                      clock='t = frame_ts[i] + timestamp_us * 1e-6 * 30 * diff(frame_ts)[i]',
+                      sampler_fps=30., seed=123, dropped_endpoint_events=discarded,
+                      frame_intervals_s=np.diff(ts).tolist(),
+                      **hashes,
+                      limitations=['Network has no dt input; variable-cadence accuracy is not established.',
+                                   'Nominal sampler timestamps are quantized to microseconds before mapping.',
+                                   'This adapter differs from the upstream fixed-FPS CLI protocol.'])
+        (out / 'representation.json').write_text(json.dumps(record, indent=2))
+
+    return generate
+
+
+def main():
+    assets, run = (Path(p).resolve() for p in sys.argv[1:3])
+    load_generator(assets)(run)
 
 
 if __name__ == '__main__':
