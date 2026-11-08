@@ -15,20 +15,22 @@ from functools import cached_property
 import numpy as np
 
 if __package__:
-    from . import metrics as m, voxel_metric
+    from . import metrics as m, metrics_our, voxel_metric
     from .event_generation import generate_event_streams_v2 as v2
 else:
     import metrics as m
+    import metrics_our
     import voxel_metric
     from event_generation import generate_event_streams_v2 as v2
 
 ROOT = v2.old.PROJECT
 UNITS = dict(event_count="events", event_count_ratio="ratio", on_percentage="percent",
-             chamfer="pixel-equivalent", chamfer_full="pixel-equivalent", chamfer_penalty="pixel-equivalent", isi_distribution="ms", isi_median_ms="ms",
+             chamfer="pixel-equivalent", chamfer_full="pixel-equivalent", chamfer_penalty="pixel-equivalent",
+             chamfer_count="pixel-equivalent", isi_distribution="ms", isi_median_ms="ms",
              isi_cv="ratio", event_rate="events/s", same_ts="fraction",
              fano_factor="mean absolute log ratio", voxel_mae="events/voxel",
              voxel_rmse="events/voxel", voxel_relative_l1="ratio")
-FULL_CHAMFERS = {"chamfer_full", "chamfer_penalty"}
+FULL_CHAMFERS = {"chamfer_full", "chamfer_penalty", "chamfer_count"}
 ARRAYS = {"isi_distribution", "event_rate", "fano_factor"}
 DESCRIPTIVE = {"event_count", "on_percentage", "isi_distribution", "isi_median_ms",
                "isi_cv", "event_rate", "same_ts"}
@@ -64,6 +66,8 @@ def settings(args):
                        chunk_size=args.chunk_size, v_px_per_ms=1.0, sampling="all", eps=0.0)
         if metric == "chamfer_penalty":
             options["one_sided_absence"] = "scoring_domain_diameter"
+        if metric == "chamfer_count":
+            options.update(count_weight=args.count_weight, count_bins="RGB frame intervals by polarity")
     elif metric == "event_rate":
         options["bin_s"] = args.rate_bin_s
     elif metric == "same_ts":
@@ -71,6 +75,8 @@ def settings(args):
     elif metric == "fano_factor":
         options.update(window_s=0.05, bin_s=0.002, bin_px=8, eps=0.001)
     files = (Path(__file__), Path(m.__file__), Path(voxel_metric.__file__), Path(v2.__file__))
+    if metric == "chamfer_count":
+        files += (Path(metrics_our.__file__),)
     return dict(dataset=args.dataset, split=args.split, metric=metric, unit=UNITS[metric],
                 interval="[first frame, last frame)", crop="full v3 crop", options=options,
                 numpy_version=np.__version__, code_sha256={
@@ -277,6 +283,8 @@ def export_csv(db, folder, metric):
         fields.extend(["chamfer_on", "chamfer_off"])
     if metric == "chamfer_penalty":
         fields.append("missing_polarity_cost")
+    if metric == "chamfer_count":
+        fields.extend(["chamfer_geometry", "count_excess", "count_deficit", "count_penalty"])
     if metric in ARRAYS:
         fields.append("array_path")
     with atomic_file(folder / "results.csv") as stream:
@@ -331,9 +339,13 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                 if metric in FULL_CHAMFERS:
                     options = config["options"]
                     kwargs = {k: options[k] for k in ("device", "workers", "chunk_size", "v_px_per_ms")}
-                    if metric == "chamfer_penalty":
-                        kwargs["height"] = meta["height"]
-                    scores = getattr(m, metric)(events, seq.gt, meta["width"], meta["duration"], **kwargs)
+                    if metric == "chamfer_count":
+                        scores = metrics_our.chamfer_count(events, seq.gt, meta["width"], edges,
+                                                          count_weight=options["count_weight"], **kwargs)
+                    else:
+                        if metric == "chamfer_penalty":
+                            kwargs["height"] = meta["height"]
+                        scores = getattr(m, metric)(events, seq.gt, meta["width"], meta["duration"], **kwargs)
                     for key, number in scores.items():
                         row[key] = float(number) if np.isfinite(number) else None
                     value = row["value"]
@@ -425,7 +437,13 @@ def main():
     parser.add_argument("--data-root", type=Path, help="Override the original dataset root containing dataset/split")
     parser.add_argument("--pred-root", type=Path, default=ROOT / "data_test_evt")
     parser.add_argument("--report-root", type=Path, default=ROOT / "reports")
+    parser.add_argument("--count-weight", type=float, help="Count penalty weight for chamfer_count (default: 1.0 pixel-equivalent)")
     args = parser.parse_args()
+    if args.count_weight is not None:
+        if args.metric != "chamfer_count" or not np.isfinite(args.count_weight) or args.count_weight < 0:
+            parser.error("--count-weight requires chamfer_count and a finite nonnegative value")
+    else:
+        args.count_weight = 1.0
     if Path(args.dataset).name != args.dataset or args.dataset in ("", ".", ".."):
         parser.error("Expected a single dataset directory name")
     if args.metric in FULL_CHAMFERS and args.max_points is not None:
