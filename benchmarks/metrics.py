@@ -174,6 +174,40 @@ def chamfer_full(events, reference, width, duration_s, *, start_s=0.0,
     return dict(value=float(np.mean(shared)) if shared else np.nan, **parts)
 
 
+def chamfer_penalty(events, reference, width, duration_s, *, height, start_s=0.0,
+                    v_px_per_ms=1.0, device="cpu", workers=1, chunk_size=131072):
+    """Full-stream Chamfer with the scoring-domain diameter for one-sided absence.
+
+    Keep raw ON/OFF distances undefined when a nearest neighbour does not exist.
+    Average over polarities present in at least one stream. Two empty streams
+    have no score. The penalty is in the same pixel-equivalent units as Chamfer.
+    """
+    if not isinstance(height, (int, np.integer)) or height < 1:
+        raise ValueError("Height must be a positive integer")
+    for stream in (events, reference):
+        if np.any(_array(stream, "y") >= height):
+            raise ValueError("Coordinates outside sensor height")
+
+    scores = chamfer_full(events, reference, width, duration_s, start_s=start_s,
+                          v_px_per_ms=v_px_per_ms, device=device, workers=workers,
+                          chunk_size=chunk_size)
+    diameter = float(np.hypot(np.hypot(width - 1, height - 1),
+                              1000.0 * duration_s * v_px_per_ms))
+    terms = []
+    for on, key in ((True, "chamfer_on"), (False, "chamfer_off")):
+        if np.isfinite(scores[key]):
+            terms.append(scores[key])
+        else:
+            for stream in (events, reference):
+                p = _array(stream, "p")
+                if np.any(p > 0 if on else p <= 0):
+                    terms.append(diameter)
+                    break
+    scores.update(value=float(np.mean(terms)) if terms else np.nan,
+                  missing_polarity_cost=diameter)
+    return scores
+
+
 def isi_distribution(events, width, duration_s, *, start_s=0.0):
     """Return all same-pixel inter-event intervals in ms, including zero ties."""
     pixel, tau, _ = _layout(events, width, duration_s, start_s)
