@@ -160,11 +160,12 @@ def same_ts(events, *, start_s=0.0, window_s=0.05, resolution_s=1e-9):
 
 
 def fano_factor(events, width, height, duration_s, *, reference=None, start_s=0.0,
-                window_s=0.05, bin_s=0.002, bin_px=8, eps=1e-3):
+                window_s=0.05, bin_s=0.002, bin_px=8, eps=1e-3, return_maps=False):
     """Return window-by-spatial-tile population variance/mean of temporal counts.
 
     Inactive cells have factor zero. With reference supplied, return the benchmark
     mean absolute log ratio over jointly active cells (NaN for no overlap).
+    With reference and return_maps=True, also return both maps and active masks.
     The last partial window is zero-padded as in the reference implementation.
     """
     for value, name in ((duration_s, "duration_s"), (window_s, "window_s"),
@@ -199,6 +200,8 @@ def fano_factor(events, width, height, duration_s, *, reference=None, start_s=0.
         return pred
     gt, gt_active = values(reference)
     shared = active & gt_active
-    if not shared.any():
-        return np.nan
-    return float(np.abs(np.log((pred[shared] + eps) / (gt[shared] + eps))).mean())
+    score = (float(np.abs(np.log((pred[shared] + eps) / (gt[shared] + eps))).mean())
+             if shared.any() else np.nan)
+    if return_maps:
+        return score, dict(pred_fano=pred, gt_fano=gt, pred_active=active, gt_active=gt_active)
+    return score
