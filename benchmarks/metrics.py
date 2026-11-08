@@ -113,6 +113,67 @@ def chamfer(events, reference, width, duration_s, *, start_s=0.0, n=20000,
     return float(np.mean(scores)) if scores else np.nan
 
 
+
+def chamfer_full(events, reference, width, duration_s, *, start_s=0.0,
+                 v_px_per_ms=1.0, device="cpu", workers=1, chunk_size=131072):
+    """Exact bidirectional 1-NN Chamfer over every event of each shared polarity.
+
+    Return value, chamfer_on and chamfer_off in pixel-equivalent units. The
+    aggregate weights available polarities equally; missing components are NaN.
+    Each batch queries the entire opposite polarity-matched target in float64.
+    CPU uses SciPy cKDTree and workers; CUDA uses CuPy's spatial KDTree.
+    """
+    _positive(duration_s, "duration_s")
+    _positive(v_px_per_ms, "v_px_per_ms")
+    if not np.isfinite(start_s) or chunk_size < 1 or workers < 1:
+        raise ValueError("Expected finite start_s and positive chunk_size and workers")
+    if device == "cpu":
+        from scipy.spatial import cKDTree as Tree
+        xp = np
+        query_options = {"workers": workers}
+    elif device == "cuda":
+        import cupy as xp
+        from cupyx.scipy.spatial import KDTree as Tree
+        query_options = {}
+    else:
+        raise ValueError("device must be cpu or cuda")
+
+    def columns(stream):
+        t = _times(stream)
+        if np.any(t < start_s) or np.any(t >= start_s + duration_s):
+            raise ValueError("Events outside the common half-open scoring interval")
+        x, y = _coordinates(stream, t, width)
+        return x, y, t, _polarity(stream, t)
+
+    def points(data, sign):
+        x, y, t, p = data
+        keep = p == sign
+        xyz = np.empty((np.count_nonzero(keep), 3), dtype=np.float64)
+        xyz[:, 0] = x[keep]
+        xyz[:, 1] = y[keep]
+        xyz[:, 2] = (t[keep] - start_s) * (1000.0 * v_px_per_ms)
+        return xyz
+
+    def directed(query, target):
+        tree = Tree(xp.asarray(target))
+        total = xp.zeros((), dtype=xp.float64)
+        for offset in range(0, len(query), chunk_size):
+            block = xp.asarray(query[offset:offset + chunk_size])
+            distances, _ = tree.query(block, k=1, p=2, eps=0.0, **query_options)
+            total += distances.sum(dtype=xp.float64)
+        return float(total.item()) / len(query)
+
+    pred, gt = columns(events), columns(reference)
+    parts = {}
+    for sign, key in ((1, "chamfer_on"), (-1, "chamfer_off")):
+        a, b = points(pred, sign), points(gt, sign)
+        parts[key] = (0.5 * (directed(a, b) + directed(b, a))
+                      if len(a) and len(b) else np.nan)
+        del a, b
+    shared = [v for v in parts.values() if np.isfinite(v)]
+    return dict(value=float(np.mean(shared)) if shared else np.nan, **parts)
+
+
 def isi_distribution(events, width, duration_s, *, start_s=0.0):
     """Return all same-pixel inter-event intervals in ms, including zero ties."""
     pixel, tau, _ = _layout(events, width, duration_s, start_s)

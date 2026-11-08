@@ -24,7 +24,7 @@ else:
 
 ROOT = v2.old.PROJECT
 UNITS = dict(event_count="events", event_count_ratio="ratio", on_percentage="percent",
-             chamfer="pixel-equivalent", isi_distribution="ms", isi_median_ms="ms",
+             chamfer="pixel-equivalent", chamfer_full="pixel-equivalent", isi_distribution="ms", isi_median_ms="ms",
              isi_cv="ratio", event_rate="events/s", same_ts="fraction",
              fano_factor="mean absolute log ratio", voxel_mae="events/voxel",
              voxel_rmse="events/voxel", voxel_relative_l1="ratio")
@@ -47,6 +47,20 @@ def settings(args):
             raise ValueError("CUDA requested but unavailable")
         options.update(n=args.max_points, chunk_size=args.chunk_size, device=device,
                        v_px_per_ms=1.0, seed=0, torch_version=str(torch.__version__))
+    elif metric == "chamfer_full":
+        device = args.device or "cpu"
+        if device == "cpu":
+            import scipy
+            from scipy.spatial import cKDTree
+            version = scipy.__version__
+        else:
+            import cupy
+            from cupyx.scipy.spatial import KDTree
+            if not cupy.cuda.runtime.getDeviceCount():
+                raise ValueError("CUDA requested but no GPU is visible to CuPy")
+            version = cupy.__version__
+        options.update(device=device, backend_version=version, workers=args.workers,
+                       chunk_size=args.chunk_size, v_px_per_ms=1.0, sampling="all", eps=0.0)
     elif metric == "event_rate":
         options["bin_s"] = args.rate_bin_s
     elif metric == "same_ts":
@@ -256,6 +270,8 @@ def atomic_file(path, binary=False):
 
 def export_csv(db, folder, metric):
     fields = ["sequence", "method", "value", "status"]
+    if metric == "chamfer_full":
+        fields.extend(["chamfer_on", "chamfer_off"])
     if metric in ARRAYS:
         fields.append("array_path")
     with atomic_file(folder / "results.csv") as stream:
@@ -307,7 +323,20 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                     value, row["status"] = None, "undefined"
             else:
                 events = seq.gt if ground else read_events(file, meta)
-                value, arrays, row["status"] = score(metric, events, seq, config["options"])
+                if metric == "chamfer_full":
+                    options = config["options"]
+                    scores = m.chamfer_full(events, seq.gt, meta["width"], meta["duration"],
+                                            **{k: options[k] for k in
+                                               ("device", "workers", "chunk_size", "v_px_per_ms")})
+                    for key, number in scores.items():
+                        row[key] = float(number) if np.isfinite(number) else None
+                    value = row["value"]
+                    if value is None:
+                        row["status"] = "undefined"
+                    elif row["chamfer_on"] is None or row["chamfer_off"] is None:
+                        row["status"] = "partial_polarity"
+                else:
+                    value, arrays, row["status"] = score(metric, events, seq, config["options"])
             if digest([stamp(p) for p in paths]) != signature:
                 raise RuntimeError("Input changed during scoring; rerun this metric")
             row["value"] = float(value) if value is not None else None
@@ -320,6 +349,8 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                 row["array_path"] = rel.as_posix()
     except Exception as exc:
         row.update(value=None, status="error", array_path="")
+        if metric == "chamfer_full":
+            row.update(chamfer_on=None, chamfer_off=None)
         print(f"  {name}/{method}: {exc}", flush=True)
     db.execute("INSERT OR REPLACE INTO scores VALUES (?,?,?,?)",
                (name, method, signature, json.dumps(row, allow_nan=False)))
@@ -380,9 +411,10 @@ def main():
     parser.add_argument("--metric", required=True, choices=tuple(UNITS))
     parser.add_argument("--methods", nargs="+", choices=v2.old.METHODS)
     parser.add_argument("--sequence")
-    parser.add_argument("--device", choices=("cpu", "cuda"), help="Chamfer device (auto by default)")
-    parser.add_argument("--max-points", type=int, default=20000, help="Chamfer sample cap per polarity")
-    parser.add_argument("--chunk-size", type=int, default=4096, help="Chamfer distance chunk size")
+    parser.add_argument("--device", choices=("cpu", "cuda"), help="Chamfer device (sampled: auto, full: CPU)")
+    parser.add_argument("--max-points", type=int, help="Sampled Chamfer only: cap per polarity (default 20000)")
+    parser.add_argument("--chunk-size", type=int, help="Queries per batch (sampled: 4096, full: 131072)")
+    parser.add_argument("--workers", type=int, default=1, help="CPU query threads for chamfer_full")
     parser.add_argument("--rate-bin-s", type=float, default=0.01, help="Event-rate bin duration in seconds")
     parser.add_argument("--data-root", type=Path, help="Override the original dataset root containing dataset/split")
     parser.add_argument("--pred-root", type=Path, default=ROOT / "data_test_evt")
@@ -390,7 +422,13 @@ def main():
     args = parser.parse_args()
     if Path(args.dataset).name != args.dataset or args.dataset in ("", ".", ".."):
         parser.error("Expected a single dataset directory name")
-    if min(args.chunk_size, args.max_points) < 1 or not np.isfinite(args.rate_bin_s) or args.rate_bin_s <= 0:
+    if args.metric == "chamfer_full" and args.max_points is not None:
+        parser.error("chamfer_full uses every event; --max-points applies to chamfer only")
+    if args.max_points is None:
+        args.max_points = 20000
+    if args.chunk_size is None:
+        args.chunk_size = 131072 if args.metric == "chamfer_full" else 4096
+    if min(args.workers, args.chunk_size, args.max_points) < 1 or not np.isfinite(args.rate_bin_s) or args.rate_bin_s <= 0:
         parser.error("Sample cap, chunk size and bin duration must be positive")
     return run(args)
 
