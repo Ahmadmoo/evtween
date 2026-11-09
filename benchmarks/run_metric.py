@@ -27,7 +27,7 @@ ROOT = v2.old.PROJECT
 UNITS = dict(event_count="events", event_count_ratio="ratio", on_percentage="percent",
              chamfer="pixel-equivalent", chamfer_full="pixel-equivalent", chamfer_penalty="pixel-equivalent",
              chamfer_count="pixel-equivalent", isi_distribution="ms", isi_median_ms="ms",
-             isi_cv="ratio", event_rate="events/s", same_ts="fraction",
+             iei_distance="log10 interval distance", isi_cv="ratio", event_rate="events/s", same_ts="fraction",
              fano_factor="mean absolute log ratio", voxel_mae="events/voxel",
              voxel_rmse="events/voxel", voxel_relative_l1="ratio")
 FULL_CHAMFERS = {"chamfer_full", "chamfer_penalty", "chamfer_count"}
@@ -227,6 +227,10 @@ def score(metric, events, seq, options):
         bins = np.append(bins[bins < duration], duration)
         arrays = dict(edges_s=bins, rate_hz=m.event_rate(events, bins))
         value = len(events["t"])/duration
+    elif metric == "iei_distance":
+        value = m.iei_distance(events, seq.gt, w, duration)
+        if np.isnan(value):
+            return None, arrays, "no_intervals"
     elif metric.startswith("isi_"):
         intervals = m.isi_distribution(events, w, duration)
         if metric == "isi_distribution":
