@@ -9,36 +9,8 @@ VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384
 LEVJEPA_ID = "galilai-group/LeVJEPA-VideoMix-Large"
 NOISE_BINS = 16  # brightness bins of the measured frame noise (tube width)
 C_RANGE = (0.5, 2.0)  # |L1 - L0| of the pixels that measure the thresholds: above the frame noise, below the sensor's speed limit
-TEX0 = 0.01  # texture at z = 0 (extra up-and-down change per unit of path change)
-DETAIL0 = 0.01  # spread of the random detail image at z = 0 (log units)
-WIGGLE0 = 0.01  # texture wiggle size at z = 0 (log units)
-PAINT_NOISE = 4  # noise channels the texture painter draws from
-PAINT_GRAIN = 2.0  # the painter starts from Gaussian noise blurred over this many px (v6's hand-made texture)
-
-
-def wiggle_rate(A, slope, speed, C):
-    # texture pairs from a hidden brightness wiggle of size A (log units) riding on the path: per unit tau and per polarity,
-    # A per pixel of motion (speed: px per gap) over the two thresholds, and none where the path's own change |dL/dtau|
-    # outruns the wiggle (a wiggle can't turn a steep curve around: there it only moves the curve's events in time)
-    v = A * speed
-    return v * torch.exp(-slope / (v + 1e-6)) / C
-
-
-def wiggle_k(K, A, C):
-    # inverse-Gaussian shape of the thresholds with the wiggle: its level noise A between two events (variance 2 A^2)
-    # adds to the threshold spread (C / sqrt(K) at the mean threshold C / 2 = (C_on + C_off) / 2)
-    return 1 / (1 / K + 8 * A ** 2 / C ** 2)
-
-
-def gauss_blur(x, sig):
-    # separable Gaussian blur over the last two axes, per channel, zeros outside
-    r, C = math.ceil(3 * sig), x.shape[1]
-    if r == 0:
-        return x
-    k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) / sig) ** 2)
-    k = (k / k.sum()).repeat(C, 1)
-    x = F.conv2d(x, k.view(C, 1, 1, -1), padding=(0, r), groups=C)
-    return F.conv2d(x, k.view(C, 1, -1, 1), padding=(r, 0), groups=C)
+KAPPA0 = 0.01  # residual events per threshold of raw path change at z = 0
+VIS = 3  # visibility V(tau) = sigmoid(cubic in tau)
 
 
 def luminance(img, gamma=2.2):
@@ -329,32 +301,10 @@ class Decoder(nn.Module):
         return self.head(self.feat(x) * g)
 
 
-class Painter(nn.Module):
-    # learned texture for the wiggle: noise + frame features (zero outside the image, plus an inside mask) -> one brightness
-    # channel on the frame-0 plane, added to Gaussian noise blurred over PAINT_GRAIN px times a learned scale (the
-    # hand-made texture it starts from: the last layer starts at 0, the scale at 1). Dilated convolutions reach 15 px.
-    # It needs no events: teacher and student draw
-    # texture the same way. Trained by losses.stats_loss (how real texture looks in x-t / y-t)
-    def __init__(self, cin, width=32):
-        super().__init__()
-        layers, c = [], cin + PAINT_NOISE
-        for d in (1, 2, 4, 8):
-            layers += [nn.Conv2d(c, width, 3, padding=d, dilation=d), nn.GELU()]
-            c = width
-        self.net = nn.Sequential(*layers, nn.Conv2d(width, 1, 1))
-        self.base = nn.Parameter(torch.ones(()))
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, x):
-        return self.net(x)
-
-
 class EvTween(nn.Module):
-    def __init__(self, width=64, depth=(2, 2, 4, 2), K=3, z_dim=32, flow_prior="raft", flow_scale=8.0, gamma=2.2,
-                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=384, pred_depth=4, bins=16, amp=True,
-                 uncertainty=True, gammas=None, sigma_event=None, nu=None, sig_max=None, tube=False, texture=False,
-                 measure_c=False, detail=False, wiggle=False, painter=False, texture_pol=False, patch=16, enc_depth=1):
+    def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_prior="raft", flow_scale=16.0, gamma=2.2,
+                 eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=512, pred_depth=8, bins=32, amp=True,
+                 gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -362,22 +312,13 @@ class EvTween(nn.Module):
         assert patch in (4, 8, 16), "model.patch: 4, 8 or 16 px"
         self.patch = patch  # path code cell size (px): one z per patch x patch pixels
         self.teacher = EventEncoder(2 * bins + 6, z_dim, width, int(math.log2(patch)), enc_depth)
-        self.uncertainty = uncertainty  # one more output: how unsure the path is about arrival times (losses.event_nll)
-        self.tube = tube  # one more output: log factor on the tube width (events come from the least-event path in the tube)
-        self.texture = texture  # one more output: up-and-down change the frames do not show (random ON / OFF pairs)
+        # crossings come from the least-event path in the frame-noise tube; its width is measured (no learned map).
+        # "scalar": times one learned factor per dataset; false: no tube
+        self.tube = {True: "measured", None: False}.get(tube, tube)
+        assert self.tube in (False, "measured", "scalar"), "model.tube: measured | scalar | false"
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
-        # detail image: three more outputs (its mean at frame 0 and at frame 1, the spread of its random part) and a
-        # full-resolution teacher branch that reads the random part from the events
-        self.detail = detail
-        self.wiggle = wiggle  # one more output: size of the hidden brightness wiggle (texture as brightness, not as events)
-        assert wiggle or not painter, "model.painter draws the wiggle's texture: it needs model.wiggle"
-        self.painter = Painter(13) if painter else None  # learned look of the wiggle's texture (else blurred noise)
-        self.decoder = Decoder(z_dim, 5 * K + 1 + int(uncertainty) + int(tube) + int(texture) + 3 * int(detail) + int(wiggle),
-                               width, depth)
-        if detail:
-            self.detail_enc = UNet(2 * bins + 12, 2, 32, (1, 1, 2))
-            nn.init.zeros_(self.detail_enc.head[1].weight)
-            nn.init.zeros_(self.detail_enc.head[1].bias)
+        # outputs: flow corrections a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
+        self.decoder = Decoder(z_dim, 4 * K + VIS + 1 + 6, width, depth)
         self.student = Student(backbone, pred_dim, pred_depth, patch)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -386,18 +327,17 @@ class EvTween(nn.Module):
         full = lambda v: nn.Parameter(torch.full((n,), math.log(v)))
         self.log_c, self.log_r = full(c_init), full(r_init)          # ON threshold, C_off / C_on
         self.log_k = full(4.0)                                        # inverse-Gaussian shape (timing regularity)
-        self.log_nu = full(0.2)                                       # background events per pixel per second
         self.log_R = full(5e-5)                                       # refractory time (s); grows from below to the real floor
         self.R_max = 2e-3                                             # soft cap: with few events per pixel R is weakly pinned
-        assert texture or not texture_pol, "model.texture_pol sets the polarity of model.texture's events: it needs model.texture"
-        if texture_pol:  # texture follows the slope's polarity: share q of its events (logit, per dataset; 0 = 0.5, v5's coin flip)
-            self.log_q_odds = nn.Parameter(torch.zeros(n))
-        # sensor noise set in the config instead of learned (None = learned): learned, it soaks up the path's errors and the
-        # sampler then spreads them as noise. sigma_event: threshold spread per event (fraction of c), nu: events / px / s
-        self.k_fixed, self.nu_fixed, self.sig_max = None if sigma_event is None else sigma_event ** -2, nu, sig_max
+        if self.tube == "scalar":
+            self.log_tube = nn.Parameter(torch.zeros(n))              # log factor on the measured tube width
+        # sigma_event: threshold spread per event (fraction of c), fixed in the config (None = learned: it then soaks up the
+        # path's errors). nu: background events per pixel per second at z = 0 (the decoder scales it per pixel and polarity)
+        assert nu > 0, "model.nu: background rate at z = 0, > 0"
+        self.k_fixed, self.nu0 = None if sigma_event is None else sigma_event ** -2, nu
         self.w_rgb = nn.Parameter(torch.tensor([[0.299, 0.587, 0.114]]).log().repeat(n, 1))  # RGB weights (softmax), learned
         self.register_buffer("gammas", torch.tensor(gammas or [gamma], dtype=torch.float32), persistent=False)  # from config
-        if tube:  # frame noise sigma_L per dataset and brightness bin, measured during training (0 = not measured yet)
+        if self.tube:  # frame noise sigma_L per dataset and brightness bin, measured during training (0 = not measured yet)
             self.register_buffer("noise", torch.zeros(n, NOISE_BINS))
         if measure_c:  # running moment equations of the threshold fit per dataset (0 = not measured yet)
             self.register_buffer("c_zx", torch.zeros(n, 2, 2))
@@ -427,20 +367,30 @@ class EvTween(nn.Module):
         return (img * w).sum(1, keepdim=True).clamp(1e-6, 1) ** self.gammas[ds].view(B, 1, 1, 1)
 
     def sensor(self, ds):
-        # per sample: thresholds (C_on, C_off), IG shape k, background rate nu (1/s), refractory R (s)
+        # per sample: thresholds (C_on, C_off), IG shape k, refractory R (s)
         c = self.log_c.exp()[ds]
         k = self.log_k.exp()[ds] if self.k_fixed is None else torch.full_like(c, self.k_fixed)
-        nu = self.log_nu.exp()[ds] if self.nu_fixed is None else torch.full_like(c, self.nu_fixed)
         C = torch.stack([c, c * self.log_r.exp()[ds]], 1)
         if self.measure_c:  # measured thresholds where the dataset has been measured, else the initial value
             m, ok = self.c_measured()
             C = torch.where(ok[ds, None], m[ds], C)
-        return C, k, nu, self.R[ds]
+        return C, k, self.R[ds]
+
+    def residual_rate(self, s, slope, dt, nu_scale=1.0, C=None):
+        # residual events per unit tau (they don't reset the pixel), ON and OFF: (B, 2, T, H*W) from the raw path's slope
+        # dL/dtau (B, T, H*W), not the taut path's, so change the tube flattens can still make events where z says so:
+        # (kappa_rise relu(slope) + kappa_fall relu(-slope)) / C_pol + nu_pol dt. C: thresholds (B, 2, 1, H*W) (sampler),
+        # else the sensor's; nu_scale: background as set in a sensor profile (1 = learned)
+        k, nu = s["kappa"].flatten(3), s["nu"].flatten(2) * nu_scale
+        C = self.sensor(s["ds"])[0][:, :, None, None] if C is None else C
+        up, down = F.relu(slope)[:, None], F.relu(-slope)[:, None]
+        dt = torch.as_tensor(dt, dtype=nu.dtype, device=nu.device).view(-1, 1, 1)
+        return (k[:, :, :1] * up + k[:, :, 1:] * down) / C + (nu * dt)[:, :, None]
 
     @torch.no_grad()
     def measure_thresholds(self, p, b, pix, pol, momentum=0.99, min_px=100):
         # over a gap the events of a pixel add up to its brightness change: E[c_on N_on - c_off N_off | d] = d, d = L1 - L0,
-        # whatever the path did in between (texture pairs cancel). The counts are the noisy side, so the fit is counts on
+        # whatever the path did in between. The counts are the noisy side, so the fit is counts on
         # change: the equation weighted by the rising part max(d, 0) and by the falling part max(-d, 0) gives two linear
         # equations for (c_on, c_off) per dataset, kept as running sums like BatchNorm statistics
         H, W = p["H"], p["W"]
@@ -493,10 +443,14 @@ class EvTween(nn.Module):
 
     def tube_eps(self, s):
         # tube half-width per pixel (B, H*W): 1.96 / sqrt(2) x the frame noise at its brightness, so 95% of pixels that only
-        # see noise (L1 - L0 ~ N(0, 2 sigma^2)) fit a flat path, times the learned factor exp(s["tube"])
-        L0, L1 = (torch.log(s[k][:, 0] + self.eps).flatten(1) for k in (("frame0", "frame1") if "frame0" in s else ("y0", "y1")))
-        sig = self.noise_table()[s["ds"][:, None], self.noise_bin((L0 + L1) / 2)]
-        return 1.96 / math.sqrt(2) * sig * s["tube"].flatten(1).exp()
+        # see noise (L1 - L0 ~ N(0, 2 sigma^2)) fit a flat path ("scalar": times one learned factor per dataset)
+        L0, L1 = (torch.log(s[k][:, 0] + self.eps).flatten(1) for k in ("y0", "y1"))
+        eps = 1.96 / math.sqrt(2) * self.noise_table()[s["ds"][:, None], self.noise_bin((L0 + L1) / 2)]
+        return eps * self.log_tube.exp()[s["ds"], None] if self.tube == "scalar" else eps
+
+    def paths(self, L, s):
+        # what the pixels see, from the raw path L (B, T, H*W): the taut path in the tube (crossings), or L without a tube
+        return taut(L, self.tube_eps(s)) if self.tube else L
 
     def load_state_dict(self, sd, strict=False):
         # checkpoints from before per-dataset sensors hold one value per parameter: every dataset starts from it
@@ -508,8 +462,7 @@ class EvTween(nn.Module):
         return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
 
     def fixed(self, name):
-        return ((name == "log_k" and self.k_fixed is not None) or (name == "log_nu" and self.nu_fixed is not None)
-                or (name in ("log_c", "log_r") and self.measure_c))
+        return (name == "log_k" and self.k_fixed is not None) or (name in ("log_c", "log_r") and self.measure_c)
 
     def state(self):
         # checkpoint without the frozen pretrained networks (reloaded from their official sources)
@@ -539,90 +492,27 @@ class EvTween(nn.Module):
         with self._ac(x):
             return self.teacher(x).float()
 
-    def detail_code(self, p, voxel, sample=True):
-        # teacher: the random part n of the detail image, read from the events at full resolution. Prior N(0, 1) per pixel,
-        # posterior N(m, s^2); returns n (a sample, or the mean m) and KL(posterior || prior) per pixel, averaged
-        x = torch.cat([torch.log1p(self._pad(voxel)), p["x"]], 1)
-        with self._ac(x):
-            out = self.detail_enc(x).float()[..., :p["H"], :p["W"]]
-        m, logs = out[:, :1], 3 * torch.tanh(out[:, 1:] / 3)
-        n = m + logs.exp() * torch.randn_like(m) if sample else m
-        return n, (0.5 * (m ** 2 + (2 * logs).exp() - 1) - logs).mean()
-
     def predict(self, ctx, ctx_tau, dt, head="z"):
         ctx = self._pad(ctx)
         with self._ac(ctx):
             f = self.student(ctx, ctx_tau, dt).float()
         return (self.to_z if head == "z" else self.to_counts)(f)
 
-    def decode(self, p, z, n=None):
-        # path code -> trajectory state used by render(); n: the random part of the detail image (teacher: from
-        # detail_code; None: drawn from its prior N(0, 1), as in generation)
+    def decode(self, p, z):
+        # path code -> trajectory state used by render() and the residual event rate
         with self._ac(z):
             out = self.decoder(p["x"], z)
-        H, W, B = p["H"], p["W"], z.shape[0]
-        crop = lambda t: t[..., :H, :W]
-        a, b, d, u, g, q, e, w = crop(out.float()).split(
-            [2 * self.K, 2 * self.K, self.K + 1, int(self.uncertainty), int(self.tube), int(self.texture), 3 * int(self.detail),
-             int(self.wiggle)], 1)
+        H, W, B, K = p["H"], p["W"], z.shape[0], self.K
+        a, b, d, kap, nu = out.float()[..., :H, :W].split([2 * K, 2 * K, VIS + 1, 4, 2], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
-        s = dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), d=bound(d, 6.0), ds=p["ds"], cfa=p["cfa"],
-                 a=bound(a, self.flow_scale).reshape(B, self.K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, self.K, 2, H, W))
-        if self.uncertainty:
-            sig = 0.01 * bound(u, 3.0).exp()  # arrival-time uncertainty (gap units), 0.01 at z = 0, range 0.0005 - 0.2
-            s["sig"] = sig if self.sig_max is None else self.sig_max * torch.tanh(sig / self.sig_max)  # optional lower cap
-        if self.tube:  # log factor on the measured tube width: x0.05 (real small changes) to x2.7, x1 at z = 0
-            s["tube"] = torch.where(g < 0, 3 * torch.tanh(g / 3), torch.tanh(g))
-        if self.texture:  # extra up-and-down change per unit of path change (texture the frames do not show), 0.01 at z = 0
-            s["texture"] = TEX0 * bound(q, 8.0).exp()
-            if hasattr(self, "log_q_odds"):  # share of texture events with the polarity of the path's slope (per sample)
-                s["tex_q"] = torch.sigmoid(self.log_q_odds[p["ds"]])
-        if self.detail:
-            # detail image (log brightness) on both keyframes: a mean per frame (e.g. sharper edges, +-2) and a random part
-            # sigma * n that lives at frame 0 and is moved to frame 1 by the path's own flow, so render() moves it with the
-            # frames and small things the frames don't show make connected curves in x-t / y-t
-            sig = DETAIL0 * bound(e[:, 2:], 5.0).exp()
-            n = torch.randn_like(sig) if n is None else n
-            F0 = self.flows(s, torch.ones(B, 1, 1, 1, device=z.device))[0]  # frame-1 pixel -> frame-0 position
-            s["D0"] = bound(e[:, :1], 2.0) + sig * n
-            s["D1"] = bound(e[:, 1:2], 2.0) + warp(sig * n, F0)
-            s["sig_detail"] = sig
-            s["frame0"], s["frame1"] = s["y0"], s["y1"]  # the frames themselves (noise table, tube width)
-            s["y0"], s["y1"] = s["y0"] * s["D0"].exp(), s["y1"] * s["D1"].exp()
-        if self.wiggle:  # size of the hidden brightness wiggle (log units), 0.01 at z = 0, up to 1.5
-            s["wiggle"] = WIGGLE0 * bound(w, 5.0).exp()
-        if self.painter is not None:
-            s["feat"] = crop(p["x"])  # frame features for the texture painter
-        return s
-
-    def paint(self, s, seen, randn, grain=PAINT_GRAIN):
-        # the wiggle's texture for this gap on the frame-0 plane, wide enough for every point the pixels see (seen: (B, 2,
-        # H, W) per tau step, frame-0 px): the painter, or without it Gaussian noise blurred over `grain` px. Scaled so one
-        # pixel of motion along the flow changes it by 1 on average over ~16 px around, so its events match the likelihood's
-        # count (model.wiggle_rate) everywhere and the painter only sets the look. randn(shape) draws the noise.
-        # Returns: points (B, 2, H, W) -> texture (B, 1, H, W)
-        B, (H, W) = seen[0].shape[0], seen[0].shape[-2:]
-        M = max(H, W)  # no texture further than M px outside the image
-        lo = torch.stack([q.amin((0, 2, 3)) for q in seen]).amin(0).floor().clamp(min=-M) - 1
-        hi = torch.stack([q.amax((0, 2, 3)) for q in seen]).amax(0).ceil().clamp(max=2 * M) + 1
-        nx, ny = (int(v) + 1 for v in hi - lo)
-        r = math.ceil(3 * grain) + 16  # margin for the blur and the painter's reach, cut off at the end
-        x0, y0 = r - int(lo[0]), r - int(lo[1])  # where image pixel (0, 0) sits on the padded canvas
-        pad = (x0, nx + 2 * r - x0 - W, y0, ny + 2 * r - y0 - H)
-        if self.painter is None:
-            T = gauss_blur(randn((B, 1, ny + 2 * r, nx + 2 * r)), grain)
-        else:
-            z = randn((B, PAINT_NOISE, ny + 2 * r, nx + 2 * r))
-            feat = F.pad(torch.cat([s["feat"], torch.ones_like(s["feat"][:, :1])], 1), pad)
-            T = self.painter.base * gauss_blur(z[:, :1], PAINT_GRAIN) + self.painter(torch.cat([feat, z], 1))
-        u = F.pad(s["f01"], pad, mode="replicate")  # direction of motion (frame 0 -> 1), extended past the image
-        n = u.norm(dim=1, keepdim=True)
-        u = u / n.clamp(min=1e-6)
-        dx, dy = F.pad(T[..., 1:] - T[..., :-1], (0, 1)), F.pad(T[..., 1:, :] - T[..., :-1, :], (0, 0, 0, 1))
-        slope = torch.where(n > 0.5, (u[:, :1] * dx + u[:, 1:] * dy).abs(), (dx.abs() + dy.abs()) / 2)
-        T = (T * gauss_blur(torch.ones_like(T), 8.0) / (gauss_blur(slope, 8.0) + 1e-6))[..., r:-r, r:-r]
-        size = torch.tensor([nx - 1, ny - 1], device=T.device, dtype=T.dtype).view(1, 2, 1, 1)
-        return lambda q: F.grid_sample(T, ((q - lo.view(1, 2, 1, 1)) / size * 2 - 1).permute(0, 2, 3, 1), align_corners=True)
+        crop = lambda t: t[..., :H, :W]
+        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), ds=p["ds"], cfa=p["cfa"],
+                    a=bound(a, self.flow_scale).reshape(B, K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, K, 2, H, W),
+                    d=bound(d, 6.0),
+                    # residual events per threshold of raw path change, (B, ON / OFF, rise / fall, H, W): 0.01 at z = 0
+                    kappa=KAPPA0 * bound(kap, 8.0).exp().view(B, 2, 2, H, W),
+                    # background events per pixel per second, (B, ON / OFF, H, W): model.nu split evenly at z = 0
+                    nu=self.nu0 / 2 * bound(nu, 8.0).exp())
 
     def flows(self, s, tau):
         # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:
@@ -638,10 +528,10 @@ class EvTween(nn.Module):
 
     def render(self, s, tau):
         # log intensity L(tau) and its analytic derivative dL/dtau, tau: (B,) or (B,1,H,W)
-        # Y = (w0*Y0(p+F0) + w1*Y1(p+F1)) / (w0+w1),  w0=(1-tau)V, w1=tau(1-V),  V = sigmoid(poly(tau))
+        # Y = (w0*Y0(p+F0) + w1*Y1(p+F1)) / (w0+w1),  w0=(1-tau)V, w1=tau(1-V),  V = sigmoid(cubic in tau)
         tau = tau.view(-1, 1, 1, 1) if tau.dim() == 1 else tau
         F0, dF0, F1, dF1 = self.flows(s, tau)
-        j = torch.arange(1, self.K + 1, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1)
+        j = torch.arange(1, VIS + 1, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1)
         z = s["d"][:, :1] + (s["d"][:, 1:] * tau ** j).sum(1, keepdim=True)
         dz = (s["d"][:, 1:] * j * tau ** (j - 1)).sum(1, keepdim=True)
         V = torch.sigmoid(z)
@@ -659,18 +549,8 @@ class EvTween(nn.Module):
         return torch.log(Y + self.eps), dY / (Y + self.eps), Y
 
 
-def head_rows(m):
-    # decoder outputs in order, name -> number of channels, for a config's "model" section (defaults as in build_model)
-    K, on = m.get("K", 3), lambda key: int(bool(m.get(key, False)))
-    return dict(a=2 * K, b=2 * K, d=K + 1, sig=on("uncertainty"), tube=on("tube"), texture=on("texture"), detail=3 * on("detail"),
-                wiggle=on("wiggle"))
-
-
 def build_model(cfg):
-    # configs from before the uncertainty output / the tube have no "uncertainty" / "tube" key: build those checkpoints without.
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**{"uncertainty": False, "tube": False, "texture": False, "measure_c": False, "detail": False, "wiggle": False,
-                      "painter": False, "texture_pol": False, **cfg["model"]},
-                   bins=cfg["data"]["bins"], gammas=gammas)
+    return EvTween(**cfg["model"], bins=cfg["data"]["bins"], gammas=gammas)

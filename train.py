@@ -11,13 +11,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from data import JointBatches, JointDataset, collate, datasets
 from losses import compute, diagnostics
-from model import build_model, head_rows
+from model import build_model
 
-# which parameters each stage trains (pretrained RAFT / video backbone always stay frozen)
+# which parameters each stage trains (pretrained RAFT / video backbone always stay frozen);
+# interp: the teacher alone (decoder, sensor and student frozen), for frame interpolation
 TRAIN = {"probe": ("student.", "to_counts."),
-         "teacher": ("teacher.", "detail_enc.", "painter.", "decoder.", "log_", "w_rgb"),
+         "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
          "student": ("student.", "to_z."),
-         "joint": ("teacher.", "detail_enc.", "painter.", "decoder.", "student.", "to_z.", "log_", "w_rgb")}
+         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_", "w_rgb"),
+         "interp": ("teacher.",)}
 
 
 def load_cfg(argv):
@@ -66,35 +68,15 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     ck0 = torch.load(T["init"], map_location=dev, weights_only=False)
     sd, own = ck0["model"], model.state_dict()
     sd = {k: v.expand_as(own[k]).clone() if k in own and v.dim() == 0 and own[k].dim() == 1 else v for k, v in sd.items()}  # one sensor -> all
-    # decoder outputs added or removed (tube factor, texture, detail image): rows matched by name, new ones start at 0
-    old, new = head_rows(ck0["cfg"]["model"]), head_rows(cfg["model"])
-    k = "decoder.head.weight"
-    grow = [k] if k in sd and k in own and len(sd[k]) == sum(old.values()) and own[k].shape[1:] == sd[k].shape[1:] and old != new else []
-    if grow:
-        at = lambda rows, name: sum(list(rows.values())[:list(rows).index(name)])  # first row of an output
-        w = own[k].clone()
-        for name in old.keys() & new.keys():
-            if old[name] == new[name]:
-                w[at(new, name):at(new, name) + new[name]] = sd[k][at(old, name):at(old, name) + old[name]]
-        sd[k] = w
     skip = sorted({k.split(".")[0] for k, v in sd.items() if k in own and own[k].shape != v.shape})
     model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
-    if rank == 0 and grow:
-        print(f"init: decoder outputs {old} -> {new}, matched by name, new ones start at 0", flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
-params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(("painter.", "log_q_odds"))]
-paint = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("painter.")]
-qs = [p for n, p in model.named_parameters() if p.requires_grad and n == "log_q_odds"]
+params = [p for p in model.parameters() if p.requires_grad]
 groups = [{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
           {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}]
-if paint:  # the texture painter starts from scratch even in a fine-tune: its own, larger learning rate (x train.painter_lr)
-    groups.append({"params": paint, "weight_decay": 0.0, "scale": float(T.get("painter_lr", 10.0))})
-if qs:  # one number per dataset (texture polarity share): at a fine-tune lr it would take ~20k steps to move, so x train.q_lr
-    groups.append({"params": qs, "weight_decay": 0.0, "scale": float(T.get("q_lr", 30.0))})
-params = params + paint + qs
 opt = torch.optim.AdamW(groups, lr=T["lr"], betas=(0.9, 0.99))
 ckpt, step = os.path.join(T["out"], "last.pt"), 0
 if os.path.exists(ckpt):
@@ -137,7 +119,7 @@ def validate(val):
         if stage == "probe":
             out = dict(probe=compute(model, batch, cfg["loss"], stage)[0].item())
         else:
-            out = diagnostics(model, batch, cfg["loss"], student=stage != "teacher")
+            out = diagnostics(model, batch, cfg["loss"], student=stage not in ("teacher", "interp"))
         sums = {k: sums.get(k, 0) + v for k, v in out.items()}
         n += 1
     model.train()
@@ -162,10 +144,10 @@ while step < T["steps"]:
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
             d = int(batch["ds"][0])  # the sensor of this batch's dataset
-            C, K, nu, R = (v[0] for v in model.sensor(batch["ds"][:1]))
+            C, K, R = (v[0] for v in model.sensor(batch["ds"][:1]))
             sec = (time.time() - tic) / n_log  # per step since the last log line (validation left out)
             print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {C[0].item():.3f} r {(C[1] / C[0]).item():.3f} "
-                  f"k {K.item():.2f} nu {nu.item():.2f} R {R.item() * 1e6:.0f}us "
+                  f"k {K.item():.2f} R {R.item() * 1e6:.0f}us "
                   f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} | {T['batch'] * (dist.get_world_size() if ddp else 1) / sec:.1f} samples/s "
                   f"ETA {timedelta(seconds=int((T['steps'] - step) * sec))}", flush=True)
             tic, n_log = time.time(), 0

@@ -45,7 +45,7 @@ except Exception:
 def render_rgb(s, i0, i1, tau, g):
     tau = tau.view(-1, 1, 1, 1)
     F0, _, F1, _ = model.flows(s, tau)
-    j = torch.arange(1, model.K + 1, device=dev, dtype=tau.dtype).view(1, -1, 1, 1)
+    j = torch.arange(1, s["d"].shape[1], device=dev, dtype=tau.dtype).view(1, -1, 1, 1)
     V = torch.sigmoid(s["d"][:, :1] + (s["d"][:, 1:] * tau ** j).sum(1, keepdim=True))
     w0, w1 = (1 - tau) * V, tau * (1 - V)
     out = (w0 * warp(i0 ** g, F0) + w1 * warp(i1 ** g, F1)) / (w0 + w1 + 1e-6)
@@ -91,8 +91,7 @@ for name, ds in datasets(D, args.split, False).items():
             z = {"frames only (z=0)": torch.zeros_like(zt), "teacher (frames + events)": zt}
             if args.student:
                 z["student (frames)"] = model.predict(b["ctx"], b["ctx_tau"], b["dt"])
-            n = model.detail_code(p, b["voxel"], sample=False)[0] if model.detail else None
-            s = {m: model.decode(p, z[m], n if m.startswith("teacher") else None) for m in z}
+            s = {m: model.decode(p, z[m]) for m in z}
             for j in range(b["mid"].shape[1]):
                 tau, gt = b["mid_tau"][:, j], b["mid"][:, j]
                 pred = {"blend": (((1 - tau).view(-1, 1, 1, 1) * b["i0"] ** g + tau.view(-1, 1, 1, 1) * b["i1"] ** g) ** (1 / g))}
