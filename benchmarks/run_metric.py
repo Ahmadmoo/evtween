@@ -163,12 +163,16 @@ def read_events(path, meta):
     return events
 
 
-def voxel_planes(events, edges, h, w):
+def voxel_planes(events, edges, h, w, *, by_polarity=False):
     cuts = np.searchsorted(events["t"], edges)
     for a, b in zip(cuts[:-1], cuts[1:]):
         pixels = events["y"][a:b].astype(np.int64)*w + events["x"][a:b]
-        yield np.bincount(pixels, weights=np.where(events["p"][a:b] > 0, 1, -1),
-                          minlength=h*w).reshape(h, w)
+        on = events["p"][a:b] > 0
+        if by_polarity:
+            ids = pixels + (~on) * (h * w)
+            yield np.bincount(ids, minlength=2*h*w).reshape(2, h, w)
+        else:
+            yield np.bincount(pixels, weights=np.where(on, 1, -1), minlength=h*w).reshape(h, w)
 
 
 @contextmanager
@@ -289,6 +293,8 @@ def export_csv(db, folder, metric):
         fields.append("missing_polarity_cost")
     if metric == "chamfer_count":
         fields.extend(["chamfer_geometry", "count_excess", "count_deficit", "count_penalty"])
+    if metric in ("voxel_mae", "voxel_rmse"):
+        fields.extend(["value_on", "value_off"])
     if metric in ARRAYS:
         fields.append("array_path")
     with atomic_file(folder / "results.csv") as stream:
@@ -357,6 +363,13 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                         row["status"] = "undefined"
                     elif row["chamfer_on"] is None or row["chamfer_off"] is None:
                         row["status"] = "partial_polarity"
+                elif metric in ("voxel_mae", "voxel_rmse"):
+                    w, h = meta["width"], meta["height"]
+                    compare = getattr(voxel_metric, metric + "_by_polarity")
+                    parts = compare(voxel_planes(events, edges, h, w, by_polarity=True),
+                                    voxel_planes(seq.gt, edges, h, w, by_polarity=True))
+                    value = parts["value"]
+                    row.update(parts)
                 else:
                     value, arrays, row["status"] = score(metric, events, seq, config["options"])
             if digest([stamp(p) for p in paths]) != signature:
@@ -371,6 +384,8 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                 row["array_path"] = rel.as_posix()
     except Exception as exc:
         row.update(value=None, status="error", array_path="")
+        if metric in ("voxel_mae", "voxel_rmse"):
+            row.update(value_on=None, value_off=None)
         if metric in FULL_CHAMFERS:
             row.update(chamfer_on=None, chamfer_off=None)
         print(f"  {name}/{method}: {exc}", flush=True)
