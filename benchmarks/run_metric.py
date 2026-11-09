@@ -68,6 +68,8 @@ def settings(args):
             options["one_sided_absence"] = "scoring_domain_diameter"
         if metric == "chamfer_count":
             options.update(count_weight=args.count_weight, count_bins="RGB frame intervals by polarity")
+    elif metric in ("voxel_mae", "voxel_rmse"):
+        options["block_size"] = args.voxel_block_size
     elif metric == "event_rate":
         options["bin_s"] = args.rate_bin_s
     elif metric == "same_ts":
@@ -209,11 +211,27 @@ def native_planes(path, edges, h, w):
             yield planes()
 
 
-def voxel_score(metric, prediction, gt, edges, h, w):
+def block_means(planes, block_size):
+    """Average counts per pixel in each non-overlapping block of each frame gap."""
+    if block_size == 1:
+        yield from planes
+        return
+    for plane in planes:
+        h, w = plane.shape[-2:]
+        rows = np.arange(0, h, block_size)
+        cols = np.arange(0, w, block_size)
+        sums = np.add.reduceat(plane, rows, axis=-2, dtype=np.float64)
+        sums = np.add.reduceat(sums, cols, axis=-1)
+        areas = np.diff(np.append(rows, h))[:, None] * np.diff(np.append(cols, w))
+        yield sums / areas
+
+
+def voxel_score(metric, prediction, gt, edges, h, w, block_size=1):
     # Accumulate sufficient statistics, so inactive pixels and all intervals
     # receive the same weight as in voxel_metric on the full dense tensor.
     totals = np.zeros(4, dtype=np.float64)
-    for pred, ref in zip(prediction, voxel_planes(gt, edges, h, w)):
+    reference = voxel_planes(gt, edges, h, w)
+    for pred, ref in zip(block_means(prediction, block_size), block_means(reference, block_size)):
         totals += voxel_metric._errors(pred[None], ref[None], None)
     absolute, squared, mass, count = totals
     if metric == "voxel_relative_l1":
@@ -261,7 +279,8 @@ def score(metric, events, seq, options):
         if np.any(arrays["pred_active"] != arrays["gt_active"]):
             status = "partial_support"
     elif metric.startswith("voxel_"):
-        value = voxel_score(metric, voxel_planes(events, edges, h, w), seq.gt, edges, h, w)
+        value = voxel_score(metric, voxel_planes(events, edges, h, w), seq.gt, edges, h, w,
+                            options.get("block_size", 1))
     else:
         value = getattr(m, metric)(events, **options)
     if value is not None and not np.isfinite(value):
@@ -341,7 +360,8 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
             if native:
                 h, w = meta["height"], meta["width"]
                 with native_planes(file, edges, h, w) as planes:
-                    value = voxel_score(metric, planes, seq.gt, edges, h, w)
+                    value = voxel_score(metric, planes, seq.gt, edges, h, w,
+                                        config["options"].get("block_size", 1))
                 if not np.isfinite(value):
                     value, row["status"] = None, "undefined"
             else:
@@ -366,8 +386,10 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                 elif metric in ("voxel_mae", "voxel_rmse"):
                     w, h = meta["width"], meta["height"]
                     compare = getattr(voxel_metric, metric + "_by_polarity")
-                    parts = compare(voxel_planes(events, edges, h, w, by_polarity=True),
-                                    voxel_planes(seq.gt, edges, h, w, by_polarity=True))
+                    size = config["options"].get("block_size", 1)
+                    pred = voxel_planes(events, edges, h, w, by_polarity=True)
+                    gt = voxel_planes(seq.gt, edges, h, w, by_polarity=True)
+                    parts = compare(block_means(pred, size), block_means(gt, size))
                     value = parts["value"]
                     row.update(parts)
                 else:
@@ -457,7 +479,13 @@ def main():
     parser.add_argument("--pred-root", type=Path, default=ROOT / "data_test_evt")
     parser.add_argument("--report-root", type=Path, default=ROOT / "reports")
     parser.add_argument("--count-weight", type=float, help="Count penalty weight for chamfer_count (default: 1.0 pixel-equivalent)")
+    parser.add_argument("--voxel-block-size", type=int, default=1, metavar="N",
+                        help="Average each N x N spatial block before voxel MAE/RMSE (default: 1)")
     args = parser.parse_args()
+    if args.voxel_block_size < 1:
+        parser.error("--voxel-block-size must be positive")
+    if args.voxel_block_size != 1 and args.metric not in ("voxel_mae", "voxel_rmse"):
+        parser.error("--voxel-block-size applies to voxel_mae and voxel_rmse")
     if args.count_weight is not None:
         if args.metric != "chamfer_count" or not np.isfinite(args.count_weight) or args.count_weight < 0:
             parser.error("--count-weight requires chamfer_count and a finite nonnegative value")
