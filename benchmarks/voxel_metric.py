@@ -50,3 +50,41 @@ def voxel_relative_l1(prediction, reference, support=None):
     """Sum of absolute errors / sum of absolute GT counts; zero GT mass gives NaN."""
     absolute, _, mass, _ = _errors(prediction, reference, support)
     return float(absolute / mass) if mass else np.nan
+
+
+def _polarity_scores(prediction, reference, squared):
+    # Each input yields one (2, H, W) array per frame interval, ON then OFF.
+    from itertools import zip_longest
+
+    totals = np.zeros(3, dtype=np.float64)
+    count = 0
+    spatial_shape = None
+    for pred, gt in zip_longest(prediction, reference):
+        if pred is None or gt is None:
+            raise ValueError("Prediction and reference must have the same number of intervals")
+        pred, gt = np.asarray(pred), np.asarray(gt)
+        if pred.ndim != 3 or pred.shape[0] != 2 or pred.shape != gt.shape:
+            raise ValueError("Expected matching (2, height, width) ON/OFF planes")
+        if spatial_shape is not None and pred.shape[1:] != spatial_shape:
+            raise ValueError("Spatial dimensions must be constant across intervals")
+        spatial_shape = pred.shape[1:]
+        if any(a.dtype.kind not in "iuf" or not np.isfinite(a).all() or np.any(a < 0)
+               for a in (pred, gt)):
+            raise ValueError("ON/OFF counts must be finite and nonnegative")
+        on, off = np.subtract(pred, gt, dtype=np.float64)
+        for i, error in enumerate((on - off, on, off)):
+            totals[i] += np.square(error).sum() if squared else np.abs(error).sum()
+        count += on.size
+    means = totals / count if count else np.full(3, np.nan)
+    values = np.sqrt(means) if squared else means
+    return dict(zip(("value", "value_on", "value_off"), map(float, values)))
+
+
+def voxel_mae_by_polarity(prediction, reference):
+    """Signed, ON and OFF MAE over aligned (interval, 2, H, W) counts, ON first."""
+    return _polarity_scores(prediction, reference, squared=False)
+
+
+def voxel_rmse_by_polarity(prediction, reference):
+    """Signed, ON and OFF RMSE over aligned (interval, 2, H, W) counts, ON first."""
+    return _polarity_scores(prediction, reference, squared=True)
