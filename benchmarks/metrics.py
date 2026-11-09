@@ -208,6 +208,36 @@ def chamfer_penalty(events, reference, width, duration_s, *, height, start_s=0.0
     return scores
 
 
+def iei_distance(events, reference, width, duration_s, *, start_s=0.0):
+    """FracEvent Eq. S3 for one paired, pre-clipped window (timestamps in seconds).
+
+    Pool positive consecutive intervals per pixel across both polarities. Return
+    the empirical W1 distance in log10 units, or NaN if either sample is empty.
+    """
+    _positive(duration_s, "duration_s")
+
+    def log_intervals(stream):
+        t = _times(stream)
+        if not np.isfinite(start_s) or np.any(t < start_s) or np.any(t >= start_s + duration_s):
+            raise ValueError("Events must be inside the common half-open scoring interval")
+        x, y = _coordinates(stream, t, width)
+        pixel = y * width + x
+        order = np.lexsort((t, pixel))
+        pixel = pixel[order]
+        delta = np.diff(t[order])[pixel[1:] == pixel[:-1]]
+        return np.sort(np.log10(np.maximum(delta[delta > 0], 1e-6)))
+
+    pred, ref = log_intervals(events), log_intervals(reference)
+    if not pred.size or not ref.size:
+        return np.nan
+
+    # In one dimension W1 is the integral of the absolute empirical CDF gap.
+    grid = np.union1d(pred, ref)
+    pred_cdf = np.searchsorted(pred, grid[:-1], side="right") / pred.size
+    ref_cdf = np.searchsorted(ref, grid[:-1], side="right") / ref.size
+    return float(np.dot(np.diff(grid), np.abs(pred_cdf - ref_cdf)))
+
+
 def isi_distribution(events, width, duration_s, *, start_s=0.0):
     """Return all same-pixel inter-event intervals in ms, including zero ties."""
     pixel, tau, _ = _layout(events, width, duration_s, start_s)
