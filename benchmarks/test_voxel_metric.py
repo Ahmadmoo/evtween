@@ -116,6 +116,10 @@ class VoxelMetrics(unittest.TestCase):
                                     capture_output=True, text=True)
             self.assertEqual(legacy.returncode, 0, legacy.stdout + legacy.stderr)
             self.assertIn('ok seq/v2v', legacy.stdout)
+            rejected = subprocess.run(command + ['--metric', 'voxel_mae', '--voxel-block-size', '2'],
+                                      capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('Spatial block averaging is disabled', rejected.stderr)
 
 
 if __name__ == '__main__':

@@ -82,7 +82,8 @@ def settings(args):
                            protocol="benchmark adaptation; not author-code/table reproduction",
                            kernel=int(metric.split("_")[1]))
         else:
-            options["block_size"] = args.voxel_block_size
+            if args.legacy_frame_voxels:
+                options["block_size"] = args.voxel_block_size
             options["native_v2v_protocol"] = "legacy frame edges; signed counts only"
     elif metric == "event_rate":
         options["bin_s"] = args.rate_bin_s
@@ -503,7 +504,7 @@ def main():
     parser.add_argument("--report-root", type=Path, default=ROOT / "reports")
     parser.add_argument("--count-weight", type=float, help="Count penalty weight for chamfer_count (default: 1.0 pixel-equivalent)")
     parser.add_argument("--voxel-block-size", type=int, default=1, metavar="N",
-                        help="Average each N x N spatial block before voxel MAE/RMSE (default: 1)")
+                        help="Historical frame-pair mode only: spatial averaging (requires --legacy-frame-voxels)")
     parser.add_argument("--voxel-temporal-bins", type=int, default=160,
                         help="Uniform bins over the entire shared interval (default: 160)")
     parser.add_argument("--legacy-frame-voxels", action="store_true",
@@ -517,6 +518,8 @@ def main():
         parser.error("PMSE requires at least kernel-size temporal bins")
     if args.voxel_block_size < 1:
         parser.error("--voxel-block-size must be positive")
+    if args.voxel_block_size != 1 and not args.legacy_frame_voxels:
+        parser.error("Spatial block averaging is disabled for full-interval metrics; use the full image and temporal bins")
     if args.voxel_block_size != 1 and args.metric not in ("voxel_mae", "voxel_rmse"):
         parser.error("--voxel-block-size applies to voxel_mae and voxel_rmse")
     if args.count_weight is not None:

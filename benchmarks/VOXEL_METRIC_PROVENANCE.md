@@ -74,7 +74,13 @@ retain their signatures and array arithmetic. They are legacy benchmark
 metrics, not attributed to any of the papers above. For event-stream input,
 the runner now bins the full shared interval uniformly for all `voxel_*`
 metrics (histogram signed counts, as before, without PMSE temporal interpolation).
-Spatial `--voxel-block-size` retains its previous partial-block averaging.
+Full-interval metrics use the entire available H×W image without spatial block
+averaging. `--voxel-block-size` values other than 1 are rejected unless explicit
+historical `--legacy-frame-voxels` mode is selected. Partial-block spatial
+averaging is retained only for historical reproduction. The watchboard excludes
+historical spatially averaged reports and displays metric/polarity columns only.
+The existing generation geometry may already crop source images; these changes
+do not regenerate predictions or reconstruct pixels outside their saved crop.
 
 Native V2V files contain frame-interval signed arrays, without recoverable
 event timestamps or separate polarities. Default full-interval metrics return
