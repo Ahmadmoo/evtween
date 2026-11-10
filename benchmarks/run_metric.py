@@ -31,6 +31,8 @@ UNITS = dict(event_count="events", event_count_ratio="ratio", on_percentage="per
              fano_factor="mean absolute log ratio", voxel_mae="events/voxel",
              voxel_rmse="events/voxel", voxel_relative_l1="ratio")
 FULL_CHAMFERS = {"chamfer_full", "chamfer_penalty", "chamfer_count"}
+PMSE = {"pmse_2_v2ce", "pmse_4_v2ce"}
+UNITS.update({name: "squared events/voxel" for name in PMSE})
 ARRAYS = {"isi_distribution", "event_rate", "fano_factor"}
 DESCRIPTIVE = {"event_count", "on_percentage", "isi_distribution", "isi_median_ms",
                "isi_cv", "event_rate", "same_ts"}
@@ -68,8 +70,20 @@ def settings(args):
             options["one_sided_absence"] = "scoring_domain_diameter"
         if metric == "chamfer_count":
             options.update(count_weight=args.count_weight, count_bins="RGB frame intervals by polarity")
-    elif metric in ("voxel_mae", "voxel_rmse"):
-        options["block_size"] = args.voxel_block_size
+    elif metric in PMSE or metric.startswith("voxel_"):
+        options.update(temporal_bins=args.voxel_temporal_bins,
+                       temporal_domain=("legacy frame pairs" if args.legacy_frame_voxels else "uniform full shared interval"),
+                       legacy_frame_voxels=args.legacy_frame_voxels,
+                       normalization="none")
+        if metric in PMSE:
+            options.update(voxelization="forward linear box integration; clipped at stop",
+                           pooling="valid 3D; kernel=stride; polarity separate",
+                           provenance="https://arxiv.org/html/2309.08891v2; III-A PMSE, II-B representation",
+                           protocol="benchmark adaptation; not author-code/table reproduction",
+                           kernel=int(metric.split("_")[1]))
+        else:
+            options["block_size"] = args.voxel_block_size
+            options["native_v2v_protocol"] = "legacy frame edges; signed counts only"
     elif metric == "event_rate":
         options["bin_s"] = args.rate_bin_s
     elif metric == "same_ts":
@@ -244,7 +258,11 @@ def score(metric, events, seq, options):
     duration, w, h = float(edges[-1]), meta["width"], meta["height"]
     arrays = {}
     status = "ok"
-    if metric == "event_rate":
+    if metric in PMSE:
+        value = getattr(voxel_metric, metric)(events, seq.gt, start=float(edges[0]),
+                    stop=float(edges[-1]), temporal_bins=options["temporal_bins"],
+                    height=h, width=w)
+    elif metric == "event_rate":
         bins = np.arange(0, duration, options["bin_s"])
         bins = np.append(bins[bins < duration], duration)
         arrays = dict(edges_s=bins, rate_hz=m.event_rate(events, bins))
@@ -279,6 +297,8 @@ def score(metric, events, seq, options):
         if np.any(arrays["pred_active"] != arrays["gt_active"]):
             status = "partial_support"
     elif metric.startswith("voxel_"):
+        if not options.get("legacy_frame_voxels", False):
+            edges = np.linspace(edges[0], edges[-1], options["temporal_bins"] + 1)
         value = voxel_score(metric, voxel_planes(events, edges, h, w), seq.gt, edges, h, w,
                             options.get("block_size", 1))
     else:
@@ -346,7 +366,8 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
     try:
         if not ground and not file.is_file():
             row["status"] = "missing_prediction"
-        elif native and not metric.startswith("voxel_"):
+        elif native and (not metric.startswith("voxel_") or
+                         not config["options"].get("legacy_frame_voxels", False)):
             row["status"] = "not_applicable"
         elif not seq.source.is_dir():
             row["status"] = "missing_source"
@@ -387,6 +408,8 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                     w, h = meta["width"], meta["height"]
                     compare = getattr(voxel_metric, metric + "_by_polarity")
                     size = config["options"].get("block_size", 1)
+                    if not config["options"].get("legacy_frame_voxels", False):
+                        edges = np.linspace(edges[0], edges[-1], config["options"]["temporal_bins"] + 1)
                     pred = voxel_planes(events, edges, h, w, by_polarity=True)
                     gt = voxel_planes(seq.gt, edges, h, w, by_polarity=True)
                     parts = compare(block_means(pred, size), block_means(gt, size))
@@ -481,7 +504,17 @@ def main():
     parser.add_argument("--count-weight", type=float, help="Count penalty weight for chamfer_count (default: 1.0 pixel-equivalent)")
     parser.add_argument("--voxel-block-size", type=int, default=1, metavar="N",
                         help="Average each N x N spatial block before voxel MAE/RMSE (default: 1)")
+    parser.add_argument("--voxel-temporal-bins", type=int, default=160,
+                        help="Uniform bins over the entire shared interval (default: 160)")
+    parser.add_argument("--legacy-frame-voxels", action="store_true",
+                        help="Reproduce old voxel_* frame-pair scores, including native V2V; incompatible with PMSE")
     args = parser.parse_args()
+    if args.legacy_frame_voxels and not args.metric.startswith("voxel_"):
+        parser.error("--legacy-frame-voxels applies only to legacy voxel_* metrics")
+    if args.voxel_temporal_bins < 1:
+        parser.error("--voxel-temporal-bins must be positive")
+    if args.metric in PMSE and args.voxel_temporal_bins < int(args.metric.split('_')[1]):
+        parser.error("PMSE requires at least kernel-size temporal bins")
     if args.voxel_block_size < 1:
         parser.error("--voxel-block-size must be positive")
     if args.voxel_block_size != 1 and args.metric not in ("voxel_mae", "voxel_rmse"):

@@ -1,11 +1,79 @@
-"""Signed-count voxel errors from the ALLTestSet_Eval comparison protocol.
+"""Event-stream PMSE and backward-compatible voxel-array error functions.
 
 Pass aligned arrays of shape (intervals, height, width), using identical physical
-frame edges and crop for prediction and GT. For V2V use the native 'voxels'
-array. support optionally selects a common boolean (height, width) mask.
+time edges and crop for prediction and GT. These legacy array functions do not
+choose time bins. The runner defaults to uniform full-interval bins; native V2V
+is available only with explicit legacy frame-pair scoring. support optionally
+selects a common boolean (height, width) mask.
 Inactive pixels within support are included. No per-stream normalization.
 """
 import numpy as np
+
+
+def _event_voxels(events, *, start, stop, temporal_bins, height, width):
+    """Benchmark representation, not a metric: forward linear temporal weights.
+
+    Shared [start, stop) domain; ON/OFF are separate nonnegative planes.
+    A unit-duration box starting at an event contributes 1-f to its bin and
+    f to the following bin (V2CE II-B). Contributions beyond stop are clipped.
+    No event-count, per-stream or nonzero-voxel normalization is applied.
+    """
+    if (not np.isfinite([start, stop]).all() or stop <= start or
+            any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer))
+                or v < 1 for v in (temporal_bins, height, width))):
+        raise ValueError("Expected finite increasing bounds and positive integer dimensions")
+    t, x, y, p = (np.asarray(events[k]) for k in "txyp")
+    if any(a.ndim != 1 or a.shape != t.shape or a.dtype.kind not in "iuf"
+           or not np.isfinite(a).all() for a in (t, x, y, p)):
+        raise ValueError("Events must have equal finite real 1D txyp arrays")
+    if (np.any(x != np.floor(x)) or np.any(y != np.floor(y)) or
+            np.any((x < 0) | (x >= width) | (y < 0) | (y >= height)) or
+            not np.isin(p, (-1, 0, 1)).all()):
+        raise ValueError("Invalid event coordinates or polarity")
+    keep = (t >= start) & (t < stop)
+    u = (t[keep] - start) / (stop - start) * temporal_bins
+    # Protect floor against rounding of a timestamp immediately below stop.
+    u = np.minimum(u, np.nextafter(float(temporal_bins), -np.inf))
+    b = np.floor(u).astype(np.int64)
+    f = u - b
+    pol = (p[keep] <= 0).astype(np.int64)
+    xx, yy = x[keep].astype(np.int64), y[keep].astype(np.int64)
+    grid = np.zeros((2, temporal_bins, height, width), dtype=np.float64)
+    np.add.at(grid, (pol, b, yy, xx), 1-f)
+    valid = b + 1 < temporal_bins
+    np.add.at(grid, (pol[valid], b[valid]+1, yy[valid], xx[valid]), f[valid])
+    return grid
+
+
+def _pmse_v2ce(prediction, reference, kernel, **domain):
+    """V2CE III-A PMSE formula; see VOXEL_METRIC_PROVENANCE.md for adaptations."""
+    pred = _event_voxels(prediction, **domain)
+    gt = _event_voxels(reference, **domain)
+    _, t, h, w = pred.shape
+    if min(t, h, w) < kernel:
+        raise ValueError("Each pooled dimension must be at least the PMSE kernel")
+    def pool(a):
+        # Valid, unpadded, floor pooling; polarity is a channel, never pooled.
+        nt, nh, nw = t//kernel, h//kernel, w//kernel
+        return a[:, :nt*kernel, :nh*kernel, :nw*kernel].reshape(
+            2, nt, kernel, nh, kernel, nw, kernel).mean(axis=(2, 4, 6))
+    return float(np.mean(np.square(pool(pred) - pool(gt))))
+
+
+def pmse_2_v2ce(prediction, reference, *, start, stop, temporal_bins, height, width):
+    """Pooling MSE (k=stride=2), from two txyp event streams on one domain.
+
+    Formula follows V2CE III-A; full-interval protocol is a benchmark adaptation.
+    https://arxiv.org/html/2309.08891v2#S3.SS1
+    """
+    return _pmse_v2ce(prediction, reference, 2, start=start, stop=stop,
+                     temporal_bins=temporal_bins, height=height, width=width)
+
+
+def pmse_4_v2ce(prediction, reference, *, start, stop, temporal_bins, height, width):
+    """Pooling MSE (k=stride=4); same domain and conventions as pmse_2_v2ce."""
+    return _pmse_v2ce(prediction, reference, 4, start=start, stop=stop,
+                     temporal_bins=temporal_bins, height=height, width=width)
 
 
 def _errors(prediction, reference, support):
