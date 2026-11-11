@@ -22,11 +22,21 @@ LAB = PROJECT.parent
 BASELINES = ("v2e", "iebcs", "dvs_voltmeter", "v2ce", "v2v", "evis_core")
 EVTWEEN = {f"evtween_{v}_{mode}": (v, mode)
            for v in ("v5.2", "v5.3") for mode in ("teacher", "student")}
+EVTWEEN["evtween_v7_teacher"] = ("v7", "teacher")
 METHODS = (*BASELINES, "fracevent", *EVTWEEN)
 
 
 def setting(key, default):
     return Path(os.environ.get(key, default)).expanduser().resolve()
+
+
+def evtween_checkout(version):
+    paths = {
+        "v5.2": ("EVTWEEN_V52_ROOT", LAB / "evtween_bnchmark-v5.2"),
+        "v5.3": ("EVTWEEN_V53_ROOT", PROJECT),
+        "v7": ("EVTWEEN_V7_ROOT", LAB / "evtween_bnchmark-v7"),
+    }
+    return setting(*paths[version])
 
 
 def run_logged(command, log):
@@ -61,8 +71,7 @@ def generate_one(method, dataset, run, assets, work, log):
                    "--device", os.getenv("FRACEVENT_DEVICE", "cpu"), "--output", raw]
     else:
         version, mode = EVTWEEN[method]
-        checkout = (setting("EVTWEEN_V52_ROOT", LAB / "evtween_bnchmark-v5.2")
-                    if version == "v5.2" else setting("EVTWEEN_V53_ROOT", PROJECT))
+        checkout = evtween_checkout(version)
         weights = setting("EVTWEEN_WEIGHTS", LAB / "evtween-tides-compare" /
                           "benchmarks/event_generation/checkpoints/evtween_versions")
         checkpoint = weights / version / ("model.pt" if mode == "teacher" else "student.pt")
