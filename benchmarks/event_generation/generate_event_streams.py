@@ -53,7 +53,7 @@ def generate_one(method, dataset, run, assets, work, log):
         run_logged(command, log)
         return folder / ("voxels.npz" if method == "v2v" else "events.npz")
     if method == "fracevent":
-        simulator = setting("FRACEVENT_ROOT", LAB / "FracEvent")
+        simulator = setting("FRACEVENT_ROOT", LAB / "evtween_bnchmark/FracEvent")
         python = setting("FRACEVENT_PYTHON", sys.executable)
         command = [python, simulator / "main.py", "simulate", "--config",
                    setting("FRACEVENT_CONFIG", simulator / "configs/davis346.yaml"),
