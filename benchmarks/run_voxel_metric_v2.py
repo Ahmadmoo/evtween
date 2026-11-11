@@ -14,11 +14,11 @@ from benchmarks import voxel_metric_v2 as metric_v2
 METRICS=("voxel_mae","voxel_rmse","voxel_relative_l1","pmse_2_v2ce_adapted","pmse_4_v2ce_adapted")
 
 
-def main():
+def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('dataset')
     parser.add_argument('split',choices=('train','test'))
-    parser.add_argument('--metric',choices=METRICS,required=True)
+    parser.add_argument('--metric',choices=(*METRICS,'all'),required=True)
     parser.add_argument('--voxel-bin-ms',type=float,required=True)
     parser.add_argument('--voxel-start-s',type=float,default=0.,help='Seconds relative to first source frame')
     parser.add_argument('--voxel-stop-s',type=float,help='Default: last source frame, in relative seconds')
@@ -27,13 +27,22 @@ def main():
     parser.add_argument('--data-root',type=Path)
     parser.add_argument('--pred-root',type=Path,default=old.ROOT/'data_test_evt')
     parser.add_argument('--report-root',type=Path,default=old.ROOT/'reports_voxel_v2')
-    args=parser.parse_args()
+    args=parser.parse_args(argv)
     if Path(args.dataset).name != args.dataset or args.dataset in ('','.','..'):
         parser.error('Expected one dataset directory name')
     if not np.isfinite([args.voxel_bin_ms,args.voxel_start_s]).all() or args.voxel_bin_ms<=0 or args.voxel_start_s<0:
         parser.error('Require finite positive bin width and nonnegative start')
     if args.voxel_stop_s is not None and (not np.isfinite(args.voxel_stop_s) or args.voxel_stop_s<=args.voxel_start_s):
         parser.error('Require finite stop > start')
+    if args.metric=='all':
+        common=[args.dataset,args.split,'--voxel-bin-ms',str(args.voxel_bin_ms),
+                '--voxel-start-s',str(args.voxel_start_s),'--pred-root',str(args.pred_root),
+                '--report-root',str(args.report_root)]
+        for name in ('voxel_stop_s','sequence','data_root'):
+            value=getattr(args,name)
+            if value is not None: common+=['--'+name.replace('_','-'),str(value)]
+        if args.methods: common+=['--methods',*args.methods]
+        return max(main([*common,'--metric',metric]) for metric in METRICS)
     options=dict(protocol=metric_v2.PROTOCOL,bin_ms=args.voxel_bin_ms,start_s=args.voxel_start_s,
                  stop_s=args.voxel_stop_s,final_bin='keep shorter',normalization='none',
                  pmse_boundary='fold overflow into last bin',pooling='partial means; original-cell weighted MSE',
@@ -63,7 +72,7 @@ def main():
         parser.error('No sequences found; check input paths')
     rows=[]; failed=False
     from csv import DictWriter
-    fields=['sequence','method','value','value_on','value_off','status','start_s','stop_s',
+    fields=['sequence','method','value','value_on','value_off','value_aware','value_total','status','start_s','stop_s',
             'bin_ms','temporal_bins','last_bin_ms','height','width','error']
     def export():
         with old.atomic_file(folder/'results.csv') as stream:

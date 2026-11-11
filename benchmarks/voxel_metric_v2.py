@@ -122,6 +122,11 @@ def pmse_4_v2ce_adapted(prediction, reference, **domain):
     return _pmse(prediction,reference,4,**domain)
 
 
+def polarity_aware_from_scores(on, off, *, squared=False):
+    """Combine per-sequence ON/OFF errors; never combine dataset-mean RMSEs."""
+    return float(np.hypot(on,off)/np.sqrt(2)) if squared else float((on+off)/2)
+
+
 def score(metric, prediction, reference, *, edges, height, width, bin_ms):
     """Return report fields. Counts have equal cell weight, including a short final bin."""
     edges=np.asarray(edges,dtype=np.float64)
@@ -131,7 +136,6 @@ def score(metric, prediction, reference, *, edges, height, width, bin_ms):
         return {"value": globals()[metric](prediction,reference,edges=edges,height=height,width=width,bin_ms=bin_ms)}
     if metric not in ("voxel_mae", "voxel_rmse", "voxel_relative_l1"):
         raise ValueError("Unknown metric")
-    from .voxel_metric import voxel_mae_by_polarity, voxel_rmse_by_polarity
     # Bin streaming avoids building full-resolution grids for legacy count errors.
     def planes(events):
         # Validate the whole stream once; avoid an O(events*bins) scan.
@@ -150,5 +154,15 @@ def score(metric, prediction, reference, *, edges, height, width, bin_ms):
             ps,gs=p[0]-p[1],g[0]-g[1]
             absolute+=np.abs(ps-gs).sum(); mass+=np.abs(gs).sum()
         return {"value":float(absolute/mass) if mass else np.nan}
-    compare=voxel_mae_by_polarity if metric == "voxel_mae" else voxel_rmse_by_polarity
-    return compare(planes(prediction),planes(reference))
+    squared=metric == 'voxel_rmse'
+    totals=np.zeros(4,dtype=np.float64);count=0
+    for pred,gt in zip(planes(prediction),planes(reference)):
+        on,off=np.subtract(pred,gt,dtype=np.float64)
+        for i,error in enumerate((on-off,on,off,on+off)):
+            totals[i]+=np.square(error).sum() if squared else np.abs(error).sum()
+        count+=on.size
+    means=totals/count
+    values=np.sqrt(means) if squared else means
+    result=dict(zip(('value','value_on','value_off','value_total'),map(float,values)))
+    result['value_aware']=polarity_aware_from_scores(result['value_on'],result['value_off'],squared=squared)
+    return result

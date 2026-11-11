@@ -10,9 +10,15 @@ import json
 import math
 from pathlib import Path
 import statistics
+import sys
+
+if not __package__:
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from benchmarks.voxel_metric_v2 import polarity_aware_from_scores
 
 METRICS=('voxel_mae','voxel_rmse','voxel_relative_l1','pmse_2_v2ce_adapted','pmse_4_v2ce_adapted')
-CHANNELS={'value':'Signed','value_on':'ON','value_off':'OFF'}
+CHANNELS={'value':'Signed','value_on':'ON','value_off':'OFF',
+          'value_aware':'A · Polarity-aware','value_total':'B · Total ON+OFF'}
 
 
 def _signature(config):
@@ -62,7 +68,7 @@ def matched_curves(reports, methods=None):
         settings={width:item for (m,width),item in reports.items() if m==metric}
         if not settings:
             continue
-        fields=('value','value_on','value_off') if metric in ('voxel_mae','voxel_rmse') else ('value',)
+        fields=('value','value_aware','value_total','value_on','value_off') if metric in ('voxel_mae','voxel_rmse') else ('value',)
         for field in fields:
             grids={}
             for width,item in settings.items():
@@ -73,7 +79,11 @@ def matched_curves(reports, methods=None):
                     if methods and row['method'] not in methods:
                         continue
                     try:
-                        val=float(row[field])
+                        if field=='value_aware':
+                            # Derive A per sequence, including older ON/OFF CSVs.
+                            val=polarity_aware_from_scores(float(row['value_on']),float(row['value_off']),squared=metric=='voxel_rmse')
+                        else:
+                            val=float(row[field])
                         bounds=(float(row['start_s']),float(row['stop_s']),int(row['height']),int(row['width']))
                         count=int(row['temporal_bins']); tail=float(row['last_bin_ms'])
                     except (KeyError,TypeError,ValueError):

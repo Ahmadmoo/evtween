@@ -28,6 +28,21 @@ averaging. Existing generation crops remain; missing source pixels cannot be
 reconstructed. Native signed V2V arrays are not applicable.
 
 Legacy MAE/RMSE/relative L1 retain hard counts and their signed/ON/OFF meanings.
+MAE/RMSE now also report `value_aware` (A) and `value_total` (B), alongside
+unchanged Signed `value`, `value_on`, and `value_off`:
+
+- A MAE = `(MAE_ON + MAE_OFF)/2`.
+- A RMSE = `sqrt((RMSE_ON**2 + RMSE_OFF**2)/2)`.
+- B MAE = `mean(abs(e_ON + e_OFF))`.
+- B RMSE = `sqrt(mean((e_ON + e_OFF)**2))`.
+
+A is explicitly derived from each sequence's ON/OFF scores before the dataset
+mean; do not combine dataset-mean RMSEs. B measures local total counts, not
+signed counts or a single global event-count ratio. All count views are
+accumulated in the same streamed pass per MAE/RMSE invocation. These are
+benchmark definitions, not attributed to a paper. Old CSV ON/OFF fields can
+provide A in the notebook/HTML; B requires rescoring events. Missing B is
+omitted, never treated as zero. Signed remains a diagnostic view.
 Counts are not rates: the shorter final bin has fewer expected counts. Every
 original voxel has equal metric weight, including the final bin; there is no
 duration normalization, per-stream normalization or nonzero-only reduction.
@@ -72,6 +87,18 @@ python benchmarks/run_voxel_metric_v2.py bsergb test --metric voxel_relative_l1 
 python benchmarks/run_voxel_metric_v2.py bsergb test --metric pmse_2_v2ce_adapted --voxel-bin-ms 30
 python benchmarks/run_voxel_metric_v2.py bsergb test --metric pmse_4_v2ce_adapted --voxel-bin-ms 30
 ```
+
+Run every v2 metric, including A/B/Signed columns, at three bin widths (Bash):
+
+```sh
+for bin_ms in 5 10 30; do
+  python benchmarks/run_voxel_metric_v2.py bsergb test --metric all --voxel-bin-ms "$bin_ms" || exit 1
+done
+```
+
+`--metric all` runs the five metric families sequentially; A/B are columns of
+MAE/RMSE, not four extra passes. It returns a nonzero exit code if any family
+fails. Method/path/window options are forwarded to each family.
 
 Optional `--methods v2ce evtween_v5.2_student`, `--sequence NAME`,
 `--voxel-start-s 0.1 --voxel-stop-s 0.5`, and the existing `--data-root`,

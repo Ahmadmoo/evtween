@@ -21,7 +21,7 @@ def fixture(root):
             for sequence,duration in (('s1',.1),('s2',.2)):
                 error=(1 if method=='a' else 2)*width/10
                 rows.append(dict(method=method,sequence=sequence,status='ok',value=error,
-                    value_on=error/2,value_off=error/3,start_s=0,stop_s=duration,height=5,width=7,
+                    value_on=error/2,value_off=error/3,value_total=error*2,start_s=0,stop_s=duration,height=5,width=7,
                     temporal_bins=__import__('math').ceil(duration*1000/width),last_bin_ms=10,bin_ms=width))
         rows.append(dict(rows[0],method='failed',status='error',value=0))
         with (folder/'results.csv').open('w',newline='') as stream:
@@ -29,17 +29,34 @@ def fixture(root):
 
 
 class BinPlots(unittest.TestCase):
+    def test_aware_rmse_is_combined_before_dataset_mean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture(Path(tmp)); reports=next(iter(p.load_reports(tmp).values()))
+            reports={('voxel_rmse',width):item for (_,width),item in reports.items()}
+            for item in reports.values():
+                for row in item['rows']:
+                    row['value_on']=0 if row['sequence']=='s1' else 4
+                    row['value_off']=4 if row['sequence']=='s1' else 0
+                    row.pop('value_total',None)  # Old CSV can supply A, never B.
+            curves,_=p.matched_curves(reports)
+            self.assertFalse(any(c['channel']=='B · Total ON+OFF' for c in curves))
+            aware=next(c for c in curves if c['channel']=='A · Polarity-aware')
+            self.assertAlmostEqual(aware['points'][0]['error'],8**.5)
+            self.assertNotEqual(aware['points'][0]['error'],2.)
+
     def test_matching_and_bin_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture(Path(tmp));groups=p.load_reports(tmp)
             self.assertEqual(len(groups),1)
             reports=next(iter(groups.values()))
             curves,coverage=p.matched_curves(reports)
-            self.assertEqual(len(curves),6)
+            self.assertEqual(len(curves),10)
             self.assertTrue(all(c['n']==2 for c in coverage))
             c=next(c for c in curves if c['method']=='a' and c['channel']=='Signed')
             self.assertEqual([v['error'] for v in c['points']],[1,3])
             self.assertEqual([v['mean_bins'] for v in c['points']],[15,5.5])
+            aware=next(c for c in curves if c['method']=='a' and c['channel']=='A · Polarity-aware')
+            self.assertAlmostEqual(aware['points'][0]['error'],5/12)
             reports[('voxel_mae',30.)]['rows']=[r for r in reports[('voxel_mae',30.)]['rows'] if r['method']!='b']
             curves,coverage=p.matched_curves(reports)
             self.assertTrue(all(c['method']=='a' for c in curves))
@@ -63,8 +80,8 @@ class BinPlots(unittest.TestCase):
             root=Path(tmp);fixture(root)
             (dataset,sig),reports=next(iter(p.load_reports(root).items()))
             fig,curves,coverage=p.make_figure(dataset,reports)
-            self.assertEqual(len(fig.data),6)
-            self.assertEqual(len(curves),6)
+            self.assertEqual(len(fig.data),10)
+            self.assertEqual(len(curves),10)
             output=root/'plot.html';p.export_html(dataset,sig,reports,output)
             html=output.read_text(encoding='utf-8')
             self.assertIn('plotly.js',html)

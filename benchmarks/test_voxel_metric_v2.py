@@ -11,6 +11,23 @@ from benchmarks.test_voxel_metric import events
 
 
 class FixedDurationMetrics(unittest.TestCase):
+    def test_polarity_aware_and_total(self):
+        def stream(on,off):
+            return events([0.]*(on+off),p=[1]*on+[-1]*off)
+        domain=dict(edges=np.array([0.,.03]),height=1,width=1,bin_ms=30)
+        for metric in ('voxel_mae','voxel_rmse'):
+            row=v.score(metric,stream(12,7),stream(10,5),**domain)
+            self.assertEqual(row['value'],0.)
+            self.assertAlmostEqual(row['value_aware'],2.)
+            self.assertEqual(row['value_total'],4.)
+            swap=v.score(metric,stream(0,10),stream(10,0),**domain)
+            self.assertEqual(swap['value'],20.)
+            self.assertAlmostEqual(swap['value_aware'],10.)
+            self.assertEqual(swap['value_total'],0.)
+        row=v.score('voxel_rmse',stream(13,9),stream(10,5),**domain)
+        self.assertAlmostEqual(row['value_aware'],np.sqrt(12.5))
+        self.assertEqual(row['value_total'],7.)
+
     def test_scoring_window_origin_contract(self):
         self.assertEqual(v.scoring_window([0,.5,1],100,.1,.8),(.1,.8))
         self.assertEqual(v.scoring_window([0,1],100), (0.,1.))
@@ -88,6 +105,15 @@ class FixedDurationMetrics(unittest.TestCase):
                 self.assertAlmostEqual(float(rows[0]['last_bin_ms']),10)
                 self.assertGreater(float(rows[0]['value']),0)
                 self.assertEqual(rows[1]['status'],'not_applicable')
+                if metric in ('voxel_mae','voxel_rmse'):
+                    self.assertTrue(rows[0]['value_aware'])
+                    self.assertTrue(rows[0]['value_total'])
+            all_run=subprocess.run([sys.executable,str(script),'toy','test','--metric','all',
+                '--voxel-bin-ms','30','--methods','v2ce','--data-root',str(root/'data'),
+                '--pred-root',str(root/'pred'),'--report-root',str(root/'all_reports')],
+                capture_output=True,text=True)
+            self.assertEqual(all_run.returncode,0,all_run.stdout+all_run.stderr)
+            self.assertEqual(len(list((root/'all_reports').glob('*/*/*/results.csv'))),5)
             # A custom window keeps the absolute shared origin; no per-stream stretching.
             cmd=[sys.executable,str(script),'toy','test','--metric','voxel_mae','--voxel-bin-ms','30',
                  '--voxel-start-s','.09','--voxel-stop-s','.1','--methods','v2ce',
