@@ -1,5 +1,8 @@
 # Fixed-duration voxel metrics v2
 
+For the complete formula reference, A/B/Signed examples, commands for all
+methods and notebook setup, see [the voxel metrics README](README_VOXEL_METRICS_V2.md).
+
 Files: `voxel_metric_v2.py`, `run_voxel_metric_v2.py`. The existing v1 metric,
 runner and watchboard are unchanged. V2 reports default to `reports_voxel_v2`.
 
