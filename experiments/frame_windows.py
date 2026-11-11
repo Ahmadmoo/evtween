@@ -1,5 +1,6 @@
 """Generate benchmark outputs independently on regularly spaced frame windows."""
 import argparse
+from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
 import subprocess
 import traceback
@@ -18,6 +19,28 @@ sys.path.insert(0, str(ROOT / 'benchmarks' / 'event_generation'))
 import generate_event_streams_v3 as v3
 
 runner = v3.v2
+
+
+@contextmanager
+def dataset_access(dest):
+    """Allow concurrent window runners while respecting older exclusive runners."""
+    import fcntl
+    with (dest / ".generation-v2.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"An older runner holds the exclusive lock on {dest}. "
+                               "Finish or stop that run before restarting with the updated script.") from exc
+        yield
+
+
+@contextmanager
+def output_lock(folder):
+    import fcntl
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / ".generation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def path_component(name):
@@ -56,7 +79,7 @@ def run_experiment(dataset, *, k, start_stride, methods, experiment_name,
     dest.mkdir(parents=True, exist_ok=True)
     assets = old.setting("BENCHMARK_INSTALL", old.LAB / "evtween/evtween-benchmark/benchmarks/event_generation")
     results, errors = [], []
-    with runner.split_lock(dest), tempfile.TemporaryDirectory(dir=dest) as tmp:
+    with dataset_access(dest), tempfile.TemporaryDirectory(dir=dest) as tmp:
         cache = Path(tmp) / "inputs" if len(methods) > 1 else None
         if cache:
             cache.mkdir()
@@ -108,56 +131,56 @@ def run_method(dataset, split, k, start_stride, samples, method, experiment_name
                         uniform_timestamps=bool(np.allclose(dt, dt.mean(), rtol=1e-3, atol=1e-7)))
             folder = dest / method / sample.name / experiment_name / f"k_{k}" / f"frames_{first}_{last}"
             target = folder / ("voxels.npz" if method == "v2v" else "events.npz")
-            metadata = folder / "input.json"
-            if metadata.exists() and json.loads(metadata.read_text()).get("source") != str(sample):
-                raise ValueError(f"{folder} belongs to another source. Choose another experiment name.")
-            results.append(str(target))
-            prepared = Path(cache) / sample.name / folder.name if cache else None
-            if runner.complete(target, meta, times):
-                if last_method and prepared and prepared.exists():
-                    shutil.rmtree(prepared)
-                print(f"SKIP {target.relative_to(dest)}", flush=True)
-                continue
-            previous_dir = Path.cwd()
-            try:
-                with tempfile.TemporaryDirectory(dir=dest) as tmp:
-                    work = Path(tmp)
-                    run = work / "run"
-                    if prepared is None:
-                        runner.prepare(run, sample, files[window], ts, times, meta, size, need_gt)
-                    else:
-                        if not prepared.exists():
-                            staging = work / "prepared"
-                            runner.prepare(staging, sample, files[window], ts, times, meta, size, need_gt)
-                            prepared.parent.mkdir(parents=True, exist_ok=True)
-                            staging.rename(prepared)
-                        run.mkdir()
-                        for item in prepared.iterdir():
-                            (run / item.name).symlink_to(item, target_is_directory=item.is_dir())
-                    print(f"RUN  {target.relative_to(dest)}", flush=True)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    log = target.parent / "run.log"
-                    if method in v3.old.EVTWEEN or method == "v2ce":
-                        with log.open("w", buffering=1) as stream, redirect_stdout(stream), redirect_stderr(stream):
-                            try:
-                                raw, generate = v3.learned_output(method, dataset, assets, run, work, generate)
-                            except Exception:
-                                traceback.print_exc()
-                                raise
-                            finally:
-                                os.chdir(previous_dir)
-                    else:
-                        raw = v3.old.generate_one(method, dataset, run, assets, work, log)
-                    runner.publish(method, raw, target, meta, times)
-                    record = work / "input.json"
-                    record.write_text(json.dumps(meta, indent=2))
-                    os.replace(record, target.parent / "input.json")
-            except Exception as exc:
-                errors.append(f"{target}: {exc}")
-                print(errors[-1], file=sys.stderr, flush=True)
-            finally:
-                if last_method and prepared and prepared.exists():
-                    shutil.rmtree(prepared)
+            with output_lock(folder):
+                metadata = folder / "input.json"
+                if metadata.exists() and json.loads(metadata.read_text()).get("source") != str(sample):
+                    raise ValueError(f"{folder} belongs to another source. Choose another experiment name.")
+                results.append(str(target))
+                prepared = Path(cache) / sample.name / folder.name if cache else None
+                if runner.complete(target, meta, times):
+                    if last_method and prepared and prepared.exists():
+                        shutil.rmtree(prepared)
+                    print(f"SKIP {target.relative_to(dest)}", flush=True)
+                    continue
+                previous_dir = Path.cwd()
+                try:
+                    with tempfile.TemporaryDirectory(dir=dest) as tmp:
+                        work = Path(tmp)
+                        run = work / "run"
+                        if prepared is None:
+                            runner.prepare(run, sample, files[window], ts, times, meta, size, need_gt)
+                        else:
+                            if not prepared.exists():
+                                staging = work / "prepared"
+                                runner.prepare(staging, sample, files[window], ts, times, meta, size, need_gt)
+                                prepared.parent.mkdir(parents=True, exist_ok=True)
+                                staging.rename(prepared)
+                            run.mkdir()
+                            for item in prepared.iterdir():
+                                (run / item.name).symlink_to(item, target_is_directory=item.is_dir())
+                        print(f"RUN  {target.relative_to(dest)}", flush=True)
+                        log = target.parent / "run.log"
+                        if method in v3.old.EVTWEEN or method == "v2ce":
+                            with log.open("w", buffering=1) as stream, redirect_stdout(stream), redirect_stderr(stream):
+                                try:
+                                    raw, generate = v3.learned_output(method, dataset, assets, run, work, generate)
+                                except Exception:
+                                    traceback.print_exc()
+                                    raise
+                                finally:
+                                    os.chdir(previous_dir)
+                        else:
+                            raw = v3.old.generate_one(method, dataset, run, assets, work, log)
+                        runner.publish(method, raw, target, meta, times)
+                        record = work / "input.json"
+                        record.write_text(json.dumps(meta, indent=2))
+                        os.replace(record, target.parent / "input.json")
+                except Exception as exc:
+                    errors.append(f"{target}: {exc}")
+                    print(errors[-1], file=sys.stderr, flush=True)
+                finally:
+                    if last_method and prepared and prepared.exists():
+                        shutil.rmtree(prepared)
     return results, errors
 
 
