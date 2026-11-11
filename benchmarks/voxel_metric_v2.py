@@ -8,7 +8,16 @@ PROTOCOL = "fixed-duration-full-coverage-v2"
 
 
 def scoring_window(source_edges, absolute_t0, start=0., stop=None):
-    """Validate relative bounds, allowing source-origin subtraction roundoff only."""
+    """Edges must be relative to the first source frame and start exactly at zero.
+
+    start/stop use that same origin, never offsets from a pretrimmed subwindow.
+    """
+    source_edges=np.asarray(source_edges,dtype=np.float64)
+    if (source_edges.ndim != 1 or len(source_edges)<2 or not np.isfinite(source_edges).all()
+            or np.any(np.diff(source_edges)<=0) or source_edges[0] != 0.):
+        raise ValueError("source_edges must increase from zero relative to the first source frame")
+    if not np.isfinite(absolute_t0):
+        raise ValueError("absolute_t0 must be finite")
     lower,upper=float(source_edges[0]),float(source_edges[-1])
     stop=upper if stop is None else float(stop)
     tolerance=8*np.spacing(max(1.,abs(float(absolute_t0)),abs(upper)))

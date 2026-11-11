@@ -11,6 +11,13 @@ from benchmarks.test_voxel_metric import events
 
 
 class FixedDurationMetrics(unittest.TestCase):
+    def test_scoring_window_origin_contract(self):
+        self.assertEqual(v.scoring_window([0,.5,1],100,.1,.8),(.1,.8))
+        self.assertEqual(v.scoring_window([0,1],100), (0.,1.))
+        for edges in ([.5,1.5],[0,0],[0,np.nan],[],[0,1,.5]):
+            with self.assertRaises(ValueError): v.scoring_window(edges,100)
+        with self.assertRaises(ValueError): v.scoring_window([0,1],100,0,2)
+
     def test_edges(self):
         np.testing.assert_allclose(v.time_edges(0,.1,30),[0,.03,.06,.09,.1])
         self.assertEqual(len(v.time_edges(0,.09,30)),4)

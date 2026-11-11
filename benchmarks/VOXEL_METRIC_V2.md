@@ -12,6 +12,9 @@ defaults to the last source frame. Optional `--voxel-start-s` and
 outside the shared source domain are rejected. Internal RGB frame edges do
 not determine bin edges. Events outside the selected half-open window are
 excluded, including events exactly at stop.
+`scoring_window` explicitly requires source edges starting at zero relative
+to the first frame, as produced by `sequence_info`. Nonzero-origin or
+pretrimmed source edges are rejected rather than interpreted as a new origin.
 
 For 100 ms and 30 ms bins, edges are 0, 30, 60, 90, 100 ms. The final bin is
 10 ms, not a rescaled 25 ms bin. CSV records actual bounds, bin count, final
@@ -84,6 +87,44 @@ Open `benchmarks/notebook/watch_voxel_metrics_v2.ipynb` to watch these reports.
 Its tables compare nominal bin widths in milliseconds; its 2D/3D views use
 the same mass-preserving edges. Set Bin ms and start/stop to match the run.
 The v1 notebook remains unchanged.
+
+## Offline interactive metric-versus-bin HTML
+
+Calculate scores at several widths using the same code version, source data,
+window, and method selection, then run:
+
+```sh
+python -m pip install plotly
+python benchmarks/plot_voxel_bins_v2.py --datasets bsergb eds
+```
+
+Default inputs: `reports_voxel_v2`. Output: `reports_voxel_v2/html`, one
+standalone offline HTML per dataset/protocol group. The exporter never runs
+metrics. Optional `--report-root`, `--output-dir`, `--split`, `--methods` and
+`--runs` (exact report directory names) control selection. Different evaluator
+versions/windows/selections are separated into different files. Ambiguous
+duplicate reports are rejected, not selected by modification time.
+
+Within a dataset, choose metric/polarity, width in milliseconds or mean bin
+count, and linear/log error axis. Click model legends, zoom and hover. Hover
+shows matched sequence count, mean duration, and mean/min/max actual bin count.
+Embedded Plotly needs no CDN/network after export. Refresh by rerunning export
+after new scores finish; HTML is a snapshot, not a live monitor.
+Alternatively, use **Export bin curves** at the bottom of
+`watch_voxel_metrics_v2.ipynb`; it uses that notebook's REPORT_ROOT, DATASETS,
+SPLIT and METHODS settings and displays links to the generated files. The
+chart exporter uses all widths it finds, independently of the table's width
+filter, and does not automatically apply the table's RUN_OVERRIDE selection.
+Use the exporter CLI with `--runs` if exact run selection is required.
+
+Each metric/channel uses the same methods and sequence cohort across all
+available widths, with equal sequence weighting. Sequences with mismatching
+actual windows or H/W are excluded. Incomplete models are listed in coverage.
+This is not a comparison of raw scales across different metrics. Smaller
+errors at coarse widths can hide temporal differences; they do not establish
+which metric is intrinsically better at measuring fidelity. A GT zero-error
+reference is shown; relative L1 is defined only with nonzero GT mass. Log mode
+cannot display zeros. Fine-bin mass-preserving edge behavior still follows v2.
 
 ## Checks
 
