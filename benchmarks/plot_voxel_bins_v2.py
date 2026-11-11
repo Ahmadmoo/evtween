@@ -109,7 +109,8 @@ def matched_curves(reports, methods=None):
     return curves,coverage
 
 
-def export_html(dataset, signature, reports, output, methods=None):
+def make_figure(dataset, reports, methods=None):
+    """Build an interactive figure without creating files; usable in Jupyter."""
     try:
         import plotly.graph_objects as go
         from plotly.io import to_html
@@ -151,6 +152,12 @@ def export_html(dataset, signature, reports, output, methods=None):
                 dict(label='Linear Y',method='relayout',args=[{'yaxis.type':'linear'}]),
                 dict(label='Log Y',method='relayout',args=[{'yaxis.type':'log'}])])])
     fig.add_hline(y=0,line_color='#64748b',line_dash='dot')
+    return fig,curves,coverage
+
+
+def export_html(dataset, signature, reports, output, methods=None):
+    from plotly.io import to_html
+    fig,curves,coverage=make_figure(dataset,reports,methods)
     chart=to_html(fig,full_html=False,include_plotlyjs=True,config={'responsive':True,'displaylogo':False})
     # Untrusted report names are escaped; no external scripts, CDN or raw report JSON injection.
     details=''.join(f'<li>{escape(c["metric"])} / {escape(c["channel"])}: n={c["n"]}; '

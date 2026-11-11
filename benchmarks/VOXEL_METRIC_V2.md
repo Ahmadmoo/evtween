@@ -110,9 +110,11 @@ count, and linear/log error axis. Click model legends, zoom and hover. Hover
 shows matched sequence count, mean duration, and mean/min/max actual bin count.
 Embedded Plotly needs no CDN/network after export. Refresh by rerunning export
 after new scores finish; HTML is a snapshot, not a live monitor.
-Alternatively, use **Export bin curves** at the bottom of
+Alternatively, use **Show bin curves** at the bottom of
 `watch_voxel_metrics_v2.ipynb`; it uses that notebook's REPORT_ROOT, DATASETS,
-SPLIT and METHODS settings and displays links to the generated files. The
+SPLIT and METHODS settings and displays interactive charts directly in the
+notebook output. Enable **Save standalone HTML** to also generate file links.
+Trust the notebook and rerun the cell if Jupyter blocks embedded JavaScript. The
 chart exporter uses all widths it finds, independently of the table's width
 filter, and does not automatically apply the table's RUN_OVERRIDE selection.
 Use the exporter CLI with `--runs` if exact run selection is required.

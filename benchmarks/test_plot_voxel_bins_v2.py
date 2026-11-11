@@ -62,6 +62,9 @@ class BinPlots(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);fixture(root)
             (dataset,sig),reports=next(iter(p.load_reports(root).items()))
+            fig,curves,coverage=p.make_figure(dataset,reports)
+            self.assertEqual(len(fig.data),6)
+            self.assertEqual(len(curves),6)
             output=root/'plot.html';p.export_html(dataset,sig,reports,output)
             html=output.read_text(encoding='utf-8')
             self.assertIn('plotly.js',html)
