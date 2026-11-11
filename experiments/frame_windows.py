@@ -51,15 +51,19 @@ def path_component(name):
     return name
 
 
-def frame_windows(n_frames, k, start_stride):
-    """Yield slices of k consecutive frames, omitting an incomplete tail."""
+def frame_windows(n_frames, k, start_stride, m=0):
+    """Select k frames per window, skipping m source frames between selections."""
     if k < 2 or start_stride < 1:
         raise ValueError("k must be at least 2 and start_stride must be positive")
-    return (slice(s, s + k) for s in range(0, n_frames - k + 1, start_stride))
+    if not isinstance(m, int) or m < 0:
+        raise ValueError("m must be a nonnegative integer")
+    step = m + 1
+    span = 1 + (k - 1) * step
+    return (slice(s, s + span, step) for s in range(0, n_frames - span + 1, start_stride))
 
 
 def run_experiment(dataset, *, k, start_stride, methods, experiment_name,
-                   sequences=None, split="test", data_root=None):
+                   sequences=None, split="test", data_root=None, m=0):
     """Return one path per selected method and complete window, including resumed outputs."""
     path_component(dataset)
     path_component(experiment_name)
@@ -84,7 +88,7 @@ def run_experiment(dataset, *, k, start_stride, methods, experiment_name,
         if cache:
             cache.mkdir()
         for method in methods:
-            options = dict(dataset=dataset, split=split, k=k, start_stride=start_stride,
+            options = dict(dataset=dataset, split=split, k=k, m=m, start_stride=start_stride,
                            samples=[str(p) for p in samples], method=method,
                            experiment_name=experiment_name, assets=str(assets), dest=str(dest),
                            cache=str(cache) if cache else None, last_method=method == methods[-1],
@@ -111,25 +115,29 @@ def run_experiment(dataset, *, k, start_stride, methods, experiment_name,
 
 
 def run_method(dataset, split, k, start_stride, samples, method, experiment_name, assets, dest, cache=None,
-               last_method=True, need_gt=False):
+               last_method=True, need_gt=False, m=0):
     dest, assets = Path(dest), Path(assets)
     generate = None
     results, errors = [], []
     for sample in map(Path, samples):
         files, stamps, _, base, size = runner.sequence_info(sample)
-        windows = frame_windows(len(files), k, start_stride)
-        if len(files) < k:
-            print(f"SKIP {sample.name}: only {len(files)} frames for k={k}", flush=True)
+        windows = frame_windows(len(files), k, start_stride, m)
+        if len(files) < 1 + (k - 1) * (m + 1):
+            print(f"SKIP {sample.name}: only {len(files)} frames for k={k}, m={m}", flush=True)
         for window in windows:
             first, last = window.start, window.stop - 1
             ts = stamps[window]
             times = ts - ts[0]
             dt = np.diff(times)
-            meta = dict(base, split=split, indices=list(range(first, last + 1)),
+            meta = dict(base, split=split, indices=list(range(first, last + 1, window.step)),
                         absolute_t0=float(ts[0]), duration=float(times[-1]),
                         frame_times_s=times.tolist(),
                         uniform_timestamps=bool(np.allclose(dt, dt.mean(), rtol=1e-3, atol=1e-7)))
-            folder = dest / method / sample.name / experiment_name / f"k_{k}" / f"frames_{first}_{last}"
+            folder = dest / method / sample.name / experiment_name / f"k_{k}"
+            if m:
+                meta["m"] = m
+                folder = folder / f"m_{m}"
+            folder = folder / f"frames_{first}_{last}"
             target = folder / ("voxels.npz" if method == "v2v" else "events.npz")
             with output_lock(folder):
                 metadata = folder / "input.json"
@@ -194,6 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--split", choices=["train", "test"], default="test")
     parser.add_argument("--sequences", nargs="+")
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--m", type=int, default=0, help="Source frames skipped between selected frames")
     parser.add_argument("--start-stride", type=int, required=True)
     parser.add_argument("--experiment-name", required=True)
     parser.add_argument("--methods", nargs="+", choices=runner.old.METHODS, required=True)
