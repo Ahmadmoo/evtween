@@ -41,10 +41,7 @@ def learned_output(method, dataset, assets, run, work, generate):
             (seq_input / "teacher_gt.npz").symlink_to(gt)
         raw = work / "raw.npz"
         if generate is None:
-            if version == "v5.2":
-                checkout = old.setting("EVTWEEN_V52_ROOT", old.LAB / "evtween_bnchmark-v5.2")
-            else:
-                checkout = old.setting("EVTWEEN_V53_ROOT", old.PROJECT)
+            checkout = old.evtween_checkout(version)
             weights = old.setting("EVTWEEN_WEIGHTS", old.LAB / "evtween-tides-compare/benchmarks/event_generation/checkpoints/evtween_versions")
             ckpt = weights / version / ("model.pt" if mode == "teacher" else "student.pt")
             generate = load_generator(checkout, ckpt, dataset, 123, mode, raw)
