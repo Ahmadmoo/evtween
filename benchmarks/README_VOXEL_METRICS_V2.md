@@ -315,6 +315,38 @@ code/protocol groups are separated; duplicate ambiguous runs require `--runs`.
 
 ## 9. Interpretation, reproducibility and limitations
 
+### Raw event-rate diagnostics in the notebook
+
+The **Raw event rates** section adds two interactive views with an actual GT
+curve: separate ON/OFF panels and a combined ON+OFF panel. These describe raw
+data behavior, not error versus GT. For polarity c and temporal bin b:
+
+$$r_{c,b}=\frac{n_{c,b}}{\tau_{b+1}-\tau_b},\qquad
+r_{total,b}=\frac{n_{ON,b}+n_{OFF,b}}{\tau_{b+1}-\tau_b}.$$
+
+Units are events per second over the full common saved image. There is no
+polarity subtraction, per-pixel normalization or prediction/GT division.
+Unlike count-error metrics, the short final rate bin is divided by its actual
+duration. Time is measured from the chosen view's start. GT is black; model
+colors are consistent between the two figures. Legend clicks toggle both
+ON/OFF panels together. Zoom/reset, hover, and linear/log Y are available;
+zeros do not appear in log mode.
+
+Set dataset/sequence, Full sequence or Selected frames, first/last frame and
+**Rate bin ms** (default 1 ms), then click **Show event rates**. Frame bounds
+are zero-based indices into source frame timestamps; events are not sampled
+by frame. If the last frame exceeds the source, it is clipped and the actual
+window is printed. Rates use all events inside `[first_time,last_time)`.
+Rate-bin width is independent of the already-scored metric widths.
+
+These plots load saved raw `events.npz` and aligned GT, so CSV metric reports
+alone are insufficient. No metrics need to be recomputed. Native V2V signed
+arrays are excluded. Missing/invalid predictions are identified. Optional
+**Save both HTML plots** writes offline snapshots beneath
+`REPORT_ROOT/html/raw-event-rates`. More than 100000 rate bins is rejected
+with guidance to increase the width or shorten the view, rather than silently
+downsampling data. Existing benchmark tables and error plots are preserved.
+
 - Use the same version, window, geometry and width settings across methods.
 - A measures polarity-specific counts; B measures local total counts; Signed
   measures net counts. None establishes individual-event correspondence.
