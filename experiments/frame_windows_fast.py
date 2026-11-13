@@ -213,7 +213,8 @@ def run_experiment(dataset, *, k, start_stride, methods, experiment_name, sequen
     methods = tuple(methods)
     if not methods or len(set(methods)) != len(methods) or set(methods) - set(old.METHODS):
         raise ValueError(f"Select distinct methods from {old.METHODS}")
-    cpus = os.cpu_count() or 1
+    # CPUs this process may use (a Slurm/taskset allocation), not every core of the machine
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     gpu_jobs = max(1, int(gpu_jobs))
     jobs = max(1, int(jobs or cpus - gpu_jobs))
     os.environ.setdefault("FRACEVENT_DEVICE", "cuda")
@@ -363,7 +364,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment-name", required=True)
     parser.add_argument("--methods", nargs="+", choices=old.METHODS, required=True)
     parser.add_argument("--data-root", type=Path)
-    parser.add_argument("--jobs", type=int, help="concurrent CPU tasks (default: CPUs - gpu-jobs)")
+    parser.add_argument("--jobs", type=int, help="concurrent CPU tasks (default: allocated CPUs - gpu-jobs)")
     parser.add_argument("--gpu-jobs", type=int, default=4,
                         help="concurrent GPU processes: workers per model method, and slots for --gpu-methods")
     parser.add_argument("--gpu-methods", nargs="*", default=["fracevent"],
