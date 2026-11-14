@@ -9,6 +9,8 @@ scorer resumes the other's results. What changes:
   * windows are scored in parallel processes (--processes), each with its own query threads;
   * chamfer_full (and chamfer_penalty/chamfer_count, which call it) reuse the GT KD-trees
     across methods of a window (experiments/fast_scoring.py; identical values);
+  * with --voxel-bin-ms, voxel_* and pmse_*_v2ce_adapted use voxel_metric_v2 (fixed-duration
+    bins, the definition used by compare_sequence_strides); without it they use the v1 path;
   * scores already in this report are skipped (as before), and scores saved by a report that
     differs only in its method or sequence list are copied instead of recomputed, when their
     input-file signature matches (--no-reuse turns this off). Only new scores are computed.
@@ -19,6 +21,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
 import copy
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -34,6 +37,68 @@ import score_windows as sw  # noqa: E402  (puts benchmarks on sys.path)
 import fast_scoring  # noqa: E402
 
 bench = sw.bench
+import voxel_metric_v2 as v2vox  # noqa: E402  (benchmarks/voxel_metric_v2.py)
+
+# Metrics scored with the fixed-duration voxel_metric_v2 when --voxel-bin-ms is given
+# (as in compare_sequence_strides.ipynb); without it voxel_* use run_metric's v1 path.
+VOXEL_V2 = ("voxel_mae", "voxel_rmse", "voxel_relative_l1", "pmse_2_v2ce_adapted", "pmse_4_v2ce_adapted")
+UNITS = {**bench.UNITS, "pmse_2_v2ce_adapted": "squared events/voxel", "pmse_4_v2ce_adapted": "squared events/voxel"}
+
+
+def uses_v2(args, metric):
+    return args.voxel_bin_ms is not None and metric in VOXEL_V2
+
+
+def v2_config(args, metric):
+    """Settings recorded for a voxel_metric_v2 report (changing any gives a new report folder)."""
+    files = (Path(v2vox.__file__), Path(bench.__file__), Path(__file__))
+    return dict(dataset=args.dataset, split=args.split, metric=metric, unit=UNITS[metric],
+                interval="[first frame, last frame)", crop="full v3 crop",
+                options=dict(protocol=v2vox.PROTOCOL, bin_ms=float(args.voxel_bin_ms), voxel_version=2),
+                numpy_version=np.__version__,
+                code_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files})
+
+
+def evaluate_v2(args, win, name, method, file, folder, db, config):
+    """run_metric.evaluate_one's bookkeeping, scoring with voxel_metric_v2.score as the strides notebook does."""
+    metric, bin_ms = args.metric, config["options"]["bin_ms"]
+    ground = method == "ground_truth"
+    metadata = file.parent / "input.json"
+    sign = signature(args, win, method, file)
+    previous = db.execute("SELECT signature,record FROM scores WHERE sequence=? AND method=?",
+                          (name, method)).fetchone()
+    if previous and previous[0] == sign and reusable(previous[1], folder):
+        return "SKIP"
+    row = dict(sequence=name, method=method, value=None, status="ok", array_path="")
+    try:
+        if not ground and not file.is_file():
+            row["status"] = "missing_prediction"
+        elif method == "v2v":
+            row["status"] = "not_applicable"  # v2: native signed V2V arrays are not applicable
+        elif not win.source.is_dir():
+            row["status"] = "missing_source"
+        elif not all((win.source / f"ev_{k}.npy").is_file() for k in "txyp"):
+            row["status"] = "missing_gt"
+        else:
+            edges, meta = win.geometry
+            if not ground:
+                bench.verify_metadata(metadata, meta, args, name)
+            events = win.gt if ground else bench.read_events(file, meta)
+            bins = v2vox.time_edges(0., float(edges[-1]), bin_ms)
+            result = v2vox.score(metric, events, win.gt, edges=bins, height=meta["height"],
+                                 width=meta["width"], bin_ms=bin_ms)
+            row.update({k: float(v) if np.isfinite(v) else None for k, v in result.items()})
+            row.update(bin_ms=bin_ms, temporal_bins=len(bins) - 1, last_bin_ms=1000 * float(np.diff(bins)[-1]))
+            if row["value"] is None:
+                row["status"] = "undefined"
+            if signature(args, win, method, file) != sign:
+                raise RuntimeError("Input changed during scoring; rerun this metric")
+    except Exception as exc:
+        row.update(value=None, status="error", array_path="")
+        print(f"  {name}/{method}: {exc}", flush=True)
+    db.execute("INSERT OR REPLACE INTO scores VALUES (?,?,?,?)",
+               (name, method, sign, json.dumps(row, allow_nan=False)))
+    return row["status"]
 
 
 def metric_args(args, metric):
@@ -135,7 +200,8 @@ def score_sequence_windows(task):
                         adopted = adopt_saved(db, folder, job["donors"], name, method,
                                               signature(args, win, method, file), Path("windows") / name / label)
                         reused += adopted
-                    bench.evaluate_one(args, win, name, method, file, folder, db, job["config"])
+                    evaluate = evaluate_v2 if uses_v2(args, metric) else bench.evaluate_one
+                    evaluate(args, win, name, method, file, folder, db, job["config"])
                     record, = db.execute("SELECT record FROM scores WHERE sequence=? AND method=?",
                                          (name, method)).fetchone()
                 row = json.loads(record)
@@ -158,6 +224,11 @@ def evaluate_many(args):
     if args.k < 2 or args.m < 0 or min(args.start_stride, args.workers, args.voxel_temporal_bins) < 1:
         raise ValueError("Invalid sampling or scoring parameters")
     metrics = list(dict.fromkeys(args.metrics))
+    if args.voxel_bin_ms is not None and not (np.isfinite(args.voxel_bin_ms) and args.voxel_bin_ms > 0):
+        raise ValueError("--voxel-bin-ms must be positive")
+    adapted = [m for m in metrics if m.endswith("_adapted")]
+    if adapted and args.voxel_bin_ms is None:
+        raise ValueError(f"{adapted} are voxel_metric_v2 metrics; give --voxel-bin-ms")
     if args.legacy_frame_voxels and any(not metric.startswith("voxel_") for metric in metrics):
         raise ValueError("--legacy-frame-voxels requires voxel_* metrics only")
     pred = ROOT / "data_test_exp" / args.dataset
@@ -176,7 +247,7 @@ def evaluate_many(args):
     for metric in metrics:
         one = metric_args(args, metric)
         methods = (["ground_truth"] if metric in bench.DESCRIPTIVE else []) + found
-        config = bench.settings(one)
+        config = v2_config(one, metric) if uses_v2(one, metric) else bench.settings(one)
         config.update(experiment=args.experiment_name, k=args.k, m=args.m, start_stride=args.start_stride,
                       sequences=names, methods=methods, evaluator=evaluator)
         report = (ROOT / "reports" / "experiments" / args.dataset / args.split / variant / metric /
@@ -277,7 +348,7 @@ if __name__ == "__main__":
     p.add_argument("--k", required=True, type=int)
     p.add_argument("--m", default=0, type=int)
     p.add_argument("--start-stride", default=50, type=int)
-    p.add_argument("--metrics", nargs="+", choices=bench.UNITS, required=True)
+    p.add_argument("--metrics", nargs="+", choices=UNITS, required=True)
     p.add_argument("--methods", nargs="+", choices=bench.v2.old.METHODS)
     p.add_argument("--sequences", nargs="+")
     p.add_argument("--data-root", type=Path)
@@ -287,7 +358,10 @@ if __name__ == "__main__":
     p.add_argument("--processes", type=int, help="parallel worker processes (default: allocated CPUs)")
     p.add_argument("--no-reuse", dest="reuse", action="store_false",
                    help="do not copy matching scores from reports with other method/sequence lists")
-    p.add_argument("--voxel-temporal-bins", type=int, default=160)
+    p.add_argument("--voxel-temporal-bins", type=int, default=160, help="v1 voxel metrics only")
+    p.add_argument("--voxel-bin-ms", type=float,
+                   help="score voxel_mae/rmse/relative_l1 and pmse_*_v2ce_adapted with voxel_metric_v2 "
+                        "(fixed bins of this many ms, as in compare_sequence_strides); omit for v1")
     p.add_argument("--legacy-frame-voxels", action="store_true")
     args = p.parse_args()
     reports, failed = evaluate_many(args)
