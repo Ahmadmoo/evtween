@@ -2,6 +2,18 @@
 
 $P$ = prediction, $G$ = recorded ground truth (GT), $E$ = either stream. Both streams use the same crop and scoring interval. Descriptors are computed on one stream and can be compared with the GT descriptor. For paired errors, zero is best.
 
+**Abbreviations**
+
+| Term | Full name or meaning |
+|---|---|
+| ISI / IEI | Inter-spike interval / inter-event interval. Here both use consecutive events at the same pixel. |
+| CV / CDF | Coefficient of variation / cumulative distribution function. |
+| MAE / RMSE | Mean absolute error / root mean squared error. |
+| MSE / PMSE | Mean squared error / pooled mean squared error. |
+| Relative L1 | Relative L1 error (sum of absolute errors divided by the reference L1 norm). |
+| Same-ts | Same timestamp. |
+| ON / OFF | Positive / negative event polarity. |
+
 ## 1. Count, rate and polarity
 
 | Metric | Formula | Meaning |
@@ -18,7 +30,7 @@ $P$ = prediction, $G$ = recorded ground truth (GT), $E$ = either stream. Both st
 | Metric | Formula | Meaning |
 |---|---|---|
 | `isi_distribution` | $\delta_{u,j}=1000(t_{u,j+1}-t_{u,j})$ | Array of consecutive same-pixel intervals in ms, pooled across pixels and polarities. Includes zero intervals. |
-| `isi_median_ms` | $\operatorname{median}(D)$ | Median of the pooled intervals in ms. |
+| `isi_median_ms` | $\mathrm{median}(D)$ | Median of the pooled intervals in ms. |
 | `isi_cv` | $\sigma(D)/\max(\mu(D),10^{-9})$ | Relative spread of the pooled intervals. Median and CV return 0 for an empty interval array. |
 | `iei_distance` | $\int_{\mathbb R}\lvert F_P(z)-F_G(z)\rvert\,dz$ | Wasserstein-1 distance between log-interval distributions. Undefined if either stream has no positive interval. |
 | `same_ts` | $\sum_{w,q:\,c_{wq}>1}c_{wq}/N_E$ | Fraction of events sharing a timestamp with another event anywhere in the same window. Undefined for an empty stream. |
@@ -30,13 +42,13 @@ $P$ = prediction, $G$ = recorded ground truth (GT), $E$ = either stream. Both st
 **`fano_factor`** compares fluctuations in event counts within each active tile. The CSV reports the mean absolute log ratio over tile-windows active in both streams.
 
 $$
-F_i(E)=\frac{\operatorname{Var}_j(c_{ij})}{\operatorname{Mean}_j(c_{ij})},
+F_i(E)=\frac{\sigma^2_j(c_{ij})}{\mu_j(c_{ij})},
 \qquad
 \mathrm{error}=\frac{1}{\lvert S\rvert}\sum_{i\in S}
 \left\lvert\ln\frac{F_i(P)+10^{-3}}{F_i(G)+10^{-3}}\right\rvert .
 $$
 
-**Symbols.** $i$ = 8×8 pixel tile in a 50 ms window, $c_{ij}$ = count in its $j$-th 2 ms bin, $\operatorname{Var}$ = population variance, $S$ = tile-windows with events in both streams. Different active masks give `partial_support` when the score is finite. Empty overlap gives an undefined score.
+**Symbols.** $i$ = 8×8 pixel tile in a 50 ms window, $c_{ij}$ = count in its $j$-th 2 ms bin, $\mu_j,\sigma^2_j$ = mean and population variance over time bins, $S$ = tile-windows with events in both streams. Different active masks give `partial_support` when the score is finite. Empty overlap gives an undefined score.
 
 ## 4. Spatiotemporal event distance
 
