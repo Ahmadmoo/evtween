@@ -37,6 +37,8 @@ model:
   tube: measured               # crossings from the least-event path in the frame-noise tube: measured width (v7) | scalar
                                # (x one learned factor per dataset) | false (no tube)
   measure_c: true              # thresholds measured from frame change vs real ON / OFF counts, not learned (c_init until then)
+  lora_rank: 0                 # > 0 (e.g. 16): LoRA on the video backbone's attention, trained in the student stage
+  lora_blocks: 8               # the last blocks that get LoRA (V-JEPA 2.1 ViT-L has 24); the rest stays frozen
 
 loss:
   nll: 1.0                     # exact-time event likelihood (crossings + residual events)
@@ -67,6 +69,7 @@ train:
   steps: 200000
   warmup: 2000
   clip: 1.0
+  lora_lr: 5.0                 # learning rate of the LoRA weights, x train.lr (model.lora_rank > 0)
   log_every: 50
   save_every: 2000
   val_batches: 25              # per dataset

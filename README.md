@@ -57,10 +57,23 @@ torchrun --nproc_per_node 4 train.py train.stage=interp train.init=runs/student_
     train.lr=5e-5 train.warmup=500 train.steps=20000 train.out=runs/interp_v7
 python eval_interp.py --ckpt runs/interp_v7/last.pt --split test --n 200
 
+# optional: LoRA fine-tune of the V-JEPA 2.1 backbone, from the trained student (head first, then LoRA)
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/student_v7/last.pt model.lora_rank=16 model.lora_blocks=8 \
+    train.lr=2e-5 train.lora_lr=5 train.warmup=500 train.steps=15000 train.out=runs/student_v7_lora
+
 # tube ablation (teacher stage, everything else the same)
 torchrun --nproc_per_node 4 train.py train.stage=teacher model.tube=scalar train.steps=80000 train.out=runs/teacher_v7_scalar
 torchrun --nproc_per_node 4 train.py train.stage=teacher model.tube=false  train.steps=80000 train.out=runs/teacher_v7_notube
 ```
+
+#### LoRA on the video backbone (optional)
+
+`model.lora_rank > 0` adds LoRA (`W x + B A x`) to the attention (`qkv`, `proj`) of the last `model.lora_blocks` blocks of V-JEPA 2.1; everything else in the backbone stays frozen. It trains in the student (and joint) stage with its own learning rate (`train.lr × train.lora_lr`, no weight decay), and its weights are saved in the checkpoint (the frozen backbone is not).
+
+- Start it from a trained student (`train.init`): `B` starts at 0, so step 0 predicts exactly what the frozen student predicts. Training a new head and LoRA together lets the head's early noise pull the backbone features around.
+- Gradients reach only the LoRA blocks: nothing is stored for the frozen blocks before them, so memory grows with `lora_blocks`, not with the backbone's 24 blocks.
+- Decide by `gap` on validation per dataset against the frozen student: smaller gap = the frozen features were the limit; a smaller train gap with a larger val gap = overfitting (lower `lora_rank` or `lora_blocks`).
+- Checked here (official V-JEPA 2.1 code, random weights): with `B = 0` the output equals the frozen backbone exactly; only the LoRA weights get gradients and only the LoRA blocks build a graph; teacher and decoder stay bit for bit; resume, `generate.py` and `eval_interp.py` run from a LoRA checkpoint.
 
 ### `v5.2` (separate branch)
 
@@ -438,6 +451,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `model.patch`, `model.z_dim`, `model.enc_depth` | Path code cell (8 px), its size (64), teacher blocks per level (6) |
 | `model.depth`, `model.width` | Decoder UNet blocks per level ([4, 4, 12, 8]) and first-level width (64) |
 | `model.pred_dim`, `model.pred_depth` | Student predictor width (512) and layers (8) |
+| `model.lora_rank`, `model.lora_blocks`, `train.lora_lr` | LoRA on the V-JEPA 2.1 attention (0 = off; e.g. 16), on the last N blocks (8 of 24), its learning rate × `train.lr` (5) |
 | `model.K` | Flow correction terms per frame (2) |
 | `model.tube` | `measured` (width from the frame noise), `scalar` (× one learned factor per dataset), `false` (no tube) |
 | `model.nu` | Background events / px / s at `z = 0`; the decoder scales it per pixel and polarity |

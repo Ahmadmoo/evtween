@@ -74,9 +74,13 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
         print("init: size changed, not loaded:", skip, flush=True)
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
-params = [p for p in model.parameters() if p.requires_grad]
+params = [p for n, p in model.named_parameters() if p.requires_grad and ".lora_" not in n]
+lora = [p for n, p in model.named_parameters() if p.requires_grad and ".lora_" in n]
 groups = [{"params": [p for p in params if p.ndim > 1], "weight_decay": T["wd"]},
           {"params": [p for p in params if p.ndim <= 1], "weight_decay": 0.0}]
+if lora:  # LoRA on the video backbone (model.lora_rank): its own learning rate, x train.lora_lr
+    groups.append({"params": lora, "weight_decay": 0.0, "scale": float(T.get("lora_lr", 1.0))})
+params = params + lora
 opt = torch.optim.AdamW(groups, lr=T["lr"], betas=(0.9, 0.99))
 ckpt, step = os.path.join(T["out"], "last.pt"), 0
 if os.path.exists(ckpt):

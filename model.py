@@ -195,10 +195,19 @@ class FlowPrior(nn.Module):
         return f.chunk(2)
 
 
+def add_lora(lin, r):
+    # low-rank update on a frozen nn.Linear: y = W x + b + B (A x); B starts at 0, so the layer starts unchanged
+    lin.lora_A = nn.Parameter(torch.empty(r, lin.in_features))
+    lin.lora_B = nn.Parameter(torch.zeros(lin.out_features, r))
+    nn.init.kaiming_uniform_(lin.lora_A, a=math.sqrt(5))
+    lin.register_forward_hook(lambda m, inp, out: out + F.linear(F.linear(inp[0], m.lora_A), m.lora_B))
+
+
 class Backbone(nn.Module):
     # frozen pretrained video encoder, built and loaded with the authors' own code;
-    # "none" is a trainable per-frame patch embedding (baseline without world knowledge)
-    def __init__(self, kind, dim):
+    # "none" is a trainable per-frame patch embedding (baseline without world knowledge).
+    # lora_rank > 0: LoRA on the attention (qkv, proj) of the last lora_blocks blocks (V-JEPA 2.1); the rest stays frozen
+    def __init__(self, kind, dim, lora_rank=0, lora_blocks=8):
         super().__init__()
         self.kind = kind
         if kind == "vjepa2_1":
@@ -214,6 +223,13 @@ class Backbone(nn.Module):
             self.net, self.tubelet, self.dim = nn.Conv2d(3, dim, 16, stride=16), 1, dim
         if kind != "none":
             self.net.eval().requires_grad_(False)
+        self.lora = bool(lora_rank) and kind != "none"  # "none" is trained whole anyway
+        if self.lora:
+            assert kind == "vjepa2_1", "model.lora_rank: V-JEPA 2.1 backbone only"
+            assert 0 < lora_blocks <= len(self.net.blocks), f"model.lora_blocks: 1 to {len(self.net.blocks)}"
+            for blk in self.net.blocks[-lora_blocks:]:
+                add_lora(blk.attn.qkv, lora_rank)
+                add_lora(blk.attn.proj, lora_rank)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1, 1), persistent=False)
 
@@ -229,17 +245,18 @@ class Backbone(nn.Module):
         if self.kind == "none":
             return self.net(clip.flatten(0, 1)).view(B, T, self.dim, H // 16, W // 16).permute(0, 1, 3, 4, 2)
         x = (clip.transpose(1, 2) - self.mean) / self.std
-        with torch.no_grad():
+        # with LoRA, gradients reach only its blocks: no frozen weight needs them, so nothing is stored for the blocks before
+        with torch.set_grad_enabled(self.lora and torch.is_grad_enabled()):
             tok = self.net(x) if self.kind == "vjepa2_1" else self.net(pixel_values=x).last_hidden_state[:, 1:]
         return tok.reshape(B, T // self.tubelet, H // 16, W // 16, self.dim)
 
 
 class Student(nn.Module):
-    # frozen video backbone on the context frames + small transformer that fills the gap
-    def __init__(self, backbone, dim, depth, patch=16):
+    # frozen video backbone (or LoRA-tuned) on the context frames + small transformer that fills the gap
+    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8):
         super().__init__()
         self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 queries per 16 x 16 token)
-        self.backbone = Backbone(backbone, dim)
+        self.backbone = Backbone(backbone, dim, lora_rank, lora_blocks)
         self.inp = nn.Linear(self.backbone.dim, dim)
         self.pos = nn.Linear(64, dim)
         self.query = nn.Parameter(torch.zeros(dim))
@@ -304,7 +321,8 @@ class Decoder(nn.Module):
 class EvTween(nn.Module):
     def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_prior="raft", flow_scale=16.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=512, pred_depth=8, bins=32, amp=True,
-                 gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6):
+                 gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6, lora_rank=0,
+                 lora_blocks=8):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -319,7 +337,7 @@ class EvTween(nn.Module):
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
         # outputs: flow corrections a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
         self.decoder = Decoder(z_dim, 4 * K + VIS + 1 + 6, width, depth)
-        self.student = Student(backbone, pred_dim, pred_depth, patch)
+        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
         # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample
@@ -459,7 +477,9 @@ class EvTween(nn.Module):
         return super().load_state_dict(sd, strict=strict)
 
     def frozen(self, name):
-        return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none")
+        # pretrained weights (RAFT, video backbone); the backbone's LoRA weights are trained and saved
+        return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none"
+                                                and ".lora_" not in name)
 
     def fixed(self, name):
         return (name == "log_k" and self.k_fixed is not None) or (name in ("log_c", "log_r") and self.measure_c)
