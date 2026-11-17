@@ -235,7 +235,7 @@ def worker(plan_path, report_path):
         except ImportError:
             pass
     console, errors_out = sys.stdout, sys.stderr
-    errors, generate, previous = [], None, None
+    errors, generate, previous, load_error = [], None, None, None
     publisher = ThreadPoolExecutor(1) if model else None
 
     def collect(future):
@@ -246,6 +246,9 @@ def worker(plan_path, report_path):
 
     for job in plan["jobs"]:
         target = Path(job["target"])
+        if load_error:  # the model could not be built: fail the rest without reloading it each time
+            errors.append(f"{target}: model not loaded ({load_error})")
+            continue
         meta, times = job["meta"], np.asarray(job["times"], dtype=np.float64)
         lock, tmp, handed = None, None, False
         cwd = Path.cwd()
@@ -264,9 +267,13 @@ def worker(plan_path, report_path):
                 with log.open("w", buffering=1) as stream, redirect_stdout(stream), redirect_stderr(stream):
                     try:
                         if generate is None:
-                            generate = load_learned(method, dataset, assets,
-                                                    scratch / f"{Path(plan_path).stem}-load.npz",
-                                                    plan.get("frame_cache", True))
+                            try:
+                                generate = load_learned(method, dataset, assets,
+                                                        scratch / f"{Path(plan_path).stem}-load.npz",
+                                                        plan.get("frame_cache", True))
+                            except Exception as exc:
+                                load_error = f"{type(exc).__name__}: {exc}"
+                                raise
                         raw, generate = v3.learned_output(method, dataset, assets, run, tmp, generate)
                     except Exception:
                         traceback.print_exc()
@@ -307,19 +314,32 @@ def worker(plan_path, report_path):
 def launch(plan, scratch, env, counter):
     """Run one worker process on a list of sequences; return its errors."""
     with counter["lock"]:
+        if counter["stop"]:  # Ctrl+C: start nothing new
+            return []
         counter["n"] += 1
         name = f"{plan['method']}-{counter['n']}"
     plan_path, report = scratch / f"plan-{name}.json", scratch / f"report-{name}.json"
     plan_path.write_text(json.dumps(plan))
     try:
         python = interpreter(plan["method"], plan["assets"])
-        result = subprocess.run([python, "-u", str(Path(__file__).resolve()), "--worker",
-                                 str(plan_path), str(report)], env=env)
+        with counter["lock"]:
+            if counter["stop"]:
+                return []
+            child = subprocess.Popen([python, "-u", str(Path(__file__).resolve()), "--worker",
+                                      str(plan_path), str(report)], env=env)
+            counter["children"].add(child)
+        try:
+            returncode = child.wait()
+        finally:
+            with counter["lock"]:
+                counter["children"].discard(child)
     except (OSError, KeyError, ValueError) as exc:
         return [f"{name}: {exc}"]
+    if counter["stop"]:
+        return []
     errors = json.loads(report.read_text()) if report.is_file() else []
-    if result.returncode:
-        errors.append(f"{name}: worker exited {result.returncode}; see the sequence logs")
+    if returncode:
+        errors.append(f"{name}: worker exited {returncode}; see the sequence logs")
     return errors
 
 
@@ -458,14 +478,26 @@ def generate_event_streams(dataset, split, *, methods=None, data_root=None, jobs
         cpu_tasks.sort(key=lambda p: -len(p["jobs"][0]["frames"]))
         threads = max(1, cpus // (jobs + gpu_jobs))
         env = thread_env(threads)
-        counter = dict(n=0, lock=threading.Lock())
+        counter = dict(n=0, lock=threading.Lock(), stop=False, children=set())
         print(f"Running {len(cpu_tasks)} CPU tasks ({jobs} at a time) and {len(gpu_tasks)} GPU tasks "
               f"({gpu_jobs} at a time), {threads} threads each", flush=True)
         with ThreadPoolExecutor(jobs) as cpu_pool, ThreadPoolExecutor(gpu_jobs) as gpu_pool:
             futures = ([gpu_pool.submit(launch, plan, scratch, env, counter) for plan in gpu_tasks] +
                        [cpu_pool.submit(launch, plan, scratch, env, counter) for plan in cpu_tasks])
-            for future in futures:
-                errors.extend(future.result())
+            try:
+                for future in futures:
+                    errors.extend(future.result())
+            except KeyboardInterrupt:
+                # stop queued tasks and running workers; finished outputs stay and are resumed next time
+                with counter["lock"]:
+                    counter["stop"] = True
+                    children = list(counter["children"])
+                for pool in (cpu_pool, gpu_pool):
+                    pool.shutdown(wait=False, cancel_futures=True)
+                for child in children:
+                    child.terminate()
+                print("Interrupted: stopping workers; rerun the same command to resume.", file=sys.stderr, flush=True)
+                raise
     if errors:
         raise RuntimeError("\n".join(errors))
     return results
