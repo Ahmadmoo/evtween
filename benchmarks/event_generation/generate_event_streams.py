@@ -23,6 +23,7 @@ BASELINES = ("v2e", "iebcs", "dvs_voltmeter", "v2ce", "v2v", "evis_core")
 EVTWEEN = {f"evtween_{v}_{mode}": (v, mode)
            for v in ("v5.2", "v5.3") for mode in ("teacher", "student")}
 EVTWEEN["evtween_v7_teacher"] = ("v7", "teacher")
+EVTWEEN["evtween_v7_student"] = ("v7", "student")
 METHODS = (*BASELINES, "fracevent", *EVTWEEN)
 
 
