@@ -344,17 +344,26 @@ def export_csv(db, folder, metric):
             writer.writerow(json.loads(record))
 
 
-def evaluate_one(args, seq, name, method, file, folder, db, config):
+def score_paths(source, method, file, metric):
+    """Inputs whose identity determines whether a saved score is reusable."""
+    ground = method == "ground_truth"
+    needs_gt = ground or metric not in DESCRIPTIVE
+    paths = [source / "frame_ts.npy"]
+    if not ground:
+        paths.extend([file.parent / "input.json", file])
+    if needs_gt:
+        paths.extend(source / f"ev_{k}.npy" for k in "txyp")
+    return paths
+
+
+def evaluate_one(args, seq, name, method, file, folder, db, config, *, read_prediction=None):
     metric = args.metric
     native = method == "v2v"
     ground = method == "ground_truth"
     metadata = file.parent / "input.json"
     needs_gt = ground or metric not in DESCRIPTIVE
-    paths = [seq.source / "frame_ts.npy"]
-    if not ground:
-        paths.extend([metadata, file])
-    if needs_gt:
-        paths.extend(seq.source / f"ev_{k}.npy" for k in "txyp")
+    read_prediction = read_prediction or read_events
+    paths = score_paths(seq.source, method, file, metric)
     signature = digest([stamp(p) for p in paths])
     previous = db.execute("SELECT signature,record FROM scores WHERE sequence=? AND method=?",
                           (name, method)).fetchone()
@@ -387,7 +396,7 @@ def evaluate_one(args, seq, name, method, file, folder, db, config):
                 if not np.isfinite(value):
                     value, row["status"] = None, "undefined"
             else:
-                events = seq.gt if ground else read_events(file, meta)
+                events = seq.gt if ground else read_prediction(file, meta)
                 if metric in FULL_CHAMFERS:
                     options = config["options"]
                     kwargs = {k: options[k] for k in ("device", "workers", "chunk_size", "v_px_per_ms")}
@@ -542,3 +551,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
