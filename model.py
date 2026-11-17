@@ -195,6 +195,14 @@ class FlowPrior(nn.Module):
         return f.chunk(2)
 
 
+def vit_blocks(net):
+    # the transformer blocks of the backbone (V-JEPA 2.1: net.blocks; LeVJEPA's Hugging Face model: net.encoder.blocks)
+    found = [m for n, m in net.named_modules() if n.split(".")[-1] == "blocks" and isinstance(m, nn.ModuleList)]
+    assert len(found) == 1 and all(isinstance(getattr(getattr(b, "attn", None), k, None), nn.Linear)
+                                   for b in found[0] for k in ("qkv", "proj")), "LoRA: no ViT blocks with attn.qkv / attn.proj found"
+    return found[0]
+
+
 def add_lora(lin, r):
     # low-rank update on a frozen nn.Linear: y = W x + b + B (A x); B starts at 0, so the layer starts unchanged
     lin.lora_A = nn.Parameter(torch.empty(r, lin.in_features))
@@ -206,7 +214,8 @@ def add_lora(lin, r):
 class Backbone(nn.Module):
     # frozen pretrained video encoder, built and loaded with the authors' own code;
     # "none" is a trainable per-frame patch embedding (baseline without world knowledge).
-    # lora_rank > 0: LoRA on the attention (qkv, proj) of the last lora_blocks blocks (V-JEPA 2.1); the rest stays frozen
+    # lora_rank > 0: LoRA on the attention (qkv, proj) of the last lora_blocks blocks (V-JEPA 2.1 or LeVJEPA); the rest stays
+    # frozen
     def __init__(self, kind, dim, lora_rank=0, lora_blocks=8):
         super().__init__()
         self.kind = kind
@@ -225,9 +234,9 @@ class Backbone(nn.Module):
             self.net.eval().requires_grad_(False)
         self.lora = bool(lora_rank) and kind != "none"  # "none" is trained whole anyway
         if self.lora:
-            assert kind == "vjepa2_1", "model.lora_rank: V-JEPA 2.1 backbone only"
-            assert 0 < lora_blocks <= len(self.net.blocks), f"model.lora_blocks: 1 to {len(self.net.blocks)}"
-            for blk in self.net.blocks[-lora_blocks:]:
+            blocks = vit_blocks(self.net)
+            assert 0 < lora_blocks <= len(blocks), f"model.lora_blocks: 1 to {len(blocks)}"
+            for blk in blocks[-lora_blocks:]:
                 add_lora(blk.attn.qkv, lora_rank)
                 add_lora(blk.attn.proj, lora_rank)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1, 1), persistent=False)
