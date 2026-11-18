@@ -12,3 +12,6 @@ EDS/*/
 EDS/*.tar*
 CED/*/
 CED/*.zip
+baselines/upstream/
+baselines/weights/
+baselines/predictions/
