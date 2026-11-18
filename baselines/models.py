@@ -1,7 +1,6 @@
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -10,19 +9,25 @@ import torch
 from fetch import ROOT, WEIGHTS
 
 
-def evis_core(seq, args):
-    from dvs_gen.dvs import BatchedMultiCamProcessor
-    recorder = SimpleNamespace(events=None)
-    def record(camera, env, x, y, p, t):
-        recorder.events = np.full(x.numel(), t), x.cpu().numpy(), y.cpu().numpy(), p.cpu().numpy()
-    recorder.record = record
-    sim = BatchedMultiCamProcessor(recorder, "camera", threshold=0.15)
-    for i, t in enumerate(seq.time):
-        rgb = torch.as_tensor(seq.read(i), device=args.device).float().div_(255).pow_(args.evis_gamma)
-        recorder.events = None
-        sim(rgb[None], float(t))
-        if recorder.events is not None:
-            yield recorder.events
+def esim(seq, args):
+    # ESIM stage 2, as vid2e's esim_torch/scripts/generate_events.py, on the frames written by `run.py film`
+    import esim_torch
+    if not args.film.is_dir():
+        raise FileNotFoundError(f"Run `run.py film` first: {args.film}")
+    if not np.array_equal(np.load(args.film / "frame_indices.npy"), seq.idx):
+        raise ValueError(f"{args.film} was made from different frames.")
+    t = np.load(args.film / "t.npy")
+    files = sorted((args.film / "frames").glob("*.png"))
+    if len(files) != len(t):
+        raise ValueError(f"{args.film} is incomplete.")
+    sim = esim_torch.ESIM(0.2, 0.2, 0)
+    for f, ti in zip(files, t):
+        image = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+        log_image = torch.from_numpy(np.log(image.astype("float32") / 255 + 1e-5)).cuda()
+        e = sim.forward(log_image, torch.tensor(int(ti * 1e9), dtype=torch.int64, device="cuda"))
+        if e is not None:
+            e = {k: v.cpu().numpy() for k, v in e.items()}
+            yield e["t"] * 1e-9, e["x"], e["y"], e["p"]
 
 
 def fracevent(seq, args):
@@ -75,35 +80,31 @@ def dvs_voltmeter(seq, args):
 
 
 def slomo_frames(seq, args):
+    # as v2e.py: the whole video in one SuperSloMo call (batch 8), only synthesized frames go to the emulator.
+    # Difference: each frame gets the time it was synthesized for, (k + 0.5) / n of its frame interval
+    # (upstream labels it k / n), on the real frame clock.
     from PIL import Image
     from v2ecore.slomo import SuperSloMo
     if not hasattr(Image, "ANTIALIAS"):
         Image.ANTIALIAS = Image.Resampling.LANCZOS
-    weights = str(ROOT / "weights" / WEIGHTS["v2e"][0])
-    sim = SuperSloMo(weights, args.v2e_steps == 0, max(2, args.v2e_steps), batch_size=1)
-    h, w = seq.h, seq.w
-    yield seq.read(0, gray=True), seq.time[0]
-    for start in range(0, len(seq.time) - 1, 8):
-        end = min(start + 8, len(seq.time) - 1)
-        with tempfile.TemporaryDirectory() as tmp:
-            inputs, mids = Path(tmp) / "input", Path(tmp) / "mid"
-            inputs.mkdir()
-            mids.mkdir()
-            for j in range(max(3, end - start + 1)):  # Upstream needs two pairs. The extra pair is never emitted.
-                im = seq.read(min(start+j, end), gray=True)
-                padded = np.pad(im, ((0, -h % 32), (0, -w % 32)), mode="edge")
-                np.save(inputs / f"{j:03d}.npy", padded)
-            with torch.serialization.safe_globals([datetime]):
-                u, _ = sim.interpolate(str(inputs), str(mids), padded.shape[::-1])
-            for j in range(end - start):
-                indices = np.flatnonzero((u >= j) & (u < j+1))
-                t0, t1 = seq.time[start+j:start+j+2]
-                for k, index in enumerate(indices):
-                    im = cv2.imread(str(mids / f"{index}.png"), cv2.IMREAD_GRAYSCALE)
-                    if im is None:
-                        raise IOError(f"Missing SuperSloMo output {index}")
-                    yield im[:h, :w], t0 + (k + 0.5) / len(indices) * (t1 - t0)
-                yield seq.read(start+j+1, gray=True), t1
+    sim = SuperSloMo(str(ROOT / "weights" / WEIGHTS["v2e"][0]), args.v2e_steps == 0, args.v2e_steps or 1, batch_size=8)
+    with tempfile.TemporaryDirectory() as tmp:
+        inputs, mids = Path(tmp) / "input", Path(tmp) / "mid"
+        inputs.mkdir()
+        mids.mkdir()
+        for i in range(len(seq.time)):
+            np.save(inputs / f"{i:08d}.npy", seq.read(i, gray=True))
+        with torch.serialization.safe_globals([datetime]):
+            u, _ = sim.interpolate(str(inputs), str(mids), (seq.w, seq.h))
+        gap = np.floor(np.asarray(u) + 1e-9).astype(np.int64)
+        for j in range(len(seq.time) - 1):
+            indices = np.flatnonzero(gap == j)
+            t0, t1 = seq.time[j:j+2]
+            for k, index in enumerate(indices):
+                im = cv2.imread(str(mids / f"{index}.png"), cv2.IMREAD_GRAYSCALE)
+                if im is None:
+                    raise IOError(f"Missing SuperSloMo output {index}")
+                yield im, t0 + (k + 0.5) / len(indices) * (t1 - t0)
 
 
 def v2e(seq, args):
@@ -120,6 +121,8 @@ def v2e(seq, args):
 
 
 def v2ce(seq, args):
+    # released weights at the input resolution (the network is fully convolutional; upstream resizes to height 260).
+    # Windows of 16 frame pairs as upstream; a video with fewer pairs repeats its last frame, the extra pairs are dropped.
     from scripts.v2ce_3d import V2ce3d
     from scripts.LDATI import sample_voxel_statistical, y_relocate
     n = len(seq.time) - 1
@@ -127,12 +130,12 @@ def v2ce(seq, args):
     weights = ROOT / "weights" / WEIGHTS["v2ce"][0]
     model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True))
     for first in range(0, n, 16):
-        start = min(first, n - 16)  # Match the released overlapping last window; keep each interval once.
-        frames = torch.from_numpy(np.stack([seq.read(i, gray=True) for i in range(start, start+17)])).to(args.device)
+        start = max(0, min(first, n - 16))  # Match the released overlapping last window; keep each interval once.
+        frames = torch.from_numpy(np.stack([seq.read(min(i, n), gray=True) for i in range(start, start+17)])).to(args.device)
         images = (frames.float() / 255 - 0.153) / 0.165
         pairs = torch.stack((images[:-1], images[1:]), dim=1)[None]
         voxels = model(pairs).reshape(16, 2, 10, seq.h, seq.w)
-        for i in range(first, start+16):
+        for i in range(first, min(start+16, n)):
             v = voxels[i-start:i-start+1]
             # The released sampler takes max() on an empty tensor for a zero-count interval.
             if not torch.any(y_relocate(v[0])[0] > 0):
@@ -143,5 +146,5 @@ def v2ce(seq, args):
             yield t, e["x"], e["y"], e["polarity"].astype(np.int8) * 2 - 1
 
 
-MODELS = {"evis-core": evis_core, "fracevent": fracevent, "iebcs": iebcs,
+MODELS = {"esim": esim, "fracevent": fracevent, "iebcs": iebcs,
           "v2e": v2e, "v2ce": v2ce, "dvs-voltmeter": dvs_voltmeter}

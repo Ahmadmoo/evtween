@@ -1,22 +1,28 @@
 import argparse
 import hashlib
 import subprocess
+import sys
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SOURCES = {
-    "evis-core": ("spikelab-jhu/isaac-sim-event-camera-plugin", "d6fe47923fad09c4bfa2fd2cb13f82520114cfae", ["dvs_gen/dvs", "dvs_gen/warp"]),
+    "esim": ("uzh-rpg/rpg_vid2e", "ecbb11a9345bb9d31b4b691e7d82965da4401345", ["upsampling", "esim_torch"]),
     "fracevent": ("bonaparte233/FracEvent", "1fe6ee7e8e7b4cbc3d2526aa80c033570bb2637f", ["core", "configs"]),
     "iebcs": ("neuromorphicsystems/IEBCS", "8fdab5c3d078435d091fa8a94ad657e1fedf0c59", ["src", "data"]),
     "v2e": ("SensorsINI/v2e", "23f6d5b18aedee5763a1cae7adf43112cf686e20", ["v2ecore"]),
     "v2ce": ("ucsd-hdsi-dvs/V2CE-Toolbox", "67f1624f6539eec7ee7df2a73f95198b3d546969", ["scripts"]),
     "dvs-voltmeter": ("Lynn0306/DVS-Voltmeter", "9d86353ecfaaa1af82b9eb66b162f0bf80cd4861", ["src"]),
 }
+# (file, Google Drive id or URL, SHA-256; None = not pinned yet, the hash is printed on download)
 WEIGHTS = {
+    "esim": ("pretrained_models.zip", "https://rpg.ifi.uzh.ch/data/VID2E/pretrained_models.zip", None),
     "v2e": ("SuperSloMo39.ckpt", "1ETID_4xqLpRBrRo1aOT7Yphs3QqWR_fx", "d4d3070431eff774a1c27038930121ffeae59ede3a7d184118c539b443ea27cb"),
     "v2ce": ("v2ce_3d.pt", "1-aC6CTGZgAZk3snANZ46FAGNkPzu_Scw", "97920e0c3f3c1df55f12800c166bf1de11466f7546bdb7b40261c5a14cddef26"),
 }
+FILM = ROOT / "weights" / "pretrained_models" / "film_net" / "Style" / "saved_model"
 
 
 def digest(path):
@@ -46,20 +52,30 @@ def fetch(name):
     actual = subprocess.check_output(["git", "-C", str(dest), "rev-parse", "HEAD"], text=True).strip()
     if actual != revision:
         raise ValueError(f"{dest} is at {actual}, expected {revision}")
+    if name == "esim":  # CUDA extension; setup.py imports torch, so no build isolation
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", str(dest / "esim_torch")], check=True)
     if name in WEIGHTS:
-        import gdown
-        filename, file_id, sha = WEIGHTS[name]
+        filename, source, sha = WEIGHTS[name]
         path = ROOT / "weights" / filename
         path.parent.mkdir(exist_ok=True)
         if not path.exists():
             with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
                 new = Path(tmp) / filename
-                gdown.download(id=file_id, output=str(new))
-                if not new.is_file() or digest(new) != sha:
-                    raise ValueError(f"Invalid download for {filename}. Get the authors' checkpoint from https://drive.google.com/file/d/{file_id}/view")
+                if source.startswith("https://"):
+                    urllib.request.urlretrieve(source, new)
+                else:
+                    import gdown
+                    gdown.download(id=source, output=str(new))
+                if not new.is_file() or (sha and digest(new) != sha):
+                    raise ValueError(f"Invalid download for {filename} from {source}")
                 new.rename(path)
-        elif digest(path) != sha:
+        elif sha and digest(path) != sha:
             raise ValueError(f"Unexpected SHA-256 for {path}")
+        if not sha:
+            print(f"{filename}: SHA-256 {digest(path)} (not pinned; put it in WEIGHTS)", flush=True)
+        if name == "esim" and not FILM.is_dir():
+            with zipfile.ZipFile(path) as z:
+                z.extractall(path.parent)
     print(f"{name} ready ({revision[:8]})", flush=True)
 
 
