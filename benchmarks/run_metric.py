@@ -95,7 +95,7 @@ def settings(args):
     if metric == "chamfer_count":
         files += (Path(metrics_our.__file__),)
     return dict(dataset=args.dataset, split=args.split, metric=metric, unit=UNITS[metric],
-                interval="[first frame, last frame)", crop="full v3 crop", options=options,
+                interval="[first frame, last frame)", crop="original resolution (no crop)", options=options,
                 numpy_version=np.__version__, code_sha256={
                     p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files})
 

@@ -82,8 +82,10 @@ def sequence_info(seq):
         raise ValueError("Frame count/timestamps are invalid")
     with Image.open(files[0]) as im:
         width, height = im.size
-    w, h = min(width, 346), min(height, 260)
-    crop = [(width-w)//2, (height-h)//2, w, h]
+    # Original resolution, no crop (previously a 346x260 center crop shared with V2CE).
+    # V2CE only accepts 260x346 inputs, so leave it out for datasets with larger frames.
+    w, h = width, height
+    crop = [0, 0, w, h]
     times = ts - ts[0]
     dt = np.diff(times)
     meta = dict(source=str(seq), indices=list(range(len(files))), absolute_t0=float(ts[0]),

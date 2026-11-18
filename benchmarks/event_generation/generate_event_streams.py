@@ -139,8 +139,8 @@ def generate_event_streams(dataset, split, *, methods=None, data_root=None):
                     raise ValueError("No PNG frames")
                 with Image.open(first) as image:
                     width, height = image.size
-                # Match the historical shared center crop required by V2CE.
-                prepare(sequence, run, count=count, crop_size=(min(height,260), min(width,346)))
+                # Original resolution, no crop (V2CE needs 260x346 and fails on larger frames).
+                prepare(sequence, run, count=count, crop_size=(height, width))
                 meta = json.loads((run / "input.json").read_text())
                 times = np.load(run / "input/frame_ts.npy")
                 (run / "input/evaluation_meta.json").write_text(json.dumps(
