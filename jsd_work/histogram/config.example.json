@@ -1,0 +1,17 @@
+{
+  "spatial_bin_size": 1,
+  "temporal_bin_s": 0.01,
+  "time_window_s": null,
+  "distributions": ["spatial", "temporal", "spatiotemporal", "polarity"],
+  "comparisons": ["jsd", "kl", "wasserstein"],
+  "normalize_jsd": true,
+  "log_base": "natural",
+  "kl_epsilon": 1e-12,
+  "reverse_kl": false,
+  "count_epsilon": 1e-12,
+  "max_spatial_transport_pairs": 50000,
+  "allow_benchmark_crop": false,
+  "save_distributions": false,
+  "save_results": true,
+  "save_plots": true
+}
