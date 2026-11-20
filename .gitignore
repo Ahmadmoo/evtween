@@ -4,6 +4,7 @@ __pycache__/
 *.pt
 *.npz
 raw/
+/data_test_exp/*_256/
 HQ-EVFI/*.zip
 HQ-EVFI/raw/
 BS-ERGB/*/
