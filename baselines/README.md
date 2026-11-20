@@ -65,23 +65,28 @@ python run.py fracevent /data/hqevfi/test/scene01 --out predictions/hqevfi
 | `width, height` | Pixels (the input resolution) |
 | `metadata` | JSON: method, source commit, weights hash, device, seed, and the number of events outside `[first, last]` frame time (excluded) |
 
-## Evaluation: Chamfer
+## Evaluation
 
-`chamfer.py` follows `chamfer_full` in `benchmarks/METRICS.md` (branch `event-evaluation-v52-v53`). It scores every event of every method in `<dataset>/<sequence>/<run>/` against the recorded events (`ev_t/x/y/p.npy` of the sequence named in the baselines' metadata), over `[first, last]` input frame time:
+`evaluate.py` scores every method in `<dataset>/<sequence>/<run>/` against the recorded events (`ev_t/x/y/p.npy` of the sequence named in the baselines' metadata), over `[first, last]` input frame time. Each dataset is scored and summarized on its own. Every value is an error, so 0 is best.
 
-- points `(x, y, v·t_ms)`, with `v` in pixels/ms (default 1)
-- per polarity: `C_s = ½ [mean NN distance P→G + mean NN distance G→P]`, exact (SciPy KD-tree, no sampling)
-- `chamfer` = mean over the polarities present in both streams. With no shared polarity, it is undefined.
+| Metric | Value | Settings (default; each takes a list for a sweep) |
+| --- | --- | --- |
+| `count` | `abs(ln(N_pred / N_GT))`; also stores the ratio and both counts | — |
+| `on` | `abs(ON%_pred − ON%_GT)` in percentage points; also stores both ON% | — |
+| `iei` | Wasserstein-1 between log10 same-pixel intervals (positive only, floor 1 µs), FracEvent Eq. S3 | — |
+| `fano` | Mean `abs(ln((F_pred + 1e-3) / (F_GT + 1e-3)))` over tile-windows active in both streams | `--fano-bin-ms 2`, `--fano-window-ms 50`, `--fano-tile 8` |
+| `pmse4` | V2CE PMSE with 4×4×4 blocks on ON/OFF voxel grids (forward linear time weights). Fixed-width bins, so the bin width is the same for long and short sequences | `--pmse-bin-ms 5` |
+| `chamfer` | Exact bidirectional nearest-neighbor distance in `(x, y, v·t_ms)` per polarity, mean of ON and OFF | `--v 1` (pixels/ms) |
 
-Each dataset is scored and summarized on its own. The summary averages over the sequences that have a score for every method in that dataset, so all methods share one sequence set.
+The definitions match `benchmarks/METRICS.md` and the reference code on branch `event-evaluation-v52-v53`. Count, ON %, IEI, Fano and PMSE-4 give the same values as that code (PMSE-4 with the same bin width). The summary averages over the sequences that have a score for every method in that dataset, so all methods share one sequence set.
 
 ```bash
-# one sequence (e.g. one Slurm array task); scores go to <seq>/<run>/chamfer.json and are not recomputed
-python chamfer.py $PRED/hqevfi --seq 2024-01-05-15-04_1
+# one sequence (e.g. one Slurm array task); scores go to <seq>/<run>/metrics.json and are not recomputed
+python evaluate.py $PRED/hqevfi --seq 2024-01-05-15-04_1
 # after all tasks: per-dataset tables
-python chamfer.py $PRED/hqevfi $PRED/bsergb $PRED/eds --summary
-# or both steps for a whole dataset at once
-python chamfer.py $PRED/eds
+python evaluate.py $PRED/hqevfi $PRED/bsergb $PRED/eds --summary
+# a sweep, or a subset of metrics
+python evaluate.py $PRED/hqevfi --metrics chamfer pmse4 --v 0.1 0.3 1 3 10 --pmse-bin-ms 1 2 5 10 20
 ```
 
-The outputs per dataset are `chamfer_<run>.csv` (one row per sequence and method) and `chamfer_<run>_summary.csv` (mean and std over sequences). `--v 0.1 1 10` scores several time scales in one pass. To score evtween next to the baselines, put its `generate.py` output into the same folder as `evtween.npz`.
+The outputs per dataset are `metrics_<run>.csv` (one row per sequence, metric setting and method) and `metrics_<run>_summary.csv` (mean and std over sequences of every stored field). On 2 cores, two 1280×720 streams of 10M events each take about 30 s for all metrics, at about 2.3 GB peak memory. Memory grows with the event count, and V2CE at full resolution can make many times more events than GT. To score evtween next to the baselines, put its `generate.py` output into the same folder as `evtween.npz`.
