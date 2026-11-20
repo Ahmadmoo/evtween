@@ -64,3 +64,24 @@ python run.py fracevent /data/hqevfi/test/scene01 --out predictions/hqevfi
 | `frame_indices, frame_ts` | Indices and timestamps of the input frames |
 | `width, height` | Pixels (the input resolution) |
 | `metadata` | JSON: method, source commit, weights hash, device, seed, and the number of events outside `[first, last]` frame time (excluded) |
+
+## Evaluation: Chamfer
+
+`chamfer.py` follows `chamfer_full` in `benchmarks/METRICS.md` (branch `event-evaluation-v52-v53`). It scores every event of every method in `<dataset>/<sequence>/<run>/` against the recorded events (`ev_t/x/y/p.npy` of the sequence named in the baselines' metadata), over `[first, last]` input frame time:
+
+- points `(x, y, v·t_ms)`, with `v` in pixels/ms (default 1)
+- per polarity: `C_s = ½ [mean NN distance P→G + mean NN distance G→P]`, exact (SciPy KD-tree, no sampling)
+- `chamfer` = mean over the polarities present in both streams. With no shared polarity, it is undefined.
+
+Each dataset is scored and summarized on its own. The summary averages over the sequences that have a score for every method in that dataset, so all methods share one sequence set.
+
+```bash
+# one sequence (e.g. one Slurm array task); scores go to <seq>/<run>/chamfer.json and are not recomputed
+python chamfer.py $PRED/hqevfi --seq 2024-01-05-15-04_1
+# after all tasks: per-dataset tables
+python chamfer.py $PRED/hqevfi $PRED/bsergb $PRED/eds --summary
+# or both steps for a whole dataset at once
+python chamfer.py $PRED/eds
+```
+
+The outputs per dataset are `chamfer_<run>.csv` (one row per sequence and method) and `chamfer_<run>_summary.csv` (mean and std over sequences). `--v 0.1 1 10` scores several time scales in one pass. To score evtween next to the baselines, put its `generate.py` output into the same folder as `evtween.npz`.
