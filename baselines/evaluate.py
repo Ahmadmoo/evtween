@@ -22,19 +22,25 @@ ap.add_argument("--v", type=float, nargs="+", default=[1.0], help="Chamfer: pixe
 ap.add_argument("--fano-bin-ms", type=float, nargs="+", default=[2.0])
 ap.add_argument("--fano-window-ms", type=float, nargs="+", default=[50.0])
 ap.add_argument("--fano-tile", type=int, nargs="+", default=[8])
+ap.add_argument("--fano-cells", nargs="+", default=["both"], choices=["both", "union"],
+                help="tile-windows scored: active in both streams, or in either (a missing side counts as Fano 0)")
 ap.add_argument("--pmse-bin-ms", type=float, nargs="+", default=[5.0])
+ap.add_argument("--pmse-norm", nargs="+", default=["none"], choices=["none", "count"],
+                help="none: raw counts (V2CE); count: each grid divided by its stream's mean density")
 ap.add_argument("--workers", type=int, default=len(os.sched_getaffinity(0)))
 ap.add_argument("--chunk", type=int, default=1 << 20, help="Chamfer query points per KD-tree call")
 a = ap.parse_args()
 
 settings = [(m, m, {}) for m in ("count", "on", "iei") if m in a.metrics]
 if "fano" in a.metrics:
-    for b, w, tile in itertools.product(a.fano_bin_ms, a.fano_window_ms, a.fano_tile):
+    for b, w, tile, cells in itertools.product(a.fano_bin_ms, a.fano_window_ms, a.fano_tile, a.fano_cells):
         if not np.isclose(w / b, round(w / b)):
             ap.error(f"The Fano window ({w} ms) must hold a whole number of bins ({b} ms).")
-        settings.append((f"fano bin={b:g}ms window={w:g}ms tile={tile}", "fano", dict(bin=b / 1000, window=w / 1000, tile=tile)))
+        settings.append((f"fano bin={b:g}ms window={w:g}ms tile={tile} cells={cells}", "fano",
+                         dict(bin=b / 1000, window=w / 1000, tile=tile, cells=cells)))
 if "pmse4" in a.metrics:
-    settings += [(f"pmse4 bin={b:g}ms", "pmse4", dict(bin=b / 1000)) for b in a.pmse_bin_ms]
+    settings += [(f"pmse4 bin={b:g}ms norm={n}", "pmse4", dict(bin=b / 1000, norm=n))
+                 for b, n in itertools.product(a.pmse_bin_ms, a.pmse_norm)]
 if "chamfer" in a.metrics:
     settings += [(f"chamfer v={v:g}px/ms", "chamfer", dict(v=v)) for v in a.v]
 
@@ -70,11 +76,11 @@ def fano_map(s, w, h, T, bin, window, tile):
     return np.divide(squares, total, out=np.zeros(len(total)), where=total > 0) - total / ns, total > 0
 
 
-def pmse4(P, G, w, h, T, bin, k=4):
+def pmse4(P, G, w, h, T, bin, norm, k=4):
     # V2CE PMSE: ON/OFF voxel grids with forward linear time weights, mean of k x k x k blocks (valid, no padding)
     nb = int(np.ceil(T / bin - 1e-12))
     nt, nh, nw = nb // k, h // k, w // k
-    if min(nt, nh, nw) < 1:
+    if min(nt, nh, nw) < 1 or (norm == "count" and not (len(P["t"]) and len(G["t"]))):
         return None
     step, total = max(1, 25_000_000 // (2 * nh * nw)), 0.0
     for c0 in range(0, nt, step):
@@ -90,7 +96,8 @@ def pmse4(P, G, w, h, T, bin, k=4):
                 m = (jj >= c0 * k) & (jj < c1 * k) & (x < nw * k) & (y < nh * k)
                 idx = (((~on[m]) * (c1 - c0) + jj[m] // k - c0) * nh + y[m] // k) * nw + x[m] // k
                 grid += np.bincount(idx, weights=weight[m], minlength=grid.size)
-            grids.append(grid / k ** 3)
+            # count: in units of the stream's mean block value, so 1 = an error as large as the mean event density
+            grids.append(grid / k ** 3 / (len(s["t"]) / (2 * nt * nh * nw * k ** 3) if norm == "count" else 1))
         total += float(np.square(grids[0] - grids[1]).sum())
     return total / (2 * nt * nh * nw)
 
@@ -173,15 +180,17 @@ def score(run):
                 lp = log_iei(P, w)
                 r = dict(value=float(wasserstein_distance(lp, cache["iei"])) if len(lp) and len(cache["iei"]) else None)
             elif metric == "fano":
-                if key not in cache:
-                    cache[key] = fano_map(G, w, h, T, **q)
-                (fp, ap_), (fg, ag) = fano_map(P, w, h, T, **q), cache[key]
+                q = {k: v for k, v in q.items() if k != "cells"}
+                if str(q) not in cache:
+                    cache[str(q)] = fano_map(G, w, h, T, **q)
+                (fp, ap_), (fg, ag) = fano_map(P, w, h, T, **q), cache[str(q)]
                 both = ap_ & ag
-                r = dict(value=float(np.abs(np.log((fp[both] + 1e-3) / (fg[both] + 1e-3))).mean()) if both.any() else None,
+                cells = both if "cells=both" in key else ap_ | ag
+                r = dict(value=float(np.abs(np.log((fp[cells] + 1e-3) / (fg[cells] + 1e-3))).mean()) if cells.any() else None,
                          shared_cells=int(both.sum()), pred_only_cells=int((ap_ & ~ag).sum()),
                          gt_only_cells=int((ag & ~ap_).sum()))
             elif metric == "pmse4":
-                r = dict(value=pmse4(P, G, w, h, T, q["bin"]))
+                r = dict(value=pmse4(P, G, w, h, T, q["bin"], q["norm"]))
             save(key, f.stem, r, start)
 
     for key, metric, q in settings:  # Chamfer: GT trees built once per v

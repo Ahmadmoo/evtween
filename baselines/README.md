@@ -74,8 +74,8 @@ python run.py fracevent /data/hqevfi/test/scene01 --out predictions/hqevfi
 | `count` | `abs(ln(N_pred / N_GT))`; also stores the ratio and both counts | — |
 | `on` | `abs(ON%_pred − ON%_GT)` in percentage points; also stores both ON% | — |
 | `iei` | Wasserstein-1 between log10 same-pixel intervals (positive only, floor 1 µs), FracEvent Eq. S3 | — |
-| `fano` | Mean `abs(ln((F_pred + 1e-3) / (F_GT + 1e-3)))` over tile-windows active in both streams | `--fano-bin-ms 2`, `--fano-window-ms 50`, `--fano-tile 8` |
-| `pmse4` | V2CE PMSE with 4×4×4 blocks on ON/OFF voxel grids (forward linear time weights). Fixed-width bins, so the bin width is the same for long and short sequences | `--pmse-bin-ms 5` |
+| `fano` | Mean `abs(ln((F_pred + 1e-3) / (F_GT + 1e-3)))` over tile-windows active in both streams (`both`, as in METRICS.md) or in either (`union`, a missing side counts as Fano 0, so events in wrong places are penalized) | `--fano-bin-ms 2`, `--fano-window-ms 50`, `--fano-tile 8`, `--fano-cells both` |
+| `pmse4` | V2CE PMSE with 4×4×4 blocks on ON/OFF voxel grids (forward linear time weights). Fixed-width bins, so the bin width is the same for long and short sequences. `none` uses raw counts (V2CE), so fewer events give a lower error. `count` divides each grid by its stream's mean density, so only where and when events fall counts | `--pmse-bin-ms 5`, `--pmse-norm none` |
 | `chamfer` | Exact bidirectional nearest-neighbor distance in `(x, y, v·t_ms)` per polarity, mean of ON and OFF | `--v 1` (pixels/ms) |
 
 The definitions match `benchmarks/METRICS.md` and the reference code on branch `event-evaluation-v52-v53`. Count, ON %, IEI, Fano and PMSE-4 give the same values as that code (PMSE-4 with the same bin width). The summary averages over the sequences that have a score for every method in that dataset, so all methods share one sequence set.
