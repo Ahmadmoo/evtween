@@ -4,7 +4,7 @@ Continuous-time event generation from RGB video, **learned from real events**.
 
 Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
-A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` with an analytic `dL/dτ`, and a crossing solver emits events with continuous timestamps.
+A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` (the frames warped along learned flows and blended), and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the measured frame noise, so noise in the frames makes no crossings.
 **Residual events** come on top at a learned rate per pixel and polarity: a part tied to the slope of the raw path and a background part. The thresholds and the tube width are **measured** from the data, not learned.
 At test time only RGB is needed.
@@ -20,7 +20,36 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v7`)
+### This version (`v8`)
+
+Built from `v7`. Three parts removed; everything else is v7.
+
+| Part | v7 | v8 | Why |
+|---|---|---|---|
+| RAFT | Frozen flows f01, f10: base motion (SloMo formula) and UNet input (with warp errors) | Gone. The decoder's flows are the whole motion: `F0 = a₁τ + a₂τ²`, `F1 = b₁(1−τ) + b₂(1−τ)²`, each term within ±`model.flow_scale` (64 px) | One fewer pretrained part; the teacher sees the motion in the events |
+| UNet input | 12 channels: I0, I1, flows, warp errors | 6 channels: I0, I1 | No flows to give |
+| `dL/dτ` | Exact slope from `render` (warp gradients) | Gone: `render` gives `L` and `Y`; slopes come from the grid | Training never used it; only the sampler did |
+| Sampler | Quadratic pieces without a tube, linear pieces on the grid with it | Always linear pieces on a grid of at least 128 steps (finer where the path is fast) | One code path |
+| Refractory time `R` | Learned per dataset (it kept rising to 0.2–0.4 ms) | Gone: after a crossing the pixel takes `ref = L` at once | ISI medians are 3–5 ms; the blind time touched few events and added a lot of code |
+
+What to expect:
+- `z = 0` is now a cross-fade of the two frames with no motion, so `nll_zero` is much higher than in v7. Compare `nll` and `nll_student`, not `nll_zero`.
+- Watch BS-ERGB (largest motions): the flows must now come from the decoder alone. Compare its `nll` with v7's teacher.
+- v7 checkpoints don't load whole (the UNet's first layer changed and the refractory parameter is gone): train from scratch.
+- `check.py`'s time-shift test uses the path at `z = 0`, which has no motion in v8, so it says little; use `check_align.py` for alignment.
+
+Checks (CPU, toy):
+- **Sampler = likelihood**, on a moving texture: 2,389 residual + background events sampled per draw against 2,400 expected; the nll is lowest at the true threshold (× 0.8 / 1 / 1.25), `κ` and `ν` (× 0.5 / 1 / 2).
+- **Gradients** reach the teacher, decoder, student, `κ` and `ν` rows in every stage and with every `model.tube` option; the interp stage changes only the teacher.
+- **Toy training** (800 teacher, 400 student, 300 interp steps, same settings as v7's toy run): teacher `nll` 0.48 (v7: 0.42), `nll_student` 1.00 (v7: 1.00), interp `photo` 0.0189 → 0.0160. On the training-style samples the student samples 47.5k events against v7's 48.8k (real 56k). `generate.py`, `check.py`, `eval_interp.py` run.
+- On gaps of one frame, shorter than the toy training gaps (4 frames), both versions make too few events (v8 4.2k, v7 10.4k, real 12.3k); the crossings are the same, the learned residual rate differs. Train with `skip` close to the gaps you will generate.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.steps=40000 train.out=runs/teacher_v8
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/teacher_v8/last.pt train.out=runs/student_v8
+```
+
+### `v7` (separate branch)
 
 Built from `v5.2`, trained from scratch. The aim: fewer hand-made parts, more capacity. The decoder switch-off test on v5.2 (all datasets) showed which hand-made parts carry weight.
 
@@ -252,12 +281,12 @@ Tube width, no hand-set value:
 |---|---|
 | Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 8×8 patch grid. Training only |
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
-| Decoder | UNet features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the plain SloMo path, `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
-| Path | Warp both frames with time-polynomial flows (RAFT + SloMo base + `K` learned correction terms per frame), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
+| Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
+| Path | Warp both frames with learned time-polynomial flows (`K` terms per frame, no RAFT), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
 | Residual events | `model.residual_rate`: per pixel and polarity, `(κ_rise·rise + κ_fall·fall) / C_pol + ν_pol·dt` per unit τ, with rise / fall the slope of the **raw** path `L`. 6 decoder maps: `s["kappa"]` (ON / OFF × rise / fall) and `s["nu"]` (ON / OFF, events per second). They don't reset the pixel |
-| Sensor | After each crossing the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Thresholds measured per dataset from frame change vs real event counts (`model.measure_c`); threshold spread per event fixed (`model.sigma_event`); refractory `R` learned per dataset. Brightness per dataset: learned RGB weights, then `PNG^gamma`; under a Bayer filter (CED) each pixel uses its own channel |
-| Events | `physics.Simulator` samples the same model: exact crossings of the taut path (grid of at least 128 steps, linear pieces) with the random thresholds, plus residual events as a Poisson process. Between gaps the pixel reference moves with the path's free start, so the jump fires nothing. Each event carries its source `s`: 0 crossing, 1 residual (slope), 2 background |
+| Sensor | After each crossing the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Thresholds measured per dataset from frame change vs real event counts (`model.measure_c`); threshold spread per event fixed (`model.sigma_event`); no refractory time. Brightness per dataset: learned RGB weights, then `PNG^gamma`; under a Bayer filter (CED) each pixel uses its own channel |
+| Events | `physics.Simulator` samples the same model: exact crossings of the taut path (grid of at least 128 steps, finer where the path is fast; linear pieces) with the random thresholds, plus residual events as a Poisson process. Between gaps the pixel reference moves with the path's free start, so the jump fires nothing. Each event carries its source `s`: 0 crossing, 1 residual (slope), 2 background |
 
 ### Losses
 
@@ -276,7 +305,7 @@ Tube width, no hand-set value:
 
 | File | Content |
 |---|---|
-| `model.py` | Backbones, teacher, student, gated decoder, flows, `render(s, τ) → L, dL/dτ`, tube, residual rate |
+| `model.py` | Backbones, teacher, student, gated decoder, flows, `render(s, τ) → L, Y`, tube, residual rate |
 | `losses.py` | Likelihood, x-t / y-t loss, photometric, SIGReg, stage logic, validation diagnostics |
 | `physics.py` | Quadratic root solver and event `Simulator` |
 | `data.py` | Sequence reader, training samples, collate, joint sampling over the datasets in `data.sets` |
@@ -293,7 +322,6 @@ Tube width, no hand-set value:
 
 | Part | Source | How |
 |---|---|---|
-| RAFT | torchvision | `raft_large(weights=Raft_Large_Weights.DEFAULT)` |
 | V-JEPA 2.1 ViT-L | [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2) | `torch.hub.load(..., "vjepa2_1_vit_large_384", pretrained=False)`, then the official checkpoint (`ema_encoder`). The repo's hub file points downloads to `localhost`, so the URL is set in `model.py` |
 | LeVJEPA ViT-L | [galilai-group/LeVJEPA-VideoMix-Large](https://huggingface.co/galilai-group/LeVJEPA-VideoMix-Large) | `AutoModel.from_pretrained(..., trust_remote_code=True)` |
 | SIGReg | [rbalestr-lab/lejepa](https://github.com/rbalestr-lab/lejepa) | `SlicingUnivariateTest(EppsPulley(n_points=17), num_slices=256)` |
@@ -395,21 +423,21 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 |---|---|---|
 | `nll` | Teacher code | Lowest |
 | `nll_shuffled` | Codes swapped between samples | Clearly above `nll`, else `z` carries nothing |
-| `nll_zero` | Plain SloMo path | Above `nll` |
+| `nll_zero` | Path with no motion (`z = 0`, a cross-fade) | Far above `nll` |
 | `nll_student` | Student code | Between `nll` and `nll_zero` |
 | `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
 | `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
 
-The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen RAFT and backbone weights.
+The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen backbone weights.
 
 ### Smoke test (CPU, a few minutes)
 
 ```bash
 python toy_data.py data/toy 24
 S="data.sets={\"toy\":{\"root\":\"data/toy\",\"skip\":3}} data.crop=64 data.min_events=50 data.workers=2 data.bins=8 \
-   model.flow_prior=none model.backbone=none model.width=16 model.depth=[1,1,1] model.enc_depth=1 model.pred_dim=64 model.pred_depth=2 \
+   model.backbone=none model.width=16 model.depth=[1,1,1] model.enc_depth=1 model.pred_dim=64 model.pred_depth=2 \
    loss.grid=16 train.batch=4 train.lr=1e-3 train.warmup=20 train.log_every=100 train.val_batches=8"
 python train.py $S train.stage=teacher train.steps=800 train.save_every=400 train.out=runs/teacher
 python train.py $S train.stage=student train.init=runs/teacher/last.pt train.steps=400 train.save_every=200 train.out=runs/student
@@ -423,7 +451,7 @@ python generate.py --ckpt runs/student/last.pt --seq data/toy/val/seq100 --out r
 
 ```bash
 python generate.py --ckpt runs/student/last.pt --seq my_video/ --out events.npz --dataset bsergb   # whose sensor / brightness mapping
-python generate.py --ckpt ... --seq ... --set shot_noise_rate_hz=0 refractory_period_s=5e-4         # no background, longer blind time
+python generate.py --ckpt ... --seq ... --set shot_noise_rate_hz=0 pos_thres=x1.2                     # no background, larger ON threshold
 ```
 
 `my_video/` needs only `frames/` and `frame_ts.npy`. Output: `t` (s, float64), `x`, `y` (int16), `p` (int8 ±1), sorted by time.
@@ -431,7 +459,7 @@ python generate.py --ckpt ... --seq ... --set shot_noise_rate_hz=0 refractory_pe
 
 ### Event-guided frame interpolation
 
-The teacher's path is also a reconstructor: from I0, I1 and the real events it gives the frames at any time in the gap. `eval_interp.py` renders it in RGB at the hidden frame times (warping and blending the RGB keyframes exactly as `render()` does, in linear light) and scores it against the real hidden frames (PSNR, SSIM, and LPIPS if `pip install lpips`), next to a plain blend, the frames-only path (`z = 0`, the SloMo path) and optionally the student (`--student`). It also saves one example with error maps. Run it on the interp-stage checkpoint.
+The teacher's path is also a reconstructor: from I0, I1 and the real events it gives the frames at any time in the gap. `eval_interp.py` renders it in RGB at the hidden frame times (warping and blending the RGB keyframes exactly as `render()` does, in linear light) and scores it against the real hidden frames (PSNR, SSIM, and LPIPS if `pip install lpips`), next to a plain blend, the frames-only path (`z = 0`: in v8 a cross-fade in linear light) and optionally the student (`--student`). It also saves one example with error maps. Run it on the interp-stage checkpoint.
 
 ```bash
 python eval_interp.py --ckpt runs/interp/last.pt --split test --n 200
@@ -452,7 +480,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `model.depth`, `model.width` | Decoder UNet blocks per level ([4, 4, 12, 8]) and first-level width (64) |
 | `model.pred_dim`, `model.pred_depth` | Student predictor width (512) and layers (8) |
 | `model.lora_rank`, `model.lora_blocks`, `train.lora_lr` | LoRA on the video backbone's attention (V-JEPA 2.1 or LeVJEPA; 0 = off; e.g. 16), on the last N blocks (8 of 24), its learning rate × `train.lr` (5) |
-| `model.K` | Flow correction terms per frame (2) |
+| `model.K`, `model.flow_scale` | Flow terms per frame (2) and the bound of each term (64 px) |
 | `model.tube` | `measured` (width from the frame noise), `scalar` (× one learned factor per dataset), `false` (no tube) |
 | `model.nu` | Background events / px / s at `z = 0`; the decoder scales it per pixel and polarity |
 | `model.sigma_event` | Threshold spread per event, fixed (fraction of c); `null` = learned |
@@ -461,11 +489,15 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `loss.photo` | Weight of the photometric loss in the interp stage (10) |
 | `loss.mix` | How far back, in events, the likelihood looks for a pixel's last crossing (16; cost grows with it) |
 | `loss.grid` | τ steps of the likelihood path (128) |
-| `sensor.*` | Generation only: profile and overrides (`set`), step limits, `residual_events: false` for crossings only |
+| `sensor.*` | Generation only: profile and overrides (`set`), `max_steps`, `residual_events: false` for crossings only |
 
 ---
 
 ## 8. Status
+
+Verified here (CPU, toy data), `v8`:
+- Sampler and likelihood are the same model on a moving path; the nll is lowest at the true threshold, `κ` and `ν`.
+- All stages, all `model.tube` options; interp changes only the teacher; toy training close to v7.
 
 Verified here (CPU, toy data), `v7`:
 - Sampler and likelihood are the same model: residual event counts match (1,308 vs 1,314 per draw), and the nll is lowest at the true `κ` and `ν`.
@@ -474,7 +506,7 @@ Verified here (CPU, toy data), `v7`:
 - Toy training: `nll` < `nll_student` < `nll_shuffled` < `nll_zero`; `generate.py`, `check.py`, `eval_interp.py`.
 
 Earlier versions (still true for the parts v7 kept):
-- `dL/dτ` matches finite differences of the model, also when samples leave the image; inverse-Gaussian terms match numerical integration.
+- Inverse-Gaussian terms match numerical integration.
 - Taut path: values equal, and gradients agree to 1e-14, with a plain autograd version; `gradcheck` passes; the path stays in the tube.
 - V-JEPA 2.1 wrapper (official code, random weights), 2-process DDP.
 

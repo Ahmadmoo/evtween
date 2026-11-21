@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # official V-JEPA 2.1 ViT-L checkpoint (the hub file in facebookresearch/vjepa2 points its downloads to localhost)
 VJEPA21_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt"
@@ -35,23 +34,6 @@ def _sample(x, px, py):
 def warp(x, flow):
     # backward warp: out(p) = x(p + flow(p))
     return _sample(x, *_coords(flow))
-
-
-def warp_with_grad(y, flow, vel):
-    # y(p + flow) and its exact spatial gradient under bilinear interpolation:
-    # d/dx = forward difference in x sampled at the left integer column (linear in y), same for d/dy;
-    # on integer coordinates (kinks) take the one-sided difference in the direction of motion vel;
-    # outside the image (or on the border moving out) the border value is constant, so the gradient is 0
-    H, W = y.shape[-2:]
-    rx, ry = _coords(flow)
-    px, py = rx.clamp(0, W - 1), ry.clamp(0, H - 1)
-    corner = lambda p, v: torch.where(v >= 0, p.floor(), p.ceil() - 1).clamp(min=0)
-    inside = lambda p, v, n: (((p > 0) | ((p == 0) & (v >= 0))) & ((p < n - 1) | ((p == n - 1) & (v < 0))))[:, None]
-    dx = F.pad(y[..., 1:] - y[..., :-1], (0, 1))
-    dy = F.pad(y[..., 1:, :] - y[..., :-1, :], (0, 0, 0, 1))
-    v, gx, gy = _sample(torch.cat([y, dx, dy]), torch.cat([px, corner(px, vel[:, 0]), px]),
-                        torch.cat([py, py, corner(py, vel[:, 1])])).chunk(3)
-    return v, gx * inside(rx, vel[:, 0], W), gy * inside(ry, vel[:, 1], H)
 
 
 def fourier(v, n=16):
@@ -167,32 +149,6 @@ class UNet(nn.Module):
             x = F.interpolate(self.up[i](x), scale_factor=2, mode="bilinear", align_corners=False)
             x = self.dec[i](torch.cat([x, skips[i]], 1))
         return self.head(x)
-
-
-class FlowPrior(nn.Module):
-    def __init__(self, kind):
-        super().__init__()
-        self.net = raft_large(weights=Raft_Large_Weights.DEFAULT) if kind == "raft" else None
-        if self.net is not None:
-            self.net.requires_grad_(False)
-
-    def train(self, mode=True):
-        return super().train(False)  # frozen, always eval
-
-    @torch.no_grad()
-    def forward(self, i0, i1):
-        if self.net is None:
-            z = i0.new_zeros(i0.shape[0], 2, *i0.shape[-2:])
-            return z, z
-        H, W = i0.shape[-2:]
-        k = max(1.0, 128 / min(H, W))  # RAFT needs >= 128 px per side
-        size = (round(H * k / 8) * 8, round(W * k / 8) * 8)
-        a, b = (F.interpolate(torch.cat(x), size, mode="bilinear", align_corners=False) * 2 - 1
-                for x in ([i0, i1], [i1, i0]))
-        f = self.net(a, b, num_flow_updates=12)[-1]
-        f = F.interpolate(f, (H, W), mode="bilinear", align_corners=False)
-        f = f * torch.tensor([W / size[1], H / size[0]], device=f.device).view(1, 2, 1, 1)
-        return f.chunk(2)
 
 
 def vit_blocks(net):
@@ -313,11 +269,11 @@ class EventEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    # frames + path code -> per-pixel path coefficients; every coefficient is gated by z,
-    # so z = 0 gives exactly the plain SloMo path and the decoder cannot ignore the code
-    def __init__(self, z_dim, cout, width, depth):
+    # frames + path code -> per-pixel path coefficients; every coefficient is gated by z, so z = 0 gives exactly the path
+    # with no motion (a cross-fade of the two frames) and the decoder cannot ignore the code
+    def __init__(self, cin, z_dim, cout, width, depth):
         super().__init__()
-        self.feat = UNet(12, width, width, depth)
+        self.feat = UNet(cin, width, width, depth)
         self.gate = nn.Conv2d(z_dim, width, 1, bias=False)
         self.head = nn.Conv2d(width, cout, 1, bias=False)
         nn.init.zeros_(self.head.weight)
@@ -328,14 +284,13 @@ class Decoder(nn.Module):
 
 
 class EvTween(nn.Module):
-    def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_prior="raft", flow_scale=16.0, gamma=2.2,
+    def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_scale=64.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=512, pred_depth=8, bins=32, amp=True,
                  gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6, lora_rank=0,
                  lora_blocks=8):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
-        self.flow = FlowPrior(flow_prior)
         assert patch in (4, 8, 16), "model.patch: 4, 8 or 16 px"
         self.patch = patch  # path code cell size (px): one z per patch x patch pixels
         self.teacher = EventEncoder(2 * bins + 6, z_dim, width, int(math.log2(patch)), enc_depth)
@@ -344,8 +299,8 @@ class EvTween(nn.Module):
         self.tube = {True: "measured", None: False}.get(tube, tube)
         assert self.tube in (False, "measured", "scalar"), "model.tube: measured | scalar | false"
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
-        # outputs: flow corrections a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
-        self.decoder = Decoder(z_dim, 4 * K + VIS + 1 + 6, width, depth)
+        # outputs: flows a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
+        self.decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
         self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -354,8 +309,6 @@ class EvTween(nn.Module):
         full = lambda v: nn.Parameter(torch.full((n,), math.log(v)))
         self.log_c, self.log_r = full(c_init), full(r_init)          # ON threshold, C_off / C_on
         self.log_k = full(4.0)                                        # inverse-Gaussian shape (timing regularity)
-        self.log_R = full(5e-5)                                       # refractory time (s); grows from below to the real floor
-        self.R_max = 2e-3                                             # soft cap: with few events per pixel R is weakly pinned
         if self.tube == "scalar":
             self.log_tube = nn.Parameter(torch.zeros(n))              # log factor on the measured tube width
         # sigma_event: threshold spread per event (fraction of c), fixed in the config (None = learned: it then soaks up the
@@ -378,10 +331,6 @@ class EvTween(nn.Module):
     def r(self):
         return self.log_r.exp()
 
-    @property
-    def R(self):
-        return self.R_max * torch.tanh(self.log_R.exp() / self.R_max)
-
     def bright(self, img, ds=None, cfa=None):
         # linear brightness the event pixels see: per dataset, learned RGB weights then PNG value^gamma;
         # under a Bayer filter (cfa: 2x2 channel ids of the crop, -1 = none) each pixel sees only its own channel
@@ -394,14 +343,14 @@ class EvTween(nn.Module):
         return (img * w).sum(1, keepdim=True).clamp(1e-6, 1) ** self.gammas[ds].view(B, 1, 1, 1)
 
     def sensor(self, ds):
-        # per sample: thresholds (C_on, C_off), IG shape k, refractory R (s)
+        # per sample: thresholds (C_on, C_off), IG shape k
         c = self.log_c.exp()[ds]
         k = self.log_k.exp()[ds] if self.k_fixed is None else torch.full_like(c, self.k_fixed)
         C = torch.stack([c, c * self.log_r.exp()[ds]], 1)
         if self.measure_c:  # measured thresholds where the dataset has been measured, else the initial value
             m, ok = self.c_measured()
             C = torch.where(ok[ds, None], m[ds], C)
-        return C, k, self.R[ds]
+        return C, k
 
     def residual_rate(self, s, slope, dt, nu_scale=1.0, C=None):
         # residual events per unit tau (they don't reset the pixel), ON and OFF: (B, 2, T, H*W) from the raw path's slope
@@ -486,9 +435,8 @@ class EvTween(nn.Module):
         return super().load_state_dict(sd, strict=strict)
 
     def frozen(self, name):
-        # pretrained weights (RAFT, video backbone); the backbone's LoRA weights are trained and saved
-        return name.startswith("flow.net.") or (name.startswith("student.backbone.net.") and self.student.backbone.kind != "none"
-                                                and ".lora_" not in name)
+        # pretrained video backbone weights; its LoRA weights are trained and saved
+        return name.startswith("student.backbone.net.") and self.student.backbone.kind != "none" and ".lora_" not in name
 
     def fixed(self, name):
         return (name == "log_k" and self.k_fixed is not None) or (name in ("log_c", "log_r") and self.measure_c)
@@ -510,11 +458,8 @@ class EvTween(nn.Module):
         H, W = i0.shape[-2:]
         i0, i1 = self._pad(i0), self._pad(i1)
         ds = torch.zeros(len(i0), dtype=torch.long, device=i0.device) if ds is None else ds
-        f01, f10 = self.flow(i0, i1)
         y0, y1 = self.bright(i0, ds, cfa), self.bright(i1, ds, cfa)
-        e0, e1 = (warp(y1, f01) - y0).abs(), (warp(y0, f10) - y1).abs()
-        x = torch.cat([i0, i1, f01 / 32, f10 / 32, e0, e1], 1)
-        return dict(x=x, i0=i0, i1=i1, y0=y0, y1=y1, f01=f01, f10=f10, H=H, W=W, ds=ds, cfa=cfa)
+        return dict(x=torch.cat([i0, i1], 1), i0=i0, i1=i1, y0=y0, y1=y1, H=H, W=W, ds=ds, cfa=cfa)
 
     def encode(self, p, voxel):
         x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
@@ -533,9 +478,9 @@ class EvTween(nn.Module):
             out = self.decoder(p["x"], z)
         H, W, B, K = p["H"], p["W"], z.shape[0], self.K
         a, b, d, kap, nu = out.float()[..., :H, :W].split([2 * K, 2 * K, VIS + 1, 4, 2], 1)
-        bound = lambda x, m: m * torch.tanh(x / m)  # corrections stay within +-flow_scale px per term, visibility logits within +-6
+        bound = lambda x, m: m * torch.tanh(x / m)  # flows stay within +-flow_scale px per term, visibility logits within +-6
         crop = lambda t: t[..., :H, :W]
-        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), f01=crop(p["f01"]), f10=crop(p["f10"]), ds=p["ds"], cfa=p["cfa"],
+        return dict(y0=crop(p["y0"]), y1=crop(p["y1"]), ds=p["ds"], cfa=p["cfa"],
                     a=bound(a, self.flow_scale).reshape(B, K, 2, H, W), b=bound(b, self.flow_scale).reshape(B, K, 2, H, W),
                     d=bound(d, 6.0),
                     # residual events per threshold of raw path change, (B, ON / OFF, rise / fall, H, W): 0.01 at z = 0
@@ -544,38 +489,21 @@ class EvTween(nn.Module):
                     nu=self.nu0 / 2 * bound(nu, 8.0).exp())
 
     def flows(self, s, tau):
-        # backward flows to frame 0 / frame 1 at time tau and their tau-derivatives:
-        # F0 = SloMo(tau) + sum_k a_k tau^(k+1)  (zero at tau=0),  F1 = SloMo(tau) + sum_k b_k (1-tau)^(k+1)  (zero at tau=1)
-        f01, f10 = s["f01"], s["f10"]
+        # backward flows from the pixel at time tau to frame 0 / frame 1:
+        # F0 = sum_k a_k tau^(k+1)  (zero at tau = 0),  F1 = sum_k b_k (1 - tau)^(k+1)  (zero at tau = 1)
         k = torch.arange(self.K, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1, 1)
-        t, u = tau.unsqueeze(1), (1 - tau).unsqueeze(1)
-        F0 = -tau * (1 - tau) * f01 + tau ** 2 * f10 + (s["a"] * t ** (k + 1)).sum(1)
-        dF0 = -(1 - 2 * tau) * f01 + 2 * tau * f10 + (s["a"] * (k + 1) * t ** k).sum(1)
-        F1 = (1 - tau) ** 2 * f01 - tau * (1 - tau) * f10 + (s["b"] * u ** (k + 1)).sum(1)
-        dF1 = -2 * (1 - tau) * f01 - (1 - 2 * tau) * f10 - (s["b"] * (k + 1) * u ** k).sum(1)
-        return F0, dF0, F1, dF1
+        return (s["a"] * tau.unsqueeze(1) ** (k + 1)).sum(1), (s["b"] * (1 - tau).unsqueeze(1) ** (k + 1)).sum(1)
 
     def render(self, s, tau):
-        # log intensity L(tau) and its analytic derivative dL/dtau, tau: (B,) or (B,1,H,W)
+        # log intensity L(tau) and linear intensity Y(tau), tau: (B,) or (B,1,H,W)
         # Y = (w0*Y0(p+F0) + w1*Y1(p+F1)) / (w0+w1),  w0=(1-tau)V, w1=tau(1-V),  V = sigmoid(cubic in tau)
         tau = tau.view(-1, 1, 1, 1) if tau.dim() == 1 else tau
-        F0, dF0, F1, dF1 = self.flows(s, tau)
-        j = torch.arange(1, VIS + 1, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1)
-        z = s["d"][:, :1] + (s["d"][:, 1:] * tau ** j).sum(1, keepdim=True)
-        dz = (s["d"][:, 1:] * j * tau ** (j - 1)).sum(1, keepdim=True)
-        V = torch.sigmoid(z)
-        dV = V * (1 - V) * dz
-
-        y0, gx0, gy0 = warp_with_grad(s["y0"], F0, dF0)
-        y1, gx1, gy1 = warp_with_grad(s["y1"], F1, -dF1)
-        dy0 = gx0 * dF0[:, :1] + gy0 * dF0[:, 1:]
-        dy1 = gx1 * dF1[:, :1] + gy1 * dF1[:, 1:]
+        F0, F1 = self.flows(s, tau)
+        j = torch.arange(VIS + 1, device=tau.device, dtype=tau.dtype).view(1, -1, 1, 1)
+        V = torch.sigmoid((s["d"] * tau ** j).sum(1, keepdim=True))
         w0, w1 = (1 - tau) * V, tau * (1 - V)
-        dw0, dw1 = -V + (1 - tau) * dV, (1 - V) - tau * dV
-        den = w0 + w1 + 1e-6
-        Y = (w0 * y0 + w1 * y1) / den
-        dY = (dw0 * y0 + w0 * dy0 + dw1 * y1 + w1 * dy1 - Y * (dw0 + dw1)) / den
-        return torch.log(Y + self.eps), dY / (Y + self.eps), Y
+        Y = (w0 * warp(s["y0"], F0) + w1 * warp(s["y1"], F1)) / (w0 + w1 + 1e-6)
+        return torch.log(Y + self.eps), Y
 
 
 def build_model(cfg):

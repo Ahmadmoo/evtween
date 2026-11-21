@@ -95,8 +95,7 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
     # point-process NLL of the real event times per pixel, same sensor model as physics.Simulator. Two kinds of events:
     # Crossings of the taut path in the frame-noise tube (model.paths): after every crossing the pixel draws thresholds
     # X_on*C_on, X_off*C_off with X ~ IG(1, k) and takes a reference ref = L; ON fires when the running max of (L - ref)/C_on
-    # reaches X_on (OFF: running max of (ref - L)/C_off); after a crossing the pixel is blind for the refractory time R and
-    # takes ref = L at its end (not at the event); the first wait of each pixel starts from the stationary state.
+    # reaches X_on (OFF: running max of (ref - L)/C_off); the first wait of each pixel starts from the stationary state.
     # Residual events (model.residual_rate: kappa x the raw path's slope, plus the background nu) come on top at their own
     # rate and leave the pixel's state alone. Which events were crossings is unknown: a forward pass over each pixel's
     # events sums over it (the last crossing is among the `mix` events before, or there was none since the gap started).
@@ -109,7 +108,7 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
         Lr, Lg = path_grid(model, s, steps)
         grids = Lr, Lg, residual_grid(model, s, Lr, dt)
     _, Lg, Rg = grids
-    C, K, R = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
+    C, K = model.sensor(s["ds"])  # per sample (each dataset has its own sensor)
     Kp = K[:, None].expand(B, H * W)  # threshold spread per pixel
     c, k = C[b], Kp[b, pix][:, None]  # per event
 
@@ -120,7 +119,6 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
     last[:-1] = key[1:] != key[:-1]
     seen = torch.zeros(B * H * W, dtype=torch.bool, device=key.device)
     seen[key] = True
-    Rt, wR = R[b] / dt[b], 1e-5 / dt[b]  # refractory time and the width of its soft edge, in gap units
     own = (pol < 0).long()[:, None]
     L0 = Lg[:, 0]  # pixels without events: no crossing over the whole path
     whole = (torch.stack([Lg.amax(1) - L0, L0 - Lg.amin(1)], 1) / C[:, :, None]).transpose(1, 2).reshape(-1, 2)
@@ -132,7 +130,7 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
     gstart = torch.where(first, gs, 0).cummax(0).values
     rank = gs - gstart
     mix = min(mix, int(rank.max()) if len(rank) else 0)  # no pixel has more events before: no further candidates
-    cand = [(torch.minimum(gq(tau, q) + Rt, tau), torch.sigmoid((tau - gq(tau, q) - Rt) / wR)) for q in range(1, mix + 1)]
+    cand = [gq(tau, q) for q in range(1, mix + 1)]
     order = torch.argsort(rank, stable=True)
     nrank = torch.bincount(rank)
     pos = torch.empty_like(order)
@@ -160,8 +158,8 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
         j = (tau * steps).floor().clamp(0, steps - 1).long()  # grid step of each event
         Li, Di = at(tau), (Lg[b, j + 1, pix] - Lg[b, j, pix]) * steps * (tau < 1)
 
-        def crossing(wake, awake, first, before=None):
-            # log density of a crossing at tau (own polarity) since the pixel woke at `wake` (first: stationary start),
+        def crossing(wake, first, before=None):
+            # log density of a crossing at tau (own polarity) since the last crossing at `wake` (first: stationary start),
             # and the log survival of both thresholds up to tau (before: (top, bottom) of L since the wake, if known)
             Lp = at(wake)
             if before is None:
@@ -170,22 +168,21 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
                 before = torch.stack([before[0].maximum(Lp) - Lp, Lp - before[1].minimum(Lp)], 1) / c
             now = torch.stack([Li - Lp, Lp - Li], 1) / c
             M = torch.maximum(before, now)
-            # signal only at a new max (a wider gate biases c low when k is small) and never while blind
-            rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3) * awake[:, None]
+            # signal only at a new max (a wider gate biases c low when k is small)
+            rate = torch.stack([F.relu(Di), F.relu(-Di)], 1) / c * torch.sigmoid((now - before) / 1e-3)
             logpdf, logsf, logsf_eq = ig_logs(M, k)
             log_h = torch.where(first[:, None], logsf - logsf_eq, logpdf - logsf)
             log_s = torch.where(first[:, None], logsf_eq, logsf)
             return (rate.clamp(min=1e-12).log() + log_h).gather(1, own)[:, 0], log_s.sum(1)
 
-        end = (tau + Rt).clamp(max=1)
-        tail = ig_logs(reach(end, torch.full_like(end, 1 + 0.5 / steps), at(end)), k)[1].sum(1)  # to the end of the path
+        tail = ig_logs(reach(tau, torch.full_like(tau, 1 + 0.5 / steps), Li), k)[1].sum(1)  # to the end of the path
         log_o = (Rg[b, own[:, 0], j, pix] * steps).log()  # residual events of this polarity per unit tau (no reset)
         O = log_o.double().cumsum(0)  # sums of residual events between two of a pixel's events: differences of this (float64)
         Ob = O - log_o
-        signal, log_s = crossing(torch.zeros_like(tau), torch.ones_like(tau), torch.ones_like(first))
+        signal, log_s = crossing(torch.zeros_like(tau), torch.ones_like(first))
         terms = [signal + log_s + (Ob - Ob[gstart]).float()]  # crossing here, none before it in the gap (residuals between)
-        # top / bottom of L since candidate q's wake: the stretch from its wake to the next event, then whole stretches
-        # between consecutive events up to this one, found once per event and combined (where they sit: no gradient)
+        # top / bottom of L since candidate q: the stretches between consecutive events from it up to this one, found once
+        # per event and combined (where they sit: no gradient)
         with torch.no_grad():
             row, tp = Lg[b, :, pix], gq(tau, 1)
 
@@ -197,23 +194,18 @@ def event_nll(model, s, ev, dt, steps=128, mix=MIX, grids=None):
                 return (torch.where(has, row.gather(1, hi_i[:, None])[:, 0], -math.inf), hi_i,
                         torch.where(has, row.gather(1, lo_i[:, None])[:, 0], math.inf), lo_i)
 
-            part, full = stretch(torch.minimum(tp + Rt, tau)), stretch(tp)
+            full = stretch(tp)
             hv, hi_, lv, li_ = torch.full_like(tau, -math.inf), torch.zeros_like(gs), torch.full_like(tau, math.inf), torch.zeros_like(gs)
         no = torch.zeros_like(first)
-        for q, (wk, aw) in enumerate(cand, 1):
-            with torch.no_grad():
-                if q >= 2:  # whole stretch ending at the (q-2)-th event before
-                    u = gq(full[0], q - 2) > hv
-                    hv, hi_ = torch.where(u, gq(full[0], q - 2), hv), torch.where(u, gq(full[1], q - 2), hi_)
-                    u = gq(full[2], q - 2) < lv
-                    lv, li_ = torch.where(u, gq(full[2], q - 2), lv), torch.where(u, gq(full[3], q - 2), li_)
-                u = gq(part[0], q - 1) > hv
-                tv, ti = torch.where(u, gq(part[0], q - 1), hv), torch.where(u, gq(part[1], q - 1), hi_)
-                u = gq(part[2], q - 1) < lv
-                bv, bi = torch.where(u, gq(part[2], q - 1), lv), torch.where(u, gq(part[3], q - 1), li_)
-            top = torch.where(torch.isfinite(tv), Lg[b, ti, pix], -math.inf)
-            bot = torch.where(torch.isfinite(bv), Lg[b, bi, pix], math.inf)
-            signal, log_s = crossing(wk, aw, no, (top, bot))
+        for q, wk in enumerate(cand, 1):
+            with torch.no_grad():  # add the stretch ending at the (q-1)-th event before
+                u = gq(full[0], q - 1) > hv
+                hv, hi_ = torch.where(u, gq(full[0], q - 1), hv), torch.where(u, gq(full[1], q - 1), hi_)
+                u = gq(full[2], q - 1) < lv
+                lv, li_ = torch.where(u, gq(full[2], q - 1), lv), torch.where(u, gq(full[3], q - 1), li_)
+            top = torch.where(torch.isfinite(hv), Lg[b, hi_, pix], -math.inf)
+            bot = torch.where(torch.isfinite(lv), Lg[b, li_, pix], math.inf)
+            signal, log_s = crossing(wk, no, (top, bot))
             terms.append(signal + log_s + (Ob - gq(O, q)).float())
         beta = []  # log p(events of the pixel up to this one, this one a crossing), by rank
         for r, idx in enumerate(groups):

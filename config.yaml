@@ -22,8 +22,7 @@ model:
   z_dim: 64                    # path code per patch
   patch: 8                     # one path code per 8x8 px; the student predicts it on this grid too
   enc_depth: 6                 # blocks per level of the teacher's event encoder
-  flow_prior: raft             # raft | none
-  flow_scale: 16.0             # max size (px) of each learned flow correction term (tanh bound)
+  flow_scale: 64.0             # v8: max size (px) of each learned flow term (tanh bound); no RAFT, the flows are all learned
   gamma: 1.0                   # PNG -> linear light for datasets without their own gamma in data.sets
   eps: 0.01                    # L = log(Y + eps)
   c_init: 0.25                 # contrast threshold until measured
@@ -53,8 +52,7 @@ loss:
 sensor:                        # generation only (generate.py / physics.Simulator)
   profile: learned             # learned | clean | profile.yaml; generate.py --sensor / --set override it
   set: {}                      # e.g. {pos_thres: 0.3, shot_noise_rate_hz: x0.5}; keys: pos_thres neg_thres sigma_event
-                               # sigma_thres shot_noise_rate_hz refractory_period_s (x = relative to the profile)
-  min_steps: 4
+                               # sigma_thres shot_noise_rate_hz (x = relative to the profile)
   max_steps: 256
   seed: 0
   residual_events: true        # false: crossings only (no residual or background events)

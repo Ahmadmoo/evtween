@@ -13,7 +13,7 @@ from data import JointBatches, JointDataset, collate, datasets
 from losses import compute, diagnostics
 from model import build_model
 
-# which parameters each stage trains (pretrained RAFT / video backbone always stay frozen);
+# which parameters each stage trains (the pretrained video backbone always stays frozen, LoRA aside);
 # interp: the teacher alone (decoder, sensor and student frozen), for frame interpolation
 TRAIN = {"probe": ("student.", "to_counts."),
          "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
@@ -148,10 +148,10 @@ while step < T["steps"]:
         if rank == 0 and step % T["log_every"] == 0:
             msg = " ".join(f"{k} {v.item():.4f}" for k, v in terms.items())
             d = int(batch["ds"][0])  # the sensor of this batch's dataset
-            C, K, R = (v[0] for v in model.sensor(batch["ds"][:1]))
+            C, K = (v[0] for v in model.sensor(batch["ds"][:1]))
             sec = (time.time() - tic) / n_log  # per step since the last log line (validation left out)
             print(f"[{stage}] step {step} {list(D['sets'])[d]} loss {loss.item():.4f} {msg} c {C[0].item():.3f} r {(C[1] / C[0]).item():.3f} "
-                  f"k {K.item():.2f} R {R.item() * 1e6:.0f}us "
+                  f"k {K.item():.2f} "
                   f"gn {gnorm.item():.2f} lr {lr_at(step):.1e} | {T['batch'] * (dist.get_world_size() if ddp else 1) / sec:.1f} samples/s "
                   f"ETA {timedelta(seconds=int((T['steps'] - step) * sec))}", flush=True)
             tic, n_log = time.time(), 0

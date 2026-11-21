@@ -43,7 +43,7 @@ for name, S in sets.items():
                            events_per_px=len(b["ev_tau"]) / b["voxel"][:, 0].numel())
                 m = 3e-3 / b["dt"][b["ev_b"]]
                 keep = (b["ev_tau"] >= m) & (b["ev_tau"] < 1 - m)  # same events for every shift
-                for ms in (-3, -2, -1, 0, 1, 2, 3):  # move all events in time, plain RAFT path
+                for ms in (-3, -2, -1, 0, 1, 2, 3):  # move all events in time, path at z = 0 (v8: no motion, a weak check)
                     t = b["ev_tau"] + ms * 1e-3 / b["dt"][b["ev_b"]]
                     e = (b["ev_b"][keep], b["ev_pix"][keep], t[keep], b["ev_pol"][keep])
                     shift_acc[ms] = shift_acc.get(ms, 0) + nll(torch.zeros_like(z), e)

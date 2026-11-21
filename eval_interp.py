@@ -8,7 +8,7 @@ from data import collate, datasets
 from model import build_model, warp
 
 # event-guided frame interpolation with the teacher's path: RGB frames at the hidden frame times vs the real hidden frames.
-# blend: (1 - tau) I0 + tau I1; frames only: z = 0 (the plain SloMo path); student: z from frames (world model);
+# blend: (1 - tau) I0 + tau I1; frames only: z = 0 (v8: no motion, a cross-fade in linear light); student: z from frames (world model);
 # teacher: z from the real events. All warp and blend the RGB keyframes exactly as render() does (in linear light)
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", required=True)
@@ -44,7 +44,7 @@ except Exception:
 
 def render_rgb(s, i0, i1, tau, g):
     tau = tau.view(-1, 1, 1, 1)
-    F0, _, F1, _ = model.flows(s, tau)
+    F0, F1 = model.flows(s, tau)
     j = torch.arange(1, s["d"].shape[1], device=dev, dtype=tau.dtype).view(1, -1, 1, 1)
     V = torch.sigmoid(s["d"][:, :1] + (s["d"][:, 1:] * tau ** j).sum(1, keepdim=True))
     w0, w1 = (1 - tau) * V, tau * (1 - V)
