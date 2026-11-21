@@ -22,7 +22,7 @@ TEST
 
 ### This version (`v8`)
 
-Built from `v7`. Three parts removed; everything else is v7.
+Built from `v7`. Three parts removed and the student's head replaced; everything else is v7.
 
 | Part | v7 | v8 | Why |
 |---|---|---|---|
@@ -31,17 +31,20 @@ Built from `v7`. Three parts removed; everything else is v7.
 | `dL/dτ` | Exact slope from `render` (warp gradients) | Gone: `render` gives `L` and `Y`; slopes come from the grid | Training never used it; only the sampler did |
 | Sampler | Quadratic pieces without a tube, linear pieces on the grid with it | Always linear pieces on a grid of at least 128 steps (finer where the path is fast) | One code path |
 | Refractory time `R` | Learned per dataset (it kept rising to 0.2–0.4 ms) | Gone: after a crossing the pixel takes `ref = L` at once | ISI medians are 3–5 ms; the blind time touched few events and added a lot of code |
+| Student head | Transformer: queries with an absolute position code, global attention over all context tokens | Conv head: the context time slots stacked on channels, `model.pred_depth` ConvNeXt blocks on the token grid, then 2 × 2 cells per token; no position code, no attention | Full frames failed: the position code took values never seen on 256 crops and attention spread over ~10× more tokens. A conv does the same at every spot, so any image size works |
 
 What to expect:
 - `z = 0` is now a cross-fade of the two frames with no motion, so `nll_zero` is much higher than in v7. Compare `nll` and `nll_student`, not `nll_zero`.
 - Watch BS-ERGB (largest motions): the flows must now come from the decoder alone. Compare its `nll` with v7's teacher.
 - v7 checkpoints don't load whole (the UNet's first layer changed and the refractory parameter is gone): train from scratch.
+- The student runs on any image size: train on crops, run on full frames. `model.pred_depth` is now the number of conv blocks (8: 11.8M parameters at `pred_dim` 384, 20.2M at 512, without the backbone).
 - `check.py`'s time-shift test uses the path at `z = 0`, which has no motion in v8, so it says little; use `check_align.py` for alignment.
 
 Checks (CPU, toy):
 - **Sampler = likelihood**, on a moving texture: 2,389 residual + background events sampled per draw against 2,400 expected; the nll is lowest at the true threshold (× 0.8 / 1 / 1.25), `κ` and `ν` (× 0.5 / 1 / 2).
 - **Gradients** reach the teacher, decoder, student, `κ` and `ν` rows in every stage and with every `model.tube` option; the interp stage changes only the teacher.
 - **Toy training** (800 teacher, 400 student, 300 interp steps, same settings as v7's toy run): teacher `nll` 0.48 (v7: 0.42), `nll_student` 1.00 (v7: 1.00), interp `photo` 0.0189 → 0.0160. On the training-style samples the student samples 47.5k events against v7's 48.8k (real 56k). `generate.py`, `check.py`, `eval_interp.py` run.
+- **Student head**: shifting the frames by 16 px shifts the code by exactly 2 cells (max difference 0), so no absolute position is left. Toy student, same settings and about the same size (132k vs 142k parameters): gap `nll_student − nll` 0.43 for the conv head vs 0.52 for the transformer on training-size crops, 0.35 vs 0.47 on full toy frames. Both backbones (with LoRA) run at crop and larger sizes; gradients reach only the head and LoRA.
 - On gaps of one frame, shorter than the toy training gaps (4 frames), both versions make too few events (v8 4.2k, v7 10.4k, real 12.3k); the crossings are the same, the learned residual rate differs. Train with `skip` close to the gaps you will generate.
 
 ```bash
@@ -280,7 +283,7 @@ Tube width, no hand-set value:
 | Part | What it does |
 |---|---|
 | Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 8×8 patch grid. Training only |
-| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + transformer predictor with real frame times and gap length → `ẑ` |
+| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + conv head (time slots stacked on channels, ConvNeXt blocks, real frame times and gap length) → `ẑ`; no position code, any image size |
 | Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
 | Path | Warp both frames with learned time-polynomial flows (`K` terms per frame, no RAFT), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
@@ -478,7 +481,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
 | `model.patch`, `model.z_dim`, `model.enc_depth` | Path code cell (8 px), its size (64), teacher blocks per level (6) |
 | `model.depth`, `model.width` | Decoder UNet blocks per level ([4, 4, 12, 8]) and first-level width (64) |
-| `model.pred_dim`, `model.pred_depth` | Student predictor width (512) and layers (8) |
+| `model.pred_dim`, `model.pred_depth` | Student head width (512) and conv blocks (8) |
 | `model.lora_rank`, `model.lora_blocks`, `train.lora_lr` | LoRA on the video backbone's attention (V-JEPA 2.1 or LeVJEPA; 0 = off; e.g. 16), on the last N blocks (8 of 24), its learning rate × `train.lr` (5) |
 | `model.K`, `model.flow_scale` | Flow terms per frame (2) and the bound of each term (64 px) |
 | `model.tube` | `measured` (width from the frame noise), `scalar` (× one learned factor per dataset), `false` (no tube) |

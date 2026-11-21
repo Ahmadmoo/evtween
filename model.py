@@ -217,19 +217,17 @@ class Backbone(nn.Module):
 
 
 class Student(nn.Module):
-    # frozen video backbone (or LoRA-tuned) on the context frames + small transformer that fills the gap
-    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8):
+    # frozen video backbone (or LoRA-tuned) on the context frames + conv head: the time slots stacked on channels, ConvNeXt
+    # blocks on the token grid, then 16 / patch cells per token side. No position code and no attention: any image size
+    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8, context=4):
         super().__init__()
-        self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 queries per 16 x 16 token)
+        self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 per 16 x 16 token)
         self.backbone = Backbone(backbone, dim, lora_rank, lora_blocks)
-        self.inp = nn.Linear(self.backbone.dim, dim)
-        self.pos = nn.Linear(64, dim)
-        self.query = nn.Parameter(torch.zeros(dim))
-        layer = nn.TransformerDecoderLayer(dim, 8, 4 * dim, dropout=0.0, batch_first=True, norm_first=True)
-        self.dec = nn.TransformerDecoder(layer, depth)
-
-    def embed(self, gy, gx, t, dt):
-        return self.pos(torch.cat([fourier(gy / 16), fourier(gx / 16), fourier(t), fourier(dt.log())], -1))
+        slots = 2 * context // self.backbone.tubelet
+        self.inp = nn.Conv2d(slots * self.backbone.dim, dim, 1)
+        self.time = nn.Linear(16 * (slots + 1), dim)  # slot times and gap length, one vector per sample
+        self.blocks = nn.Sequential(*[Block(dim) for _ in range(depth)])
+        self.out = nn.Sequential(LayerNorm2d(dim), nn.Conv2d(dim, dim * self.up ** 2, 1), nn.PixelShuffle(self.up))
 
     def forward(self, ctx, ctx_tau, dt):
         # ctx: frames up to I0 then from I1 on (gap frames never included); ctx_tau: their times in gap units
@@ -238,18 +236,10 @@ class Student(nn.Module):
         for side in (slice(0, T // 2), slice(T // 2, T)):  # encode each side alone so the backbone never sees a fake jump
             tok.append(self.backbone(ctx[:, side]))
             tt.append(ctx_tau[:, side].reshape(B, -1, self.backbone.tubelet).mean(-1))
-        tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)
-        _, n, h, w, _ = tok.shape
-        gy, gx = torch.meshgrid(torch.arange(h, device=tok.device), torch.arange(w, device=tok.device), indexing="ij")
-        mem = self.inp(tok) + self.embed(gy.expand(B, n, h, w), gx.expand(B, n, h, w),
-                                         tt.view(B, n, 1, 1).expand(B, n, h, w), dt.view(B, 1, 1, 1).expand(B, n, h, w))
-        u = self.up
-        qy, qx = torch.meshgrid((torch.arange(h * u, device=tok.device) + 0.5) / u - 0.5,
-                                (torch.arange(w * u, device=tok.device) + 0.5) / u - 0.5, indexing="ij")  # in token units
-        q = self.query + self.embed(qy.expand(B, h * u, w * u), qx.expand(B, h * u, w * u),
-                                    torch.full((B, h * u, w * u), 0.5, device=tok.device), dt.view(B, 1, 1).expand(B, h * u, w * u))
-        out = self.dec(q.flatten(1, 2), mem.flatten(1, 3))
-        return out.transpose(1, 2).reshape(B, -1, h * u, w * u)
+        tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)  # (B, slots, h, w, D) in time order, (B, slots)
+        x = self.inp(tok.permute(0, 1, 4, 2, 3).flatten(1, 2))
+        x = x + self.time(torch.cat([fourier(tt).flatten(1), fourier(dt.reshape(B).log())], -1))[..., None, None]
+        return self.out(self.blocks(x))
 
 
 class EventEncoder(nn.Module):
@@ -287,7 +277,7 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_scale=64.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=512, pred_depth=8, bins=32, amp=True,
                  gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6, lora_rank=0,
-                 lora_blocks=8):
+                 lora_blocks=8, context=4):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -301,7 +291,7 @@ class EvTween(nn.Module):
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
         # outputs: flows a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
         self.decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
-        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks)
+        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, context)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
         # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample
@@ -510,4 +500,4 @@ def build_model(cfg):
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**cfg["model"], bins=cfg["data"]["bins"], gammas=gammas)
+    return EvTween(**cfg["model"], bins=cfg["data"]["bins"], context=cfg["data"]["context"], gammas=gammas)
