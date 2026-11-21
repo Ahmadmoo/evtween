@@ -230,15 +230,16 @@ def generate(dataset, split, *, data_root, sequences, methods, jobs, gpu_jobs, g
     assets = fast.old.setting("BENCHMARK_INSTALL", fast.old.LAB / "evtween/evtween-benchmark/benchmarks/event_generation")
     dest.mkdir(parents=True, exist_ok=True)
     errors = []
-    with fast.v2.split_lock(dest):
-        plans = pending_sequences(samples, methods, dest, verify_existing, errors)
-        while batch := list(islice(plans, sequences_per_batch)):
-            # Publication uses atomic rename, so scratch lives on the output filesystem.
-            with tempfile.TemporaryDirectory(prefix=".tiled-", dir=dest) as tmp:
-                scratch = Path(tmp)
-                by_method, prep_errors = prepare_batch(batch, scratch, jobs)
-                errors.extend(prep_errors)
-                errors.extend(run_batch(by_method, scratch, dataset, assets, jobs, gpu_jobs, gpu_methods, cpus))
+    # Each fast worker locks its output directory and rechecks completeness
+    # before writing, so runs on the same split can safely share the destination.
+    plans = pending_sequences(samples, methods, dest, verify_existing, errors)
+    while batch := list(islice(plans, sequences_per_batch)):
+        # Publication uses atomic rename, so scratch lives on the output filesystem.
+        with tempfile.TemporaryDirectory(prefix=".tiled-", dir=dest) as tmp:
+            scratch = Path(tmp)
+            by_method, prep_errors = prepare_batch(batch, scratch, jobs)
+            errors.extend(prep_errors)
+            errors.extend(run_batch(by_method, scratch, dataset, assets, jobs, gpu_jobs, gpu_methods, cpus))
     if errors:
         raise RuntimeError("\n".join(errors))
 
