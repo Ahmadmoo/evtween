@@ -29,7 +29,8 @@ model:
   r_init: 1.0                  # C_off / C_on until measured
   backbone: vjepa2_1           # vjepa2_1 | levjepa | none (trainable patch embedding, no world knowledge)
   pred_dim: 512                # student head width
-  pred_depth: 8                # v8: conv blocks of the student head (no position code); 20M at 512, 12M at 384
+  pred_depth: 8                # v8.1: student layers (local cross-attention + conv block); 20M at 512, 12M at 384
+  pred_window: 5               # v8.1: each cell looks at window x window tokens around it (5: 80 px)
   amp: true                    # bf16 on CUDA
   sigma_event: 0.2             # threshold spread per event (fraction of c), fixed; null = learned (it then soaks up path errors)
   nu: 0.1                      # background events per pixel per second at z = 0; the decoder scales it per pixel and polarity

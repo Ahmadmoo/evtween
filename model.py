@@ -216,18 +216,46 @@ class Backbone(nn.Module):
         return tok.reshape(B, T // self.tubelet, H // 16, W // 16, self.dim)
 
 
+class LocalCross(nn.Module):
+    # each token's u x u cells (queries) look at the window x window tokens around that token in every time slot.
+    # Position only as the offset inside the window: a learned bias per head, cell inside the token and offset (as Swin),
+    # keys outside the image masked. Nothing depends on where the window is, so any image size works
+    def __init__(self, dim, heads, up, window):
+        super().__init__()
+        self.heads, self.up, self.window = heads, up, window
+        self.norm = LayerNorm2d(dim)
+        self.q, self.kv, self.proj = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
+        self.bias = nn.Parameter(torch.zeros(heads, up * up, window * window))
+
+    def forward(self, x, mem):
+        # x: cells (B, C, h*u, w*u); mem: context tokens (B, slots, h, w, C)
+        B, C = x.shape[:2]
+        _, n, h, w, _ = mem.shape
+        u, k = self.up, self.window
+        q = self.q(self.norm(x).view(B, C, h, u, w, u).permute(0, 2, 4, 3, 5, 1).reshape(B * h * w, u * u, C))
+        kv = F.unfold(self.kv(mem).permute(0, 1, 4, 2, 3).reshape(B, n * 2 * C, h, w), k, padding=k // 2)
+        kv = kv.view(B, n, 2 * C, k * k, h * w).permute(0, 4, 1, 3, 2).reshape(B * h * w, n * k * k, 2 * C)
+        inside = F.unfold(x.new_ones(1, 1, h, w), k, padding=k // 2)[0].T.repeat(1, n) > 0  # (h*w, slots*k*k)
+        mask = torch.where(inside[:, None, None], self.bias.repeat(1, 1, n)[None], float("-inf")).repeat(B, 1, 1, 1)
+        heads = lambda t: t.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+        out = F.scaled_dot_product_attention(heads(q), *map(heads, kv.chunk(2, -1)), attn_mask=mask.to(q.dtype))
+        out = self.proj(out.transpose(1, 2).flatten(2))
+        return out.view(B, h, w, u, u, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, h * u, w * u)
+
+
 class Student(nn.Module):
-    # frozen video backbone (or LoRA-tuned) on the context frames + conv head: the time slots stacked on channels, ConvNeXt
-    # blocks on the token grid, then 16 / patch cells per token side. No position code and no attention: any image size
-    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8, context=4):
+    # frozen video backbone (or LoRA-tuned) on the context frames + local cross-attention head: one query per path-code
+    # cell (16 / patch per token side); each layer: local cross-attention to the context tokens, then a ConvNeXt block
+    # between the cells. Keys carry their slot's time and the gap length; no absolute position anywhere: any image size
+    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8, window=5):
         super().__init__()
         self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 per 16 x 16 token)
         self.backbone = Backbone(backbone, dim, lora_rank, lora_blocks)
-        slots = 2 * context // self.backbone.tubelet
-        self.inp = nn.Conv2d(slots * self.backbone.dim, dim, 1)
-        self.time = nn.Linear(16 * (slots + 1), dim)  # slot times and gap length, one vector per sample
-        self.blocks = nn.Sequential(*[Block(dim) for _ in range(depth)])
-        self.out = nn.Sequential(LayerNorm2d(dim), nn.Conv2d(dim, dim * self.up ** 2, 1), nn.PixelShuffle(self.up))
+        self.inp = nn.Linear(self.backbone.dim, dim)
+        self.time = nn.Linear(32, dim)  # (time, gap length): a key's slot, or the gap middle for the queries
+        self.query = nn.Parameter(0.02 * torch.randn(self.up ** 2, dim))  # one per cell inside a token
+        self.cross = nn.ModuleList([LocalCross(dim, 8, self.up, window) for _ in range(depth)])
+        self.mix = nn.ModuleList([Block(dim) for _ in range(depth)])
 
     def forward(self, ctx, ctx_tau, dt):
         # ctx: frames up to I0 then from I1 on (gap frames never included); ctx_tau: their times in gap units
@@ -236,10 +264,15 @@ class Student(nn.Module):
         for side in (slice(0, T // 2), slice(T // 2, T)):  # encode each side alone so the backbone never sees a fake jump
             tok.append(self.backbone(ctx[:, side]))
             tt.append(ctx_tau[:, side].reshape(B, -1, self.backbone.tubelet).mean(-1))
-        tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)  # (B, slots, h, w, D) in time order, (B, slots)
-        x = self.inp(tok.permute(0, 1, 4, 2, 3).flatten(1, 2))
-        x = x + self.time(torch.cat([fourier(tt).flatten(1), fourier(dt.reshape(B).log())], -1))[..., None, None]
-        return self.out(self.blocks(x))
+        tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)  # (B, slots, h, w, D), (B, slots)
+        _, n, h, w, _ = tok.shape
+        u, gap = self.up, fourier(dt.reshape(B).log())
+        mem = self.inp(tok) + self.time(torch.cat([fourier(tt), gap[:, None].expand(B, n, -1)], -1))[:, :, None, None]
+        q = self.query + self.time(torch.cat([fourier(torch.full_like(tt[:, 0], 0.5)), gap], -1))[:, None]
+        x = q.view(B, u, u, -1).permute(0, 3, 1, 2).repeat(1, 1, h, w)  # (B, C, h*u, w*u)
+        for cross, mix in zip(self.cross, self.mix):
+            x = mix(x + cross(x, mem))
+        return x
 
 
 class EventEncoder(nn.Module):
@@ -277,7 +310,7 @@ class EvTween(nn.Module):
     def __init__(self, width=64, depth=(4, 4, 12, 8), K=2, z_dim=64, flow_scale=64.0, gamma=2.2,
                  eps=0.01, c_init=0.25, r_init=1.0, backbone="vjepa2_1", pred_dim=512, pred_depth=8, bins=32, amp=True,
                  gammas=None, sigma_event=0.2, nu=0.1, tube="measured", measure_c=True, patch=8, enc_depth=6, lora_rank=0,
-                 lora_blocks=8, context=4):
+                 lora_blocks=8, pred_window=5):
         super().__init__()
         self.K, self.flow_scale, self.gamma, self.eps, self.amp = K, flow_scale, gamma, eps, amp
         self.mult = max(16, 2 ** (len(depth) - 1))
@@ -291,7 +324,7 @@ class EvTween(nn.Module):
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
         # outputs: flows a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
         self.decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
-        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, context)
+        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, pred_window)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
         # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample
@@ -500,4 +533,4 @@ def build_model(cfg):
     # one gamma per entry of data.sets (position = dataset id); older configs: one dataset
     g = cfg["model"].get("gamma", 2.2)
     gammas = [(v or {}).get("gamma", g) for v in (cfg["data"].get("sets") or {}).values()] or [g]
-    return EvTween(**cfg["model"], bins=cfg["data"]["bins"], context=cfg["data"]["context"], gammas=gammas)
+    return EvTween(**cfg["model"], bins=cfg["data"]["bins"], gammas=gammas)

@@ -20,7 +20,39 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v8`)
+### This version (`v8.1`)
+
+Built from `v8`. Only the student's head changes: local cross-attention instead of the conv head. Everything else is v8.
+
+| Part | v8 | v8.1 | Why |
+|---|---|---|---|
+| Student head | Conv: the context time slots stacked on channels, ConvNeXt blocks on the token grid | Local cross-attention: one query per 8 × 8 px cell; each looks at the `model.pred_window` × `pred_window` tokens (5: 80 px) around its own token in every context slot, then a ConvNeXt block mixes the cells; `model.pred_depth` layers | The query picks tokens by content, as the old transformer did. Position is only the offset inside the window (a learned bias per head, cell and offset, as in Swin) and keys outside the image are masked, so any image size still works |
+
+- Keys carry their slot's time and the gap length, so the number of context slots is free.
+- 14.8M parameters at `pred_dim` 384 and 8 layers, backbone not counted (v8 conv head: 11.8M).
+- Memory: the window copies each token 25 times. Training at 256 crops with batch 8 keeps about 3.3 GB of head activations in bf16 (v8 conv head: about 0.2 GB). Measured at batch 2 on CPU and scaled.
+- v8 teacher checkpoints load as they are; the student trains from scratch.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/teacher_v8/last.pt model.pred_dim=384 train.out=runs/student_v8.1
+```
+
+Checks (CPU, toy):
+- `LocalCross` gives the same output as a plain loop over every offset (max difference 2e-16).
+- Shifting the frames by 16 px shifts the code by exactly 2 cells (max difference 0): no absolute position is left.
+- Every stage and `model.tube` option gets gradients. Both backbones with LoRA: gradients reach only the head and LoRA; 400 × 610 frames run.
+- Toy student, same settings as the earlier runs; gap `nll_student − nll`, lower is better:
+
+| Head | Parameters | Training-size crops (64) | Full toy frames (96 × 128) |
+|---|---|---|---|
+| Transformer (v8 before the conv head) | 142k | 0.52 | 0.47 |
+| Conv (v8) | 132k | 0.43 | 0.35 |
+| Local cross-attention (v8.1) | 115k | 0.52 | 0.45 |
+
+  On toy data the attention head is about as good as the old transformer and worse than the conv head. The toy frames are too small to show the full-frame failure; the real test is full BS-ERGB frames.
+- `generate.py`, `eval_interp.py`, `check.py` run.
+
+### `v8` (separate branch)
 
 Built from `v7`. Three parts removed and the student's head replaced; everything else is v7.
 
@@ -283,7 +315,7 @@ Tube width, no hand-set value:
 | Part | What it does |
 |---|---|
 | Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 8×8 patch grid. Training only |
-| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + conv head (time slots stacked on channels, ConvNeXt blocks, real frame times and gap length) → `ẑ`; no position code, any image size |
+| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + local cross-attention head (each 8×8 cell looks at the tokens in a 5×5 window around it in every slot, then a conv block; keys carry real frame times and gap length) → `ẑ`; no absolute position, any image size |
 | Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
 | Path | Warp both frames with learned time-polynomial flows (`K` terms per frame, no RAFT), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
@@ -481,7 +513,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
 | `model.patch`, `model.z_dim`, `model.enc_depth` | Path code cell (8 px), its size (64), teacher blocks per level (6) |
 | `model.depth`, `model.width` | Decoder UNet blocks per level ([4, 4, 12, 8]) and first-level width (64) |
-| `model.pred_dim`, `model.pred_depth` | Student head width (512) and conv blocks (8) |
+| `model.pred_dim`, `model.pred_depth`, `model.pred_window` | Student head width (512), layers (8) and window in tokens (5) |
 | `model.lora_rank`, `model.lora_blocks`, `train.lora_lr` | LoRA on the video backbone's attention (V-JEPA 2.1 or LeVJEPA; 0 = off; e.g. 16), on the last N blocks (8 of 24), its learning rate × `train.lr` (5) |
 | `model.K`, `model.flow_scale` | Flow terms per frame (2) and the bound of each term (64 px) |
 | `model.tube` | `measured` (width from the frame noise), `scalar` (× one learned factor per dataset), `false` (no tube) |
