@@ -27,7 +27,7 @@ Algorithms
            displacements below ~1e-7 sigma.
 """
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import cached_property
 import math
@@ -139,13 +139,14 @@ def _collect(sums, constant, kernel, factor=1):
         sums[k].append(factor * float(kernel[k]))
 
 
-def exact_energy(points, weights, scales, block_size=1024):
+def exact_energy(points, weights, scales, block_size=1024, report=None):
     """All pairs, symmetric blocks; matches the original JSD_v2 metric."""
     k = weights.shape[1]
     if not len(points):
         return np.zeros(k)
     scaled = (points - points[0]) / scales
     sums = [[] for _ in range(k)]
+    pairs = 0
     for i in range(0, len(scaled), block_size):
         left, wl = scaled[i:i + block_size], weights[i:i + block_size]
         for j in range(i, len(scaled), block_size):
@@ -154,6 +155,9 @@ def exact_energy(points, weights, scales, block_size=1024):
                 break
             constant, kernel = _block(left, right, wl, weights[j:j + block_size])
             _collect(sums, constant, kernel, 1 if i == j else 2)
+            pairs += len(left) * len(right) * (1 if i == j else 2)
+        if report:
+            report(min(i + block_size, len(scaled)), len(scaled), pairs)
     return np.array([math.fsum(s) for s in sums])
 
 
@@ -180,6 +184,17 @@ class _Plan:
         ids, starts = np.unique(key[self.order], return_index=True)
         ends = np.append(starts[1:], len(self.order))
         self.ranges = dict(zip(ids.tolist(), zip(starts.tolist(), ends.tolist())))
+
+    def work(self):
+        """Rough relative cost of each tile (rows x rows of the 3 x 3 tiles), for progress."""
+        counts = {t: end - start for t, (start, end) in self.ranges.items()}
+        estimate = {}
+        for t, count in counts.items():
+            a, b = t % self.columns, t // self.columns
+            near = sum(counts.get((b + db) * self.columns + a + da, 0)
+                       for db in (-1, 0, 1) for da in (-1, 0, 1) if 0 <= a + da < self.columns)
+            estimate[t] = float(count) * near
+        return estimate
 
     def tiles(self):
         """Largest tiles first so parallel workers finish together."""
@@ -215,8 +230,12 @@ class _Plan:
 
 
 def fast_energy(points, weights, scales, *, cutoff_sigma=10.0, tile_px=32,
-                block_size=512, chunk_size=4096, span_factor=1.0, executor=None):
-    """CPU: ordered pairs within a box of half-width cutoff_sigma sigmas on every axis."""
+                block_size=512, chunk_size=4096, span_factor=1.0, executor=None, report=None):
+    """CPU: ordered pairs within a box of half-width cutoff_sigma sigmas on every axis.
+
+    report(done, total, pairs) is called after each tile; done/total is the estimated
+    fraction of the work. Sums are exact (math.fsum), so tile order does not matter.
+    """
     k = weights.shape[1]
     if not len(points):
         return np.zeros(k)
@@ -226,17 +245,26 @@ def fast_energy(points, weights, scales, *, cutoff_sigma=10.0, tile_px=32,
         owned, near = plan.members(tile_id)
         left, wl = plan.scaled[owned], weights[owned]
         right, wr = plan.scaled[near], weights[near]
-        sums = [[] for _ in range(k)]
+        sums, pairs = [[] for _ in range(k)], 0
         for r0, r1, c0, c1 in plan.blocks(owned, near, block_size, chunk_size, span_factor):
             _collect(sums, *_block(left[r0:r1], right[c0:c1], wl[r0:r1], wr[c0:c1]))
-        return sums
+            pairs += (r1 - r0) * (c1 - c0)
+        return sums, pairs
 
-    tasks = plan.tiles()
-    results = executor.map(run_tile, tasks) if executor else map(run_tile, tasks)
+    work = plan.work()
+    total, done, pairs = sum(work.values()), 0.0, 0
+    if executor:
+        futures = {executor.submit(run_tile, t): t for t in plan.tiles()}
+        results = ((futures[f], f.result()) for f in as_completed(futures))
+    else:
+        results = ((t, run_tile(t)) for t in plan.tiles())
     sums = [[] for _ in range(k)]
-    for part in results:
+    for tile_id, (part, tile_pairs) in results:
         for column, values in zip(sums, part):
             column.extend(values)
+        done, pairs = done + work[tile_id], pairs + tile_pairs
+        if report:
+            report(done, total, pairs)
     return np.array([math.fsum(s) for s in sums])
 
 
@@ -324,7 +352,7 @@ def _ahead(pool, function, items, depth):
 
 
 def device_energy(points, weights, scales, *, ops, cutoff_sigma=10.0, tile_px=64,
-                  block_size=4096, chunk_size=32768, span_factor=1.0, prefetch=2):
+                  block_size=4096, chunk_size=32768, span_factor=1.0, prefetch=2, report=None):
     """Same pairs as fast_energy; blocks run through `ops` (a GPU with TorchOps).
 
     CPU threads find each tile's rows and block bounds ahead of the device; every block's
@@ -338,15 +366,22 @@ def device_energy(points, weights, scales, *, ops, cutoff_sigma=10.0, tile_px=64
     def prepare(tile_id):
         owned, near = plan.members(tile_id)
         bounds = list(plan.blocks(owned, near, block_size, chunk_size, span_factor))
-        return plan.scaled[owned], weights[owned], plan.scaled[near], weights[near], bounds
+        return (tile_id, plan.scaled[owned], weights[owned], plan.scaled[near], weights[near],
+                bounds)
 
+    work = plan.work()
+    total, done, pairs = sum(work.values()), 0.0, 0
     parts = []
     with ThreadPoolExecutor(max(1, prefetch)) as pool:
-        for left, wl, right, wr, bounds in _ahead(pool, prepare, plan.tiles(), max(1, prefetch)):
-            left, wl, right, wr = (ops.put(a) for a in (left, wl, right, wr))
+        for tile_id, *arrays, bounds in _ahead(pool, prepare, plan.tiles(), max(1, prefetch)):
+            left, wl, right, wr = (ops.put(a) for a in arrays)
             sums = [ops.block_sum(wl[r0:r1], ops.kernel_rows(left[r0:r1], right[c0:c1], wr[c0:c1]))
                     for r0, r1, c0, c1 in bounds]
             parts.append(ops.stack(sums, k))
+            done += work[tile_id]
+            pairs += sum((r1 - r0) * (c1 - c0) for r0, r1, c0, c1 in bounds)
+            if report:
+                report(done, total, pairs)
     values = ops.concatenate(parts, k)
     return np.array([math.fsum(values[:, c]) for c in range(k)])
 
@@ -399,6 +434,8 @@ class MMDReference:
                                  chunk_size=chunk_size)
         self._threads = threads
         self._ops = make_ops(device) if algorithm == "fast" else None
+        # Optional: an object with stage(label, events) and __call__(done, total, pairs).
+        self.progress = None
         self.device = self._ops.name if self._ops else "cpu"
         self._reference = self._channels(reference)
         self.n_gt = len(reference)
@@ -410,15 +447,16 @@ class MMDReference:
         return _points(events, 1), _points(events, -1)
 
     def _energies(self, points, weights):
+        options = dict(self._options, report=self.progress)
         if self.algorithm == "exact":
-            return exact_energy(points, weights, self._scales, **self._options)
+            return exact_energy(points, weights, self._scales, **options)
         if self._ops is not None:
             return device_energy(points, weights, self._scales, ops=self._ops,
-                                 prefetch=min(self._threads, 4), **self._options)
+                                 prefetch=min(self._threads, 4), **options)
         if self._threads == 1 or len(points) < 4 * self._options["block_size"]:
-            return fast_energy(points, weights, self._scales, **self._options)
+            return fast_energy(points, weights, self._scales, **options)
         with ThreadPoolExecutor(self._threads) as pool:
-            return fast_energy(points, weights, self._scales, executor=pool, **self._options)
+            return fast_energy(points, weights, self._scales, executor=pool, **options)
 
     def _bound(self, weights):
         """Upper bound on |energy| of the pairs the fast algorithm skips."""
@@ -426,11 +464,15 @@ class MMDReference:
             return 0.0
         return math.exp(-0.5 * self.cutoff_sigma ** 2) * float(np.abs(weights).sum()) ** 2
 
-    def _score_channels(self, generated, columns, n_gen):
+    def _score_channels(self, generated, columns, n_gen, label=""):
         energies, bounds = {c: [] for c in columns}, {c: [] for c in columns}
-        for reference, prediction in zip(self._reference, generated):
+        for name, reference, prediction in zip(("ON", "OFF"), self._reference, generated):
+            if self.progress:
+                self.progress.stage(f"{label}{name} merge", len(reference) + len(prediction))
             channel = _channel(reference, prediction)
             points, weights = _weights(channel, columns, self.n_gt, n_gen)
+            if self.progress:
+                self.progress.stage(f"{label}{name}", len(points))
             values = self._energies(points, weights)
             for index, column in enumerate(columns):
                 bound = self._bound(weights[:, index])
@@ -442,7 +484,7 @@ class MMDReference:
     def empty_baseline(self):
         """Count distance from GT to an empty prediction, (joint, on, off, bound)."""
         empty = (np.zeros((0, 3)), np.zeros((0, 3)))
-        distances, bounds = self._score_channels(empty, ("gt_count",), 0)
+        distances, bounds = self._score_channels(empty, ("gt_count",), 0, "GT baseline ")
         on, off = distances["gt_count"]
         return math.hypot(on, off), on, off, math.sqrt(sum(bounds["gt_count"]))
 

@@ -144,6 +144,37 @@ class DeviceTests(unittest.TestCase):
         if torch.cuda.is_available():
             self.check("cuda")
 
+    def test_progress_reports_reach_the_end_and_do_not_change_scores(self):
+        rng = np.random.default_rng(2)
+        gt, gen = random_events(rng, 3000), random_events(rng, 2000)
+
+        class Recorder:
+            def __init__(self):
+                self.stages, self.calls = [], []
+
+            def stage(self, label, events):
+                self.stages.append(label)
+
+            def __call__(self, done, total, pairs):
+                self.calls.append((self.stages[-1], done, total, pairs))
+
+        for options in (dict(), dict(threads=3, block_size=64), dict(device="numpy"),
+                        dict(algorithm="exact")):
+            plain = scorer(gt, **options).score(gen)
+            watched = scorer(gt, **options)
+            watched.progress = recorder = Recorder()
+            with self.subTest(options=options):
+                self.assertEqual(watched.score(gen), plain)
+                self.assertEqual(recorder.stages, [
+                    "ON merge", "ON", "OFF merge", "OFF", "GT baseline ON merge",
+                    "GT baseline ON", "GT baseline OFF merge", "GT baseline OFF"])
+                for stage in ("ON", "OFF", "GT baseline ON", "GT baseline OFF"):
+                    calls = [c for c in recorder.calls if c[0] == stage]
+                    done = [c[1] for c in calls]
+                    self.assertEqual(done, sorted(done))
+                    self.assertAlmostEqual(done[-1], calls[-1][2])
+                    self.assertGreater(calls[-1][3], 0)
+
     def test_exact_runs_on_cpu_only(self):
         with self.assertRaises(ValueError):
             scorer(events((1, 1, 0.0, 1)), algorithm="exact", device="numpy")

@@ -79,6 +79,45 @@ def visible_gpus(device):
     return [device]
 
 
+def duration(seconds):
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
+
+
+class Progress:
+    """Where one (sequence, generator) pair is: printed every `every` seconds.
+
+    Stages: "<ON|OFF> merge" (sorting the events), "<ON|OFF>" (the kernel sums), and the
+    same with "GT baseline" once per sequence. The percentage is an estimate of the
+    kernel work, from event counts per spatial tile.
+    """
+
+    def __init__(self, prefix, every):
+        self.prefix, self.every = prefix, every
+        self.label, self.start, self.last = "", time.perf_counter(), 0.0
+
+    def stage(self, label, events):
+        self.label = label
+        self.start = self.last = time.perf_counter()
+        if events >= 5_000_000:
+            print(f"{self.prefix} {label}: {events:,} events", flush=True)
+
+    def __call__(self, done, total, pairs):
+        now = time.perf_counter()
+        finished = done >= total * (1 - 1e-9)
+        elapsed = now - self.start
+        if (now - self.last < self.every and not finished) or (finished and elapsed < self.every):
+            return
+        self.last = now
+        fraction = min(1.0, done / total) if total else 1.0
+        left = "done" if finished else (
+            f"~{duration(elapsed * (1 - fraction) / fraction)} left" if fraction else "")
+        print(f"{self.prefix} {self.label}: {fraction:6.1%}  {duration(elapsed)} elapsed, {left}, "
+              f"{pairs / max(elapsed, 1e-9):.2g} pairs/s", flush=True)
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -117,7 +156,7 @@ def _score_sequence(sequence, source, generators, settings, rows_dir, threads, d
     args = argparse.Namespace(**settings)
     reference = Reference(Path(source), args.allow_benchmark_crop)
     scorers, statuses = {}, []
-    for generator, path, inputs in generators:
+    for number, (generator, path, inputs) in enumerate(generators, 1):
         path = Path(path)
         row = dict(dataset=args.dataset, split=args.split, sequence=sequence, generator=generator,
                    sigma_spatial_px=args.sigma_spatial_px, sigma_temporal_ms=args.sigma_temporal_ms,
@@ -147,6 +186,11 @@ def _score_sequence(sequence, source, generators, settings, rows_dir, threads, d
                         tile_px=args.tile_px, block_size=args.block_size,
                         chunk_size=args.chunk_size, threads=threads, device=device)
                 scorer = scorers[crop]
+                if args.progress_every:
+                    prefix = f"  [{sequence}/{generator}]"
+                    print(f"{prefix} start: generator {number}/{len(generators)} pending here",
+                          flush=True)
+                    scorer.progress = Progress(prefix, args.progress_every)
                 predicted = load_prediction(path, metadata).select(start, stop)
                 n_gt, n_gen = scorer.n_gt, len(predicted)
                 status = {(True, True): "ok", (True, False): "empty_generated",
@@ -217,6 +261,8 @@ def arguments(argv):
                         help="Sequences scored at once (default: CPUs/8 on cpu, GPUs on cuda)")
     parser.add_argument("--threads", type=int,
                         help="Threads per sequence (on cuda: CPU threads preparing tiles)")
+    parser.add_argument("--progress-every", type=float, default=60.0, metavar="SECONDS",
+                        help="Progress line inside each pair this often (0: off; default 60)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print sources, predictions and pending pairs, then stop")
     args = parser.parse_args(argv)
@@ -232,6 +278,8 @@ def arguments(argv):
         value = getattr(args, name)
         if value is not None and value < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.progress_every < 0:
+        parser.error("--progress-every must be >= 0")
     if args.time_window_s and not args.time_window_s[0] < args.time_window_s[1]:
         parser.error("--time-window-s needs START < STOP")
     args.weighting = list(dict.fromkeys(args.weighting))
@@ -333,7 +381,7 @@ def main(argv=None):
                        if k in ("dataset", "split", "sigma_spatial_px", "sigma_temporal_ms",
                                 "weighting", "algorithm", "cutoff_sigma", "tile_px", "block_size",
                                 "chunk_size", "time_window_s", "allow_benchmark_crop",
-                                "data_root", "pred_root")}
+                                "data_root", "pred_root", "progress_every")}
     statuses = []
     if jobs == 1:
         for task in tasks:

@@ -63,6 +63,20 @@ GT comes from the `source` in each prediction's `input.json` (as in `run_metric.
 `--data-root` / `$EVTWEEN_DATA`. The start of a run prints the GT folder of every sequence,
 and every CSV row records `gt_source` and `prediction`.
 
+While a pair runs, a line is printed every `--progress-every` seconds (default 60; 0 turns
+it off) with the stage, the estimated percentage, elapsed and remaining time and kernel pairs
+per second:
+
+```
+  [02_rocket_earth_light/v2e] start: generator 1/7 pending here
+  [02_rocket_earth_light/v2e] ON merge: 434,112,318 events
+  [02_rocket_earth_light/v2e] ON:  24.5%  6m10s elapsed, ~19m01s left, 3.1e+10 pairs/s
+```
+
+Stages per pair: `ON merge`, `ON`, `OFF merge`, `OFF`, and once per sequence the same for
+`GT baseline`. The percentage is estimated from event counts per tile, so the time left is
+approximate.
+
 Output goes to `MMD/runs/<dataset>-<split>-<hash>/` (or `--output`): `config.json`,
 `rows/<sequence>/<generator>.json` written as each pair finishes, and `results.csv`. Rerun
 the same command to resume. A pair is rescored only if it did not finish or its GT or
