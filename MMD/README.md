@@ -131,8 +131,8 @@ python -m MMD.run eds test --sigma-spatial-px 2 --sigma-temporal-ms 1 --device c
 `--device cuda` uses every visible GPU, one sequence per GPU at a time (`--jobs` defaults to
 the GPU count); `--device cuda:1` uses one. CPU threads (`--threads`) prepare the next tiles
 while the GPU works; loading and merging events still runs on the CPU, so ask for a few CPUs
-and the same RAM as a CPU run. Each GPU block holds `block_size × chunk_size` doubles
-(1 GiB by default). The GPU path has no expm1 split for blocks within one sigma, which only
+and the same RAM as a CPU run. Each GPU block holds 2 × `block_size × chunk_size` doubles
+(2 GiB by default). The GPU path has no expm1 split for blocks within one sigma, which only
 matters for displacements below about 1e-7 σ.
 
 ```bash

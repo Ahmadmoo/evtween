@@ -321,9 +321,18 @@ class TorchOps(NumpyOps):
         return self.torch.from_numpy(array).to(self.device)
 
     def kernel_rows(self, left, right, wr):
-        # Exact differences (no |a|^2 + |b|^2 - 2ab shortcut), squared and exponentiated in place.
-        kernel = self.torch.cdist(left, right, compute_mode="donot_use_mm_for_euclid_dist")
-        kernel.square_().mul_(-0.5).exp_()
+        # Exact differences (no |a|^2 + |b|^2 - 2ab shortcut) with broadcast element-wise ops.
+        # Not torch.cdist: its exact mode runs one thread block per pair, which made 3-D
+        # points ~30x slower than this on the GPU.
+        torch = self.torch
+        kernel = torch.sub(left[:, 0:1], right[:, 0])
+        kernel.square_()
+        offset = torch.empty_like(kernel)
+        for axis in (1, 2):
+            torch.sub(left[:, axis:axis + 1], right[:, axis], out=offset)
+            kernel.addcmul_(offset, offset)
+        del offset
+        kernel.mul_(-0.5).exp_()
         return kernel @ wr
 
     def block_sum(self, wl, rows):

@@ -29,6 +29,23 @@ def synthetic(rng, n, width, height, duration):
     return Events(x, y, t, rng.choice([-1, 1], n).astype(np.int8))
 
 
+class PairCounter:
+    """Progress hook that only adds up the kernel pairs evaluated."""
+
+    def __init__(self):
+        self.done, self.current = 0, 0
+
+    def stage(self, label, events):
+        self.done, self.current = self.done + self.current, 0
+
+    def __call__(self, done, total, pairs):
+        self.current = pairs
+
+    @property
+    def pairs(self):
+        return self.done + self.current
+
+
 def timed(function):
     start = time.perf_counter()
     value = function()
@@ -68,10 +85,11 @@ def main(argv=None):
 
     print(f"{args.events:,} GT and {len(generated):,} generated events, "
           f"{args.width}x{args.height}, {args.duration_s} s")
-    scores, seconds = timed(lambda: MMDReference(gt, device=args.device, threads=args.threads,
-                                                 **sigmas).score(generated))
+    on_device = MMDReference(gt, device=args.device, threads=args.threads, **sigmas)
+    on_device.progress = counter = PairCounter()
+    scores, seconds = timed(lambda: on_device.score(generated))
     print(f"  {args.device:>8}: {seconds:8.1f} s   count {scores['count_distance']:.10g}   "
-          f"prob {scores['prob_distance']:.10g}")
+          f"prob {scores['prob_distance']:.10g}   ({counter.pairs / seconds:.2g} pairs/s)")
     if not args.skip_cpu:
         reference, cpu_seconds = timed(lambda: MMDReference(gt, threads=args.threads, **sigmas)
                                        .score(generated))
