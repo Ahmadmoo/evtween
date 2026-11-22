@@ -10,6 +10,7 @@ every other benchmark metric.
 | `benchmark_io.py` | GT geometry, prediction alignment (`input.json`), prediction reading |
 | `events.py` | Event validation and clock conversion (copied from `jsd_work/histogram/events.py`) |
 | `run.py` | Parallel, resumable runner |
+| `summarize.py` | Mean per generator over sequences, `summary.csv` and `summary.png` |
 | `test_mmd.py` | Analytical cases, dense O(n²) reference, fast/exact agreement, runner and resume |
 
 ## Definition
@@ -63,6 +64,19 @@ Output goes to `MMD/runs/<dataset>-<split>-<hash>/` (or `--output`): `config.jso
 `rows/<sequence>/<generator>.json` written as each pair finishes, and `results.csv`. Rerun
 the same command to resume. A pair is rescored only if it did not finish or its GT or
 prediction files changed. A folder with different settings is refused.
+
+### Summary and plot
+
+```bash
+python -m MMD.summarize MMD/runs/eds-test-<hash>
+```
+
+Prints every (sequence, generator) row, then the mean per generator over sequences, sorted
+best first, and writes `summary.csv` and `summary.png` (bars = mean, dots = sequences) in the
+run folder. It reads the `rows/` files, so it also works while a run is still going. Only
+`prob_distance` and `count_relative_to_empty` are averaged; raw `count_distance` grows with
+a sequence's event count. Compare generators only when the `sequences` column is the same
+for all of them.
 
 ### CPUs
 

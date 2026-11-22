@@ -151,7 +151,20 @@ class RunnerTests(unittest.TestCase):
             self.assertAlmostEqual(float(rows["moved"]["count_distance"]),
                                    math.sqrt(3 * -2 * math.expm1(-0.5)))
             self.assertEqual(rows["wrong_clock"]["status"], "alignment_unavailable")
-            stamp = (root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns
+            try:
+                import matplotlib  # noqa: F401
+                import pandas  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                from . import summarize
+                self.assertEqual(summarize.main([str(root / "run")]), 0)
+                self.assertTrue((root / "run" / "summary.png").is_file())
+                with (root / "run" / "summary.csv").open(newline="") as stream:
+                    summary = {r["generator"]: r for r in csv.DictReader(stream)}
+                self.assertEqual(set(summary), {"match", "moved"})
+                self.assertEqual(float(summary["match"]["prob_distance"]), 0)
+            stamp =(root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns
             run.main(command)
             self.assertEqual((root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns,
                              stamp)  # resumed, not rescored
