@@ -6,8 +6,10 @@ import csv
 import json
 import math
 from pathlib import Path
+import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -37,6 +39,10 @@ def dense(gt, gen, sigma_s, sigma_t_ms, probability):
         offsets = (points[:, None] - points[None]) / [sigma_t_ms / 1000, sigma_s, sigma_s]
         total += w @ np.exp(-0.5 * (offsets ** 2).sum(-1)) @ w
     return math.sqrt(max(total, 0.0))
+
+
+def has_torch():
+    return importlib.util.find_spec("torch") is not None
 
 
 def scorer(reference, **options):
@@ -113,43 +119,89 @@ class AgreementTests(unittest.TestCase):
             self.assertAlmostEqual(one[key], many[key], delta=1e-12 * one[key])
 
 
+class DeviceTests(unittest.TestCase):
+    """The GPU path (device_energy) on its NumPy backend here, on PyTorch where installed."""
+
+    def check(self, device, **sizes):
+        rng = np.random.default_rng(11)
+        for trial in range(3):
+            gt, gen = random_events(rng, 4000), random_events(rng, int(rng.integers(1, 3500)))
+            cpu = scorer(gt).score(gen)
+            on_device = scorer(gt, device=device, threads=2, **sizes).score(gen)
+            for key in ("count_distance", "prob_distance", "count_empty_baseline"):
+                with self.subTest(device=device, trial=trial, key=key):
+                    self.assertAlmostEqual(on_device[key], cpu[key], delta=1e-12 * cpu[key])
+
+    def test_device_path_matches_cpu(self):
+        self.check("numpy")
+        self.check("numpy", tile_px=4, block_size=33, chunk_size=97)
+
+    @unittest.skipUnless(has_torch(), "PyTorch is not installed")
+    def test_torch_backend_matches_cpu(self):
+        import torch
+
+        self.check("torch-cpu", block_size=64, chunk_size=256)
+        if torch.cuda.is_available():
+            self.check("cuda")
+
+    def test_exact_runs_on_cpu_only(self):
+        with self.assertRaises(ValueError):
+            scorer(events((1, 1, 0.0, 1)), algorithm="exact", device="numpy")
+
+
+def make_benchmark(root, sequences, models):
+    """Fake converted GT and saved predictions; returns the GT folders."""
+    from PIL import Image
+
+    from .benchmark_io import benchmark
+
+    raw = dict(x=np.array([1, 3, 5]), y=np.array([0, 2, 4]),
+               t=np.array([20.25, 20.5, 20.75]), p=np.array([0, 1, 1]))
+    sources = {}
+    for sequence in sequences:
+        source = sources[sequence] = root / "data" / "eds" / "test" / sequence
+        (source / "frames").mkdir(parents=True)
+        for i in range(2):
+            Image.new("RGB", (8, 6)).save(source / "frames" / f"{i:04}.png")
+        np.save(source / "frame_ts.npy", [20.0, 21.0])
+        for key, array in raw.items():
+            np.save(source / f"ev_{key}.npy", array)
+        _, _, _, metadata, _ = benchmark.v2.sequence_info(source)
+        for model, origin, shift in models:
+            path = root / "pred" / "eds" / "test" / model / sequence
+            path.mkdir(parents=True)
+            (path / "input.json").write_text(json.dumps(dict(metadata, absolute_t0=origin)))
+            np.savez(path / "events.npz", x=raw["x"] + shift, y=raw["y"], t=raw["t"] - 20,
+                     p=np.array([-1, 1, 1]))
+    return sources
+
+
+def read_results(path):
+    with path.open(newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+MOVED = math.sqrt(3 * -2 * math.expm1(-0.5))
+
+
 class RunnerTests(unittest.TestCase):
     def test_runner_alignment_and_resume(self):
-        from PIL import Image
-
         from . import run
-        from .benchmark_io import benchmark
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / "data" / "eds" / "test" / "seq"
-            (source / "frames").mkdir(parents=True)
-            for i in range(2):
-                Image.new("RGB", (8, 6)).save(source / "frames" / f"{i:04}.png")
-            np.save(source / "frame_ts.npy", [20.0, 21.0])
-            raw = dict(x=np.array([1, 3, 5]), y=np.array([0, 2, 4]),
-                       t=np.array([20.25, 20.5, 20.75]), p=np.array([0, 1, 1]))
-            for key, array in raw.items():
-                np.save(source / f"ev_{key}.npy", array)
-            _, _, _, metadata, _ = benchmark.v2.sequence_info(source)
-            for model, origin, shift in (("match", 20.0, 0), ("moved", 20.0, 1),
-                                         ("wrong_clock", 19.0, 0)):
-                path = root / "pred" / "eds" / "test" / model / "seq"
-                path.mkdir(parents=True)
-                (path / "input.json").write_text(json.dumps(dict(metadata, absolute_t0=origin)))
-                np.savez(path / "events.npz", x=raw["x"] + shift, y=raw["y"], t=raw["t"] - 20,
-                         p=np.array([-1, 1, 1]))
+            source = make_benchmark(root, ("seq",), (("match", 20.0, 0), ("moved", 20.0, 1),
+                                                     ("wrong_clock", 19.0, 0)))["seq"]
             command = ["eds", "test", "--sigma-spatial-px", "1", "--sigma-temporal-ms", "1",
                        "--data-root", str(root / "data"), "--pred-root", str(root / "pred"),
                        "--output", str(root / "run"), "--jobs", "1", "--threads", "1"]
             self.assertEqual(run.main(command), 1)  # wrong_clock is unavailable
-            with (root / "run" / "results.csv").open(newline="") as stream:
-                rows = {r["generator"]: r for r in csv.DictReader(stream)}
+            rows = {r["generator"]: r for r in read_results(root / "run" / "results.csv")}
             self.assertEqual(rows["match"]["status"], "ok")
+            self.assertEqual(rows["match"]["device"], "cpu")
             self.assertEqual(float(rows["match"]["count_distance"]), 0)
             self.assertEqual(rows["match"]["gt_source"], str(source))
-            self.assertAlmostEqual(float(rows["moved"]["count_distance"]),
-                                   math.sqrt(3 * -2 * math.expm1(-0.5)))
+            self.assertAlmostEqual(float(rows["moved"]["count_distance"]), MOVED)
             self.assertEqual(rows["wrong_clock"]["status"], "alignment_unavailable")
             try:
                 import matplotlib  # noqa: F401
@@ -164,7 +216,7 @@ class RunnerTests(unittest.TestCase):
                     summary = {r["generator"]: r for r in csv.DictReader(stream)}
                 self.assertEqual(set(summary), {"match", "moved"})
                 self.assertEqual(float(summary["match"]["prob_distance"]), 0)
-            stamp =(root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns
+            stamp = (root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns
             run.main(command)
             self.assertEqual((root / "run" / "rows" / "seq" / "match.json").stat().st_mtime_ns,
                              stamp)  # resumed, not rescored
@@ -172,6 +224,26 @@ class RunnerTests(unittest.TestCase):
             changed[3] = "2"  # --sigma-spatial-px
             with self.assertRaisesRegex(SystemExit, "different settings"):
                 run.main(changed)
+
+    def test_gpu_scheduling_with_stand_in_devices(self):
+        """Two sequences on two 'GPUs' (NumPy stand-ins) in two processes."""
+        from . import run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_benchmark(root, ("s1", "s2"), (("match", 20.0, 0), ("moved", 20.0, 1)))
+            command = ["eds", "test", "--sigma-spatial-px", "1", "--sigma-temporal-ms", "1",
+                       "--data-root", str(root / "data"), "--pred-root", str(root / "pred"),
+                       "--output", str(root / "run"), "--device", "cuda", "--jobs", "2",
+                       "--threads", "1"]
+            with mock.patch.object(run, "visible_gpus", return_value=["numpy", "numpy"]):
+                self.assertEqual(run.main(command), 0)
+            rows = read_results(root / "run" / "results.csv")
+            self.assertEqual(len(rows), 4)
+            for row in rows:
+                self.assertEqual((row["status"], row["device"]), ("ok", "numpy"))
+                expected = 0 if row["generator"] == "match" else MOVED
+                self.assertAlmostEqual(float(row["count_distance"]), expected)
 
 
 if __name__ == "__main__":

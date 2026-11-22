@@ -16,12 +16,17 @@ Weightings
 
 Algorithms
     exact  every pair, blocks swept in time and stopped where the Gaussian
-           underflows (40 temporal sigmas). Reference implementation.
+           underflows (40 temporal sigmas). Reference implementation, CPU only.
     fast   pairs whose scaled offset exceeds `cutoff_sigma` along any axis are
            skipped using spatial tiles and a time sweep, and tiles run on threads.
            Each skipped pair has kernel < exp(-cutoff^2/2); the reported
            truncation bound covers all of them.
+           device="cpu" runs the blocks with NumPy threads; device="cuda" runs the same
+           blocks in float64 on a GPU through PyTorch (device_energy). The GPU path has
+           no expm1 split for blocks within one sigma, which only matters for
+           displacements below ~1e-7 sigma.
 """
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
@@ -31,6 +36,24 @@ import numpy as np
 
 WEIGHTINGS = ("count", "probability")
 EXACT_TIME_CUTOFF = 40.0
+# Bump when a change alters scores; run folders are keyed on it instead of on the code.
+METRIC_VERSION = 1
+# Tile and block sizes per backend: they change speed and memory, never the pairs scored.
+SIZES = {"cpu": dict(tile_px=32, block_size=512, chunk_size=4096),
+         "device": dict(tile_px=64, block_size=4096, chunk_size=32768)}
+
+
+def make_ops(device):
+    """None for the threaded NumPy path ("cpu"); otherwise the device_energy backend."""
+    if device == "cpu":
+        return None
+    if device == "numpy":
+        return NumpyOps()
+    if device == "torch-cpu":
+        return TorchOps("cpu")
+    if device == "cuda" or device.startswith("cuda:"):
+        return TorchOps(device)
+    raise ValueError(f"Unknown device {device!r}; use cpu, cuda or cuda:N")
 
 
 @dataclass(frozen=True)
@@ -46,15 +69,31 @@ def _points(events, polarity):
 
 
 def _channel(reference, generated):
+    """Merge identical (t, x, y) rows, sorted by t, then x, then y, with multiplicities.
+
+    Same result as np.unique(axis=0) but much faster on time-sorted streams: a stable sort
+    on t (two sorted runs), then on one integer key (t rank, x, y) that is nearly sorted.
+    """
     both = np.concatenate((reference, generated))
     if not len(both):
         empty = np.zeros(0, dtype=np.int64)
         return Channel(np.zeros((0, 3)), empty, empty)
-    points, inverse = np.unique(both, axis=0, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    gt = np.bincount(inverse[:len(reference)], minlength=len(points))
-    gen = np.bincount(inverse[len(reference):], minlength=len(points))
-    return Channel(points, gt, gen)
+    order = np.argsort(both[:, 0], kind="stable")
+    times = both[order, 0]
+    rank = np.zeros(len(times), dtype=np.int64)
+    np.cumsum(times[1:] != times[:-1], out=rank[1:])
+    x = both[order, 1].astype(np.int64)
+    y = both[order, 2].astype(np.int64)
+    height = int(y.max()) + 1
+    key = rank * ((int(x.max()) + 1) * height) + x * height + y
+    order = order[np.argsort(key, kind="stable")]
+    ordered = both[order]
+    new = np.ones(len(ordered), dtype=bool)
+    new[1:] = np.any(ordered[1:] != ordered[:-1], axis=1)
+    starts = np.flatnonzero(new)
+    gt = np.add.reduceat((order < len(reference)).astype(np.int64), starts)
+    gen = np.diff(np.append(starts, len(ordered))) - gt
+    return Channel(ordered[starts], gt, gen)
 
 
 def _weights(channel, columns, n_gt, n_gen):
@@ -118,64 +157,198 @@ def exact_energy(points, weights, scales, block_size=1024):
     return np.array([math.fsum(s) for s in sums])
 
 
-def fast_energy(points, weights, scales, *, cutoff_sigma=10.0, tile_px=32,
-                block_size=512, chunk_size=4096, span_factor=1.0, executor=None):
-    """Ordered pairs within a box of half-width cutoff_sigma sigmas on every axis."""
-    k = weights.shape[1]
-    if not len(points):
-        return np.zeros(k)
-    scaled = (points - points[0]) / scales
-    times = scaled[:, 0]
-    halo_px = cutoff_sigma * scales[1]
-    span = cutoff_sigma * span_factor
-    tile = max(int(tile_px), math.ceil(halo_px), 1)
-    x = points[:, 1].astype(np.int64)
-    y = points[:, 2].astype(np.int64)
-    columns = int(x.max()) // tile + 1
-    key = (y // tile) * columns + x // tile
-    # Stable: rows of each tile stay in time order (row index order).
-    order = np.argsort(key, kind="stable")
-    tile_ids, starts = np.unique(key[order], return_index=True)
-    ends = np.append(starts[1:], len(order))
-    ranges = dict(zip(tile_ids.tolist(), zip(starts.tolist(), ends.tolist())))
+class _Plan:
+    """Spatial tiles of the fast algorithm (only to find neighbours; every event is scored).
 
-    def run_tile(tile_id):
-        start, end = ranges[tile_id]
-        owned = order[start:end]
-        a, b = tile_id % columns, tile_id // columns
-        parts = [order[slice(*ranges[n])] for db in (-1, 0, 1) for da in (-1, 0, 1)
-                 if 0 <= a + da < columns and (n := (b + db) * columns + a + da) in ranges]
+    Each row is owned by one tile. A tile's neighbours are the rows of the 3 x 3 tiles
+    around it that lie within `cutoff_sigma` spatial sigmas of the tile, so no pair closer
+    than the cutoff is missed at a tile border.
+    """
+
+    def __init__(self, points, scales, cutoff_sigma, tile_px):
+        self.scaled = (points - points[0]) / scales
+        self.times = self.scaled[:, 0]
+        self.cutoff = cutoff_sigma
+        self.halo_px = cutoff_sigma * scales[1]
+        self.tile = max(int(tile_px), math.ceil(self.halo_px), 1)
+        self.x, self.y = points[:, 1], points[:, 2]
+        key_x = self.x.astype(np.int64) // self.tile
+        self.columns = int(key_x.max()) + 1
+        key = (self.y.astype(np.int64) // self.tile) * self.columns + key_x
+        # Stable: rows of each tile stay in time order (row index order).
+        self.order = np.argsort(key, kind="stable")
+        ids, starts = np.unique(key[self.order], return_index=True)
+        ends = np.append(starts[1:], len(self.order))
+        self.ranges = dict(zip(ids.tolist(), zip(starts.tolist(), ends.tolist())))
+
+    def tiles(self):
+        """Largest tiles first so parallel workers finish together."""
+        return sorted(self.ranges, key=lambda t: self.ranges[t][0] - self.ranges[t][1])
+
+    def members(self, tile_id):
+        """(owned rows, neighbour rows), both in time order."""
+        start, end = self.ranges[tile_id]
+        a, b = tile_id % self.columns, tile_id // self.columns
+        parts = [self.order[slice(*self.ranges[n])] for db in (-1, 0, 1) for da in (-1, 0, 1)
+                 if 0 <= a + da < self.columns
+                 and (n := (b + db) * self.columns + a + da) in self.ranges]
         near = np.concatenate(parts)
-        nx, ny = points[near, 1], points[near, 2]
-        keep = ((nx >= a * tile - halo_px) & (nx < (a + 1) * tile + halo_px)
-                & (ny >= b * tile - halo_px) & (ny < (b + 1) * tile + halo_px))
-        near = np.sort(near[keep])  # row order is time order
-        near_t = times[near]
-        sums = [[] for _ in range(k)]
-        owned_t = times[owned]
+        nx, ny, tile, halo = self.x[near], self.y[near], self.tile, self.halo_px
+        keep = ((nx >= a * tile - halo) & (nx < (a + 1) * tile + halo)
+                & (ny >= b * tile - halo) & (ny < (b + 1) * tile + halo))
+        return self.order[start:end], np.sort(near[keep])
+
+    def blocks(self, owned, near, block_size, chunk_size, span_factor):
+        """(row start, row end, column start, column end) into owned / near."""
+        owned_t, near_t = self.times[owned], self.times[near]
+        span = self.cutoff * span_factor
         i = 0
         while i < len(owned):
             # Cap the block's time span too, so sparse tiles do not pull in far neighbours.
-            end = min(i + block_size,
-                      int(np.searchsorted(owned_t, owned_t[i] + span, "right")))
-            rows = owned[i:max(end, i + 1)]
-            i += len(rows)
-            left, wl = scaled[rows], weights[rows]
-            lo = np.searchsorted(near_t, times[rows[0]] - cutoff_sigma, "left")
-            hi = np.searchsorted(near_t, times[rows[-1]] + cutoff_sigma, "right")
+            end = max(i + 1, min(i + block_size,
+                                 int(np.searchsorted(owned_t, owned_t[i] + span, "right"))))
+            lo = int(np.searchsorted(near_t, owned_t[i] - self.cutoff, "left"))
+            hi = int(np.searchsorted(near_t, owned_t[end - 1] + self.cutoff, "right"))
             for j in range(lo, hi, chunk_size):
-                cols = near[j:min(j + chunk_size, hi)]
-                _collect(sums, *_block(left, scaled[cols], wl, weights[cols]))
+                yield i, end, j, min(j + chunk_size, hi)
+            i = end
+
+
+def fast_energy(points, weights, scales, *, cutoff_sigma=10.0, tile_px=32,
+                block_size=512, chunk_size=4096, span_factor=1.0, executor=None):
+    """CPU: ordered pairs within a box of half-width cutoff_sigma sigmas on every axis."""
+    k = weights.shape[1]
+    if not len(points):
+        return np.zeros(k)
+    plan = _Plan(points, scales, cutoff_sigma, tile_px)
+
+    def run_tile(tile_id):
+        owned, near = plan.members(tile_id)
+        left, wl = plan.scaled[owned], weights[owned]
+        right, wr = plan.scaled[near], weights[near]
+        sums = [[] for _ in range(k)]
+        for r0, r1, c0, c1 in plan.blocks(owned, near, block_size, chunk_size, span_factor):
+            _collect(sums, *_block(left[r0:r1], right[c0:c1], wl[r0:r1], wr[c0:c1]))
         return sums
 
-    # Largest tiles first so threads finish together.
-    tasks = sorted(ranges, key=lambda t: ranges[t][0] - ranges[t][1])
+    tasks = plan.tiles()
     results = executor.map(run_tile, tasks) if executor else map(run_tile, tasks)
     sums = [[] for _ in range(k)]
     for part in results:
         for column, values in zip(sums, part):
             column.extend(values)
     return np.array([math.fsum(s) for s in sums])
+
+
+class NumpyOps:
+    """Array backend of device_energy on the CPU (reference for the GPU backend)."""
+
+    name = "numpy"
+
+    def put(self, array):
+        return np.ascontiguousarray(array, dtype=np.float64)
+
+    def kernel_rows(self, left, right, wr):
+        exponent = np.subtract.outer(left[:, 0], right[:, 0])
+        exponent *= exponent
+        for axis in (1, 2):
+            offset = np.subtract.outer(left[:, axis], right[:, axis])
+            offset *= offset
+            exponent += offset
+        exponent *= -0.5
+        np.exp(exponent, out=exponent)
+        return exponent @ wr
+
+    def block_sum(self, wl, rows):
+        return np.einsum("ik,ik->k", wl, rows)
+
+    def stack(self, parts, k):
+        return np.array(parts, dtype=np.float64).reshape(-1, k)
+
+    def concatenate(self, parts, k):
+        return np.concatenate(parts) if parts else np.zeros((0, k))
+
+
+class TorchOps(NumpyOps):
+    """PyTorch backend: the same blocks in float64 on a GPU ("cuda", "cuda:1") or "cpu"."""
+
+    def __init__(self, device):
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError(f"device={device!r} needs PyTorch in this environment") from None
+        self.torch = torch
+        self.device = torch.device(device)
+        if self.device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+            if self.device.index is not None:
+                torch.cuda.set_device(self.device)
+            self.name = torch.cuda.get_device_name(self.device)
+        else:
+            self.name = f"torch-{self.device.type}"
+
+    def put(self, array):
+        array = np.ascontiguousarray(array, dtype=np.float64)
+        return self.torch.from_numpy(array).to(self.device)
+
+    def kernel_rows(self, left, right, wr):
+        # Exact differences (no |a|^2 + |b|^2 - 2ab shortcut), squared and exponentiated in place.
+        kernel = self.torch.cdist(left, right, compute_mode="donot_use_mm_for_euclid_dist")
+        kernel.square_().mul_(-0.5).exp_()
+        return kernel @ wr
+
+    def block_sum(self, wl, rows):
+        return (wl * rows).sum(dim=0)
+
+    def stack(self, parts, k):
+        if not parts:
+            return self.torch.zeros((0, k), dtype=self.torch.float64, device=self.device)
+        return self.torch.stack(parts)
+
+    def concatenate(self, parts, k):
+        if not parts:
+            return np.zeros((0, k))
+        return self.torch.cat(parts).cpu().numpy()
+
+
+def _ahead(pool, function, items, depth):
+    """pool.map that prepares at most `depth` items ahead of the consumer."""
+    pending = deque()
+    for item in items:
+        pending.append(pool.submit(function, item))
+        if len(pending) > depth:
+            yield pending.popleft().result()
+    while pending:
+        yield pending.popleft().result()
+
+
+def device_energy(points, weights, scales, *, ops, cutoff_sigma=10.0, tile_px=64,
+                  block_size=4096, chunk_size=32768, span_factor=1.0, prefetch=2):
+    """Same pairs as fast_energy; blocks run through `ops` (a GPU with TorchOps).
+
+    CPU threads find each tile's rows and block bounds ahead of the device; every block's
+    sum stays on the device until the end and is then added exactly (math.fsum).
+    """
+    k = weights.shape[1]
+    if not len(points):
+        return np.zeros(k)
+    plan = _Plan(points, scales, cutoff_sigma, tile_px)
+
+    def prepare(tile_id):
+        owned, near = plan.members(tile_id)
+        bounds = list(plan.blocks(owned, near, block_size, chunk_size, span_factor))
+        return plan.scaled[owned], weights[owned], plan.scaled[near], weights[near], bounds
+
+    parts = []
+    with ThreadPoolExecutor(max(1, prefetch)) as pool:
+        for left, wl, right, wr, bounds in _ahead(pool, prepare, plan.tiles(), max(1, prefetch)):
+            left, wl, right, wr = (ops.put(a) for a in (left, wl, right, wr))
+            sums = [ops.block_sum(wl[r0:r1], ops.kernel_rows(left[r0:r1], right[c0:c1], wr[c0:c1]))
+                    for r0, r1, c0, c1 in bounds]
+            parts.append(ops.stack(sums, k))
+    values = ops.concatenate(parts, k)
+    return np.array([math.fsum(values[:, c]) for c in range(k)])
 
 
 def _distance(energy, weights, bound):
@@ -194,8 +367,8 @@ class MMDReference:
     """
 
     def __init__(self, reference, *, sigma_spatial_px, sigma_temporal_ms,
-                 weightings=WEIGHTINGS, algorithm="fast", cutoff_sigma=10.0, tile_px=32,
-                 block_size=512, chunk_size=4096, threads=1):
+                 weightings=WEIGHTINGS, algorithm="fast", cutoff_sigma=10.0, tile_px=None,
+                 block_size=None, chunk_size=None, threads=1, device="cpu"):
         time_s = sigma_temporal_ms / 1000
         if not all(math.isfinite(v) and v > 0 for v in (sigma_spatial_px, time_s)):
             raise ValueError("Gaussian scales must be finite and positive")
@@ -204,6 +377,12 @@ class MMDReference:
             raise ValueError(f"weightings must be a non-empty subset of {WEIGHTINGS}")
         if algorithm not in ("fast", "exact"):
             raise ValueError("algorithm must be 'fast' or 'exact'")
+        if algorithm == "exact" and device != "cpu":
+            raise ValueError("The exact algorithm runs on the CPU only")
+        sizes = SIZES["cpu" if device == "cpu" else "device"]
+        tile_px = sizes["tile_px"] if tile_px is None else tile_px
+        block_size = sizes["block_size"] if block_size is None else block_size
+        chunk_size = sizes["chunk_size"] if chunk_size is None else chunk_size
         for name, value in (("block_size", block_size), ("chunk_size", chunk_size),
                             ("tile_px", tile_px), ("threads", threads)):
             if type(value) is not int or value <= 0:
@@ -219,6 +398,8 @@ class MMDReference:
             self._options.update(cutoff_sigma=cutoff_sigma, tile_px=tile_px,
                                  chunk_size=chunk_size)
         self._threads = threads
+        self._ops = make_ops(device) if algorithm == "fast" else None
+        self.device = self._ops.name if self._ops else "cpu"
         self._reference = self._channels(reference)
         self.n_gt = len(reference)
 
@@ -231,6 +412,9 @@ class MMDReference:
     def _energies(self, points, weights):
         if self.algorithm == "exact":
             return exact_energy(points, weights, self._scales, **self._options)
+        if self._ops is not None:
+            return device_energy(points, weights, self._scales, ops=self._ops,
+                                 prefetch=min(self._threads, 4), **self._options)
         if self._threads == 1 or len(points) < 4 * self._options["block_size"]:
             return fast_energy(points, weights, self._scales, **self._options)
         with ThreadPoolExecutor(self._threads) as pool:

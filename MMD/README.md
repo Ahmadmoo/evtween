@@ -6,12 +6,13 @@ every other benchmark metric.
 
 | File | Role |
 | --- | --- |
-| `kernel.py` | The distance: `exact` reference and `fast` tiled/threaded algorithm, `count` and `probability` weightings |
+| `kernel.py` | The distance: `exact` reference, `fast` tiled algorithm on CPU threads or a GPU, `count` and `probability` weightings |
 | `benchmark_io.py` | GT geometry, prediction alignment (`input.json`), prediction reading |
 | `events.py` | Event validation and clock conversion (copied from `jsd_work/histogram/events.py`) |
 | `run.py` | Parallel, resumable runner |
 | `summarize.py` | Mean per generator over sequences, `summary.csv` and `summary.png` |
-| `test_mmd.py` | Analytical cases, dense O(n²) reference, fast/exact agreement, runner and resume |
+| `check_device.py` | GPU vs CPU on synthetic events: same scores? how much faster? |
+| `test_mmd.py` | Analytical cases, dense O(n²) reference, fast/exact/GPU-path agreement, runner, resume, GPU scheduling |
 
 ## Definition
 
@@ -36,10 +37,12 @@ Both are computed in one pass by default (`--weighting count probability`).
   axis, using spatial tiles and a time sweep, and runs tiles on threads. Each skipped pair has
   kernel < e^(−50); `*_truncation_bound` is a guaranteed bound on the resulting change of the
   distance. On synthetic 640×480 data it matched `exact` to 1e-14 and was ~28× faster on one
-  thread.
+  thread. With `--device cuda` the same blocks run in float64 on a GPU through PyTorch.
 
-`--tile-px`, `--block-size`, `--chunk-size`, `--jobs` and `--threads` change speed and memory
-only, never the score, so changing them keeps resume working.
+`--device`, `--tile-px`, `--block-size`, `--chunk-size`, `--jobs` and `--threads` change
+speed and memory only, never the score, so changing them keeps resume working. Run folders
+are keyed on the settings and on `METRIC_VERSION` in `kernel.py`, which is bumped only when
+a change alters scores.
 
 ## Run
 
@@ -99,6 +102,30 @@ python -m MMD.run eds test --sigma-spatial-px 2 --sigma-temporal-ms 1
 ```
 
 Without Slurm, `taskset -c 0-31 python -m MMD.run ...` gives the same limit.
+
+### GPU
+
+Needs PyTorch with CUDA in the environment. Everything stays float64, so A100 and H100 give
+the CPU's scores (H100 has about 3× the FP64 rate, so it is faster). The GPU model is chosen
+in the job request, not in the code. Check a new GPU first:
+
+```bash
+python -m MMD.check_device                    # cuda vs cpu on 2M synthetic events
+python -m MMD.run eds test --sigma-spatial-px 2 --sigma-temporal-ms 1 --device cuda
+```
+
+`--device cuda` uses every visible GPU, one sequence per GPU at a time (`--jobs` defaults to
+the GPU count); `--device cuda:1` uses one. CPU threads (`--threads`) prepare the next tiles
+while the GPU works; loading and merging events still runs on the CPU, so ask for a few CPUs
+and the same RAM as a CPU run. Each GPU block holds `block_size × chunk_size` doubles
+(1 GiB by default). The GPU path has no expm1 split for blocks within one sigma, which only
+matters for displacements below about 1e-7 σ.
+
+```bash
+#SBATCH --gres=gpu:h100:1      # or gpu:a100:1; names depend on the cluster (sinfo -o "%P %G")
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+```
 
 ## Choosing σ
 
