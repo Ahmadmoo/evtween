@@ -12,6 +12,7 @@ First time on a GPU: python -m MMD.check_device_v2_fast
 """
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import csv
 import json
 import multiprocessing
 import os
@@ -31,9 +32,30 @@ if __package__ in (None, ""):
 
 from .benchmark_io import AlignmentError, Reference, benchmark, component, load_prediction  # noqa: E402
 from .kernel import METRIC_VERSION, WEIGHTINGS  # noqa: E402
-from .kernel_v2_fast import ENGINE, MMDReference  # noqa: E402
-from .run import (HERE, Progress, allocated_cpus, export_csv, finished,  # noqa: E402
+from .kernel_v2_fast import ENGINE, OUTPUT_VERSION, SUM_COLUMNS, MMDReference  # noqa: E402
+from .run import (COLUMNS, HERE, Progress, allocated_cpus, finished,  # noqa: E402
                   fingerprint, gt_files, row_file, visible_gpus, write_json)
+
+
+# run.py's columns, then the three kernel sums per polarity and the cosine similarity.
+COLUMNS_V2 = (*COLUMNS[:COLUMNS.index("seconds")], *SUM_COLUMNS,
+              *COLUMNS[COLUMNS.index("seconds"):])
+
+
+def export_csv(output, rows_dir, pairs):
+    rows = []
+    for sequence, generator in pairs:
+        try:
+            rows.append(json.loads(row_file(rows_dir, sequence, generator).read_text()))
+        except (OSError, ValueError):
+            continue
+    temporary = output / ".results.csv.tmp"
+    with temporary.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=COLUMNS_V2, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, output / "results.csv")
+    return rows
 
 
 def score_sequence(sequence, source, generators, settings, rows_dir, threads, device="cpu",
@@ -178,7 +200,7 @@ def settings_of(args, data_root):
     return dict(
         dataset=args.dataset, split=args.split, sigma_spatial_px=args.sigma_spatial_px,
         sigma_temporal_ms=args.sigma_temporal_ms, weighting=args.weighting,
-        engine=ENGINE, cutoff_sigma=args.cutoff_sigma,
+        engine=ENGINE, output_version=OUTPUT_VERSION, cutoff_sigma=args.cutoff_sigma,
         time_window_s=args.time_window_s, allow_benchmark_crop=args.allow_benchmark_crop,
         data_root=str(data_root) if args.data_root else None,
         pred_root=str(args.pred_root.resolve()),

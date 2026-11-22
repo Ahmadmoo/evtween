@@ -3,6 +3,7 @@
     python -m unittest MMD.test_v2_fast -v
 """
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,7 +41,7 @@ class AgreementTests(unittest.TestCase):
         for index, (gt, gen) in enumerate(cases):
             expected = kernel.MMDReference(gt, **SIGMAS).score(gen)
             got = kernel_v2_fast.MMDReference(gt, **SIGMAS, **options).score(gen)
-            self.assertEqual(set(got), set(expected))
+            self.assertEqual(set(got), set(expected) | set(kernel_v2_fast.SUM_COLUMNS))
             for key in KEYS:
                 with self.subTest(options=options, case=index, key=key):
                     self.assertTrue(close(got[key], expected[key]), (got[key], expected[key]))
@@ -117,13 +118,57 @@ class AgreementTests(unittest.TestCase):
                         self.assertTrue(close(got[key], expected[key]),
                                         (key, got[key], expected[key]))
 
+    def test_sums_and_similarity_on_every_path(self):
+        """The three sums against a dense O(n^2) sum, for each way a channel is scored."""
+        rng = np.random.default_rng(9)
+
+        def dense(a, b, polarity):
+            pa, pb = ([np.column_stack((e.t[e.p == polarity], e.x[e.p == polarity],
+                                        e.y[e.p == polarity])).astype(float)] for e in (a, b))
+            offsets = (pa[0][:, None] - pb[0][None]) / [0.001, 2, 2]
+            return np.exp(-0.5 * (offsets ** 2).sum(-1)).sum()
+
+        gt = random_events(rng, 800)
+        keep = np.arange(len(gt)) % 10 != 0
+        on = gt.p == 1
+        cases = ((random_events(rng, 700), ["sums", "sums"]),
+                 (Events(*(a[keep] for a in (gt.x, gt.y, gt.t, gt.p))),
+                  ["together", "together"]),
+                 (Events(*(a[on] for a in (gt.x, gt.y, gt.t, gt.p))), ["identical", "sums"]))
+        for generated, paths in cases:
+            for options in (dict(), dict(device="numpy", tile_px=4, block_size=30,
+                                         chunk_size=70)):
+                scorer = kernel_v2_fast.MMDReference(gt, **SIGMAS, **options)
+                score = scorer.score(generated)
+                self.assertEqual(scorer.paths, paths)
+                totals = np.zeros(3)
+                for polarity, tag in ((1, "on"), (-1, "off")):
+                    want = [dense(gt, gt, polarity), dense(generated, generated, polarity),
+                            dense(gt, generated, polarity)]
+                    totals += want
+                    got = [score[f"sum_gt_gt_{tag}"], score[f"sum_gen_gen_{tag}"],
+                           score[f"sum_gt_gen_{tag}"]]
+                    for g, w in zip(got, want):
+                        with self.subTest(paths=paths, options=options, tag=tag):
+                            self.assertTrue(close(g, w, 1e-12) or (w == 0 and abs(g) < 1e-12),
+                                            (g, w))
+                similarity = totals[2] / np.sqrt(totals[0] * totals[1])
+                self.assertAlmostEqual(score["similarity"], similarity, delta=1e-12)
+                self.assertTrue(0 <= score["similarity"] <= 1 + 1e-12)
+        self.assertEqual(kernel_v2_fast.MMDReference(gt, **SIGMAS).score(gt)["similarity"], 1)
+        empty = Events(*(a[:0] for a in (gt.x, gt.y, gt.t, gt.p)))
+        score = kernel_v2_fast.MMDReference(gt, **SIGMAS).score(empty)
+        self.assertIsNone(score["similarity"])
+        self.assertEqual((score["sum_gen_gen_on"], score["sum_gt_gen_on"]), (0, 0))
+        self.assertGreater(score["sum_gt_gt_on"], 0)
+
     def test_single_weighting(self):
         rng = np.random.default_rng(6)
         gt, gen = random_events(rng, 500), random_events(rng, 400)
         for weightings in (("count",), ("probability",)):
             expected = kernel.MMDReference(gt, **SIGMAS, weightings=weightings).score(gen)
             got = kernel_v2_fast.MMDReference(gt, **SIGMAS, weightings=weightings).score(gen)
-            self.assertEqual(set(got), set(expected))
+            self.assertEqual(set(got), set(expected) | set(kernel_v2_fast.SUM_COLUMNS))
 
     def test_progress_and_gt_sum_once(self):
         rng = np.random.default_rng(7)
@@ -169,14 +214,26 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_v2_fast.main(command), 1)  # wrong_clock is unavailable
                 (folder,) = (root / "runs").iterdir()
                 self.assertIn("-v2-", folder.name)
-                self.assertEqual(json.loads((folder / "config.json").read_text())["engine"],
-                                 "v2_fast")
+                config = json.loads((folder / "config.json").read_text())
+                self.assertEqual((config["engine"], config["output_version"]),
+                                 ("v2_fast", kernel_v2_fast.OUTPUT_VERSION))
                 rows = {r["generator"]: r for r in read_results(folder / "results.csv")}
                 self.assertEqual((rows["match"]["status"], rows["match"]["algorithm"]),
                                  ("ok", "v2_fast"))
                 self.assertEqual(float(rows["match"]["count_distance"]), 0)
+                self.assertEqual(float(rows["match"]["similarity"]), 1)
                 self.assertAlmostEqual(float(rows["moved"]["count_distance"]), MOVED)
+                self.assertAlmostEqual(float(rows["moved"]["similarity"]), math.exp(-0.5))
+                self.assertGreater(float(rows["moved"]["sum_gt_gt_on"]), 0)
                 self.assertEqual(rows["wrong_clock"]["status"], "alignment_unavailable")
+                try:
+                    import pandas  # noqa: F401
+                except ImportError:
+                    pass
+                else:
+                    from . import summarize_v2_fast
+                    self.assertEqual(summarize_v2_fast.main([str(folder), "--no-plot"]), 0)
+                    self.assertTrue((folder / "wins_similarity.csv").is_file())
                 stamp = (folder / "rows" / "seq" / "match.json").stat().st_mtime_ns
                 run_v2_fast.main(command)
                 self.assertEqual((folder / "rows" / "seq" / "match.json").stat().st_mtime_ns,

@@ -158,12 +158,22 @@ compute the same distance with less work; the files above are unchanged.
   says so).
 - Scores equal kernel.py's to ~1e-15 in the tests. Runs go to
   `MMD/runs/<dataset>-<split>-v2-<hash>`, never mixed with run.py's.
+- Each row also stores the three sums per polarity (`sum_gt_gt_*`, `sum_gen_gen_*`,
+  `sum_gt_gen_*`, count-weighted) and `similarity` = S_gp / sqrt(S_gg S_pp) (joint over
+  polarities, plus `_on` / `_off`): the cosine between the GT and prediction densities
+  smoothed by the kernel, in [0, 1], independent of event counts. 1 = same shape, 0 = no
+  overlap. These cost nothing extra. (Rows from before output_version 2 lack them; such
+  runs get a new folder.)
+- `python -m MMD.summarize_v2_fast <run folder>` adds the mean similarity, the mean rank per
+  sequence and a head-to-head table (in how many sequences each generator beats each
+  other one). Close means are a real difference only if one generator wins on most
+  sequences.
 
 ```bash
 python -m unittest MMD.test_v2_fast -v
 python -m MMD.check_device_v2_fast        # fused / element-wise GPU vs kernel.py CPU
 python -m MMD.run_v2_fast eds test --sigma-spatial-px 2 --sigma-temporal-ms 1 --device cuda
-python -m MMD.summarize MMD/runs/eds-test-v2-<hash>
+python -m MMD.summarize_v2_fast MMD/runs/eds-test-v2-<hash>
 ```
 
 Resources for a GPU run: one GPU (A100 80GB or H100), 16 CPUs (loading and merging events

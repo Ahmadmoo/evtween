@@ -16,6 +16,16 @@ kernel.py, regrouped; per generator about half the pairs are evaluated. S_gg is 
 squared empty baseline. When a prediction channel equals the GT channel the distance is
 exactly 0.
 
+score() also returns the three sums per polarity (sum_gt_gt_*, sum_gen_gen_*,
+sum_gt_gen_*, multiplicity-weighted, i.e. count weights) and their cosine similarity
+
+    similarity = S_gp / sqrt(S_gg S_pp)       (joint: sums over both polarities)
+
+in [0, 1]: 1 when the two smoothed event densities have the same shape, 0 when they do not
+overlap at all. It does not depend on event counts (count and probability weightings give
+the same value), so it reads like a correlation between GT and prediction at the scale of
+the kernel.
+
 If a prediction shares many events exactly with GT (e.g. a subset of GT), kernel.py's way
 is cheaper, because identical events cancel before any pair is evaluated. Each channel
 takes the way with fewer estimated pairs: (unique GT + prediction rows)^2 for kernel.py's,
@@ -34,9 +44,15 @@ import warnings
 import numpy as np
 
 from .kernel import (SIZES, WEIGHTINGS, NumpyOps, TorchOps, _ahead, _block, _channel,
-                     _distance, _points, _weights, device_energy, fast_energy)
+                     _distance, _points, device_energy, fast_energy)
 
 ENGINE = "v2_fast"
+# Bump when score() gains columns, so run_v2_fast starts a new folder instead of reusing rows
+# that lack them.
+OUTPUT_VERSION = 2
+SUM_COLUMNS = ("sum_gt_gt_on", "sum_gt_gt_off", "sum_gen_gen_on", "sum_gen_gen_off",
+               "sum_gt_gen_on", "sum_gt_gen_off", "similarity", "similarity_on",
+               "similarity_off")
 SIZES_V2 = {"cpu": SIZES["cpu"], "device": SIZES["device"],
             # Fused kernel: no block x chunk matrix in memory, so take bigger chunks.
             "compiled": dict(tile_px=64, block_size=4096, chunk_size=131072)}
@@ -245,6 +261,20 @@ def make_ops(device, compile=True):
     raise ValueError(f"Unknown device {device!r}; use cpu, cuda or cuda:N")
 
 
+def _cosine(s_gg, s_pp, s_gp):
+    return s_gp / math.sqrt(s_gg * s_pp) if s_gg > 0 and s_pp > 0 else None
+
+
+def _sum_columns(sums):
+    """The three sums per polarity and the cosine similarity, joint and per polarity."""
+    (gg_on, pp_on, gp_on), (gg_off, pp_off, gp_off) = sums
+    return dict(sum_gt_gt_on=gg_on, sum_gt_gt_off=gg_off, sum_gen_gen_on=pp_on,
+                sum_gen_gen_off=pp_off, sum_gt_gen_on=gp_on, sum_gt_gen_off=gp_off,
+                similarity=_cosine(gg_on + gg_off, pp_on + pp_off, gp_on + gp_off),
+                similarity_on=_cosine(gg_on, pp_on, gp_on),
+                similarity_off=_cosine(gg_off, pp_off, gp_off))
+
+
 def _clamp(squared, magnitude, bound):
     """sqrt of D^2 = sum of terms of total size `magnitude`, rejecting real negatives."""
     if squared < 0:
@@ -370,7 +400,7 @@ class MMDReference:
                               count_distance_off=off, count_truncation_bound=bound)
         else:
             count, prob, count_bound, prob_bound = [], [], 0.0, 0.0
-            self.paths = []
+            self.paths, sums = [], []
             for index, (name, (gt_points, gt_counts, s_gg), points) in enumerate(
                     zip(("ON", "OFF"), self._gt, predicted)):
                 reference = self._polarities[index]
@@ -384,6 +414,7 @@ class MMDReference:
                 unique, counts = both.points[mine], both.gen[mine].astype(np.float64)
                 if np.array_equal(both.gt, both.gen):
                     self.paths.append("identical")  # same events: exactly zero
+                    sums.append((s_gg, s_gg, s_gg))
                     count.append(0.0)
                     if want_prob:  # same events, different totals N, M over polarities
                         prob.append(math.sqrt(max(0.0, s_gg)) * abs(1 / n_gt - 1 / n_gen))
@@ -391,9 +422,15 @@ class MMDReference:
                 rows_together, rows_gt, rows_gen = len(both.points), len(gt_points), len(unique)
                 if rows_together ** 2 <= rows_gen ** 2 + rows_gt * rows_gen:
                     self.paths.append("together")
-                    columns = ["count"] + (["probability"] if want_prob else [])
-                    together, weights = _weights(both, columns, n_gt, n_gen)
-                    energies = self._together(together, weights, f"{name} GT+prediction")
+                    gt_c, gen_c = both.gt.astype(np.float64), both.gen.astype(np.float64)
+                    columns = [gt_c - gen_c]
+                    if want_prob:
+                        columns.append(gt_c / n_gt - gen_c / n_gen)
+                    columns.append(gen_c)  # the last column gives S_pp
+                    weights = np.column_stack(columns)
+                    energies = self._together(both.points, weights, f"{name} GT+prediction")
+                    s_pp = energies[-1]
+                    sums.append((s_gg, s_pp, (s_gg + s_pp - energies[0]) / 2))
                     count.append(_distance(energies[0], weights[:, 0], bound))
                     if want_prob:
                         prob.append(_distance(energies[1], weights[:, 1], p_bound))
@@ -401,10 +438,12 @@ class MMDReference:
                 self.paths.append("sums")
                 s_pp = self._sum(unique, counts, unique, counts, f"{name} with itself")
                 s_gp = self._sum(gt_points, gt_counts, unique, counts, f"{name} with GT")
+                sums.append((s_gg, s_pp, s_gp))
                 count.append(_clamp(s_gg + s_pp - 2 * s_gp, s_gg + s_pp + 2 * abs(s_gp), bound))
                 if want_prob:
                     a, b, c = s_gg / n_gt ** 2, s_pp / n_gen ** 2, s_gp / (n_gt * n_gen)
                     prob.append(_clamp(a + b - 2 * c, a + b + 2 * abs(c), p_bound))
+            result.update(_sum_columns(sums))
             if want_count:
                 result.update(count_distance=math.hypot(*count), count_distance_on=count[0],
                               count_distance_off=count[1],
@@ -413,6 +452,8 @@ class MMDReference:
                 result.update(prob_distance=math.hypot(*prob), prob_distance_on=prob[0],
                               prob_distance_off=prob[1],
                               prob_truncation_bound=math.sqrt(prob_bound))
+        if n_gen == 0:
+            result.update(_sum_columns([(s_gg, 0.0, 0.0) for _, _, s_gg in self._gt]))
         if want_count:
             baseline = self.empty_baseline[0]
             result["count_empty_baseline"] = baseline
