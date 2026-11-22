@@ -12,6 +12,7 @@ every other benchmark metric.
 | `run.py` | Parallel, resumable runner |
 | `summarize.py` | Mean per generator over sequences, `summary.csv` and `summary.png` |
 | `check_device.py` | GPU vs CPU on synthetic events: same scores? how much faster? |
+| `*_v2_fast.py` | Faster version of the same metric (see v2_fast below) |
 | `test_mmd.py` | Analytical cases, dense O(n²) reference, fast/exact/GPU-path agreement, runner, resume, GPU scheduling |
 
 ## Definition
@@ -140,6 +141,33 @@ matters for displacements below about 1e-7 σ.
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 ```
+
+## v2_fast
+
+`kernel_v2_fast.py`, `run_v2_fast.py`, `check_device_v2_fast.py` and `test_v2_fast.py`
+compute the same distance with less work; the files above are unchanged.
+
+- Per polarity, D² = S_gg + S_pp − 2 S_gp (count) or S_gg/N² + S_pp/M² − 2 S_gp/(NM)
+  (probability), with S the sums of kernel values GT-GT, prediction-prediction and
+  GT-prediction. S_gg is computed once per sequence, so each generator costs about half the
+  pairs. When a prediction shares most of its events exactly with GT, the channel is scored
+  the kernel.py way instead (identical events cancel first); each channel takes the cheaper
+  way. Identical channels give exactly 0.
+- On a GPU, `torch.compile` fuses distance, exp and the weighted sum into one kernel
+  (`--no-compile` turns it off; if compiling fails it falls back and the row's `device`
+  says so).
+- Scores equal kernel.py's to ~1e-15 in the tests. Runs go to
+  `MMD/runs/<dataset>-<split>-v2-<hash>`, never mixed with run.py's.
+
+```bash
+python -m unittest MMD.test_v2_fast -v
+python -m MMD.check_device_v2_fast        # fused / element-wise GPU vs kernel.py CPU
+python -m MMD.run_v2_fast eds test --sigma-spatial-px 2 --sigma-temporal-ms 1 --device cuda
+python -m MMD.summarize MMD/runs/eds-test-v2-<hash>
+```
+
+Resources for a GPU run: one GPU (A100 80GB or H100), 16 CPUs (loading and merging events
+run on the CPU; at most 4 threads prepare tiles), 128 GB RAM for the largest EDS sequence.
 
 ## Choosing σ
 
