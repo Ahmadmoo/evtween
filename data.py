@@ -44,22 +44,26 @@ class PairDataset(torch.utils.data.Dataset):
         roots = root if isinstance(root, list) else [root]  # one folder or a list, searched recursively
         self.seqs = [Sequence(os.path.dirname(p)) for r in roots
                      for p in sorted(glob.glob(os.path.join(r, "**", "frame_ts.npy"), recursive=True))]
-        g = skip + 1
+        # skip: one value, or a range [lo, hi] (v8.2): training batches draw one per batch (JointBatches); a plain index
+        # (validation) uses hi. The index fits the largest gap; a gap counts if its shortest version has events
+        self.skips = (skip, skip) if isinstance(skip, int) else (int(skip[0]), int(skip[1]))
+        lo, g = self.skips[0] + 1, self.skips[1] + 1
         cut = [np.searchsorted(s.ev["t"], s.ts) if s.ev is not None else None for s in self.seqs]  # events before each frame
         self.index = [(k, i) for k, s in enumerate(self.seqs) for i in range((context - 1) * g, len(s) - context * g)
-                      if cut[k] is None or cut[k][i + g] > cut[k][i]]  # gaps with no event at all are holes in the recording
-        self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, skip, context, bins, min_events, train
+                      if cut[k] is None or cut[k][i + lo] > cut[k][i]]  # gaps with no event at all are holes in the recording
+        self.crop, self.skip, self.context, self.bins, self.min_events, self.train = crop, self.skips[1], context, bins, min_events, train
         self.ds = ds  # dataset id carried by every sample (joint training: position in data.sets)
 
     def __len__(self):
         return len(self.index)
 
-    def __getitem__(self, n):
+    def __getitem__(self, key):
         # keyframes I0, I1, the hidden frames between them, the real events of the gap (time-binned for the teacher,
         # exact list for the likelihood), and context frames at the gap's own stride: the student sees exactly
-        # the frames a video at this frame rate would give
+        # the frames a video at this frame rate would give. key: sample, or (sample, skip)
+        n, skip = key if isinstance(key, tuple) else (key, self.skip)
         k, i = self.index[n]
-        s, j, c, g = self.seqs[k], i + self.skip + 1, self.context, self.skip + 1
+        s, j, c, g = self.seqs[k], i + skip + 1, self.context, skip + 1
         t0, t1 = s.ts[i], s.ts[j]
         ev = s.events(t0, t1)
         ctx = [i - q * g for q in reversed(range(c))] + [j + q * g for q in range(c)]
@@ -89,7 +93,7 @@ class PairDataset(torch.utils.data.Dataset):
 
         cut = lambda q: full[q][:, y0:y0 + h, x0:x0 + w].flip(-1) if flip else full[q][:, y0:y0 + h, x0:x0 + w]
         return dict(i0=cut(i), i1=cut(j),
-                    mid=torch.stack([cut(q) for q in range(i + 1, j)]) if self.skip else torch.zeros(0, 3, h, w),
+                    mid=torch.stack([cut(q) for q in range(i + 1, j)]) if skip else torch.zeros(0, 3, h, w),
                     mid_tau=torch.from_numpy((s.ts[i + 1:j] - t0) / (t1 - t0)).float(),
                     ctx=torch.stack([cut(q) for q in ctx]), ctx_tau=torch.from_numpy((s.ts[ctx] - t0) / (t1 - t0)).float(),
                     dt=torch.tensor(t1 - t0, dtype=torch.float32), voxel=torch.from_numpy(voxel),
@@ -120,20 +124,38 @@ class JointDataset(torch.utils.data.Dataset):
         return sum(map(len, self.sets))
 
     def __getitem__(self, key):
-        return self.sets[key[0]][key[1]]
+        return self.sets[key[0]][key[1] if len(key) == 2 else tuple(key[1:])]
+
+
+class AtSkip(torch.utils.data.Dataset):
+    # a PairDataset at one fixed skip (validation at both ends of a skip range)
+    def __init__(self, ds, skip):
+        self.ds, self.skip = ds, skip
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, n):
+        return self.ds[(n, self.skip)]
 
 
 class JointBatches(torch.utils.data.Sampler):
-    # endless batches, each from one dataset (same skip: same number of hidden frames); dataset d with probability ~ weight[d]
-    def __init__(self, sizes, weights, batch, seed=0):
+    # endless batches, each from one dataset and one skip (same number of hidden frames); dataset d with probability
+    # ~ weight[d]; skips: (lo, hi) per dataset, the batch's skip drawn evenly from lo..hi (v8.2)
+    def __init__(self, sizes, weights, batch, seed=0, skips=None):
         w = np.array([wt if n > 0 else 0.0 for wt, n in zip(weights, sizes)], dtype=np.float64)
-        self.sizes, self.batch, self.seed, self.p = sizes, batch, seed, w / w.sum()
+        self.sizes, self.batch, self.seed, self.p, self.skips = sizes, batch, seed, w / w.sum(), skips
 
     def __iter__(self):
         g = np.random.default_rng(self.seed)
         while True:
             d = int(g.choice(len(self.p), p=self.p))
-            yield [(d, int(n)) for n in g.choice(self.sizes[d], self.batch, replace=self.sizes[d] < self.batch)]
+            n = g.choice(self.sizes[d], self.batch, replace=self.sizes[d] < self.batch)
+            if self.skips is None:
+                yield [(d, int(q)) for q in n]
+            else:
+                k = int(g.integers(self.skips[d][0], self.skips[d][1] + 1))
+                yield [(d, int(q), k) for q in n]
 
 
 def collate(items):

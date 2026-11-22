@@ -20,7 +20,42 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v8`)
+### This version (`v8.2`)
+
+Built from `v8` (conv student head; v8.1's attention head is not in here). Two training changes; the model is v8's.
+
+| Change | v8 | v8.2 | Why |
+|---|---|---|---|
+| Gap length | One `skip` per dataset | `skip: [lo, hi]`: one skip per batch, drawn evenly from lo..hi (hqevfi 0–4, eds 0–2, bsergb 0). The context frames follow the batch's stride | Generation and the paper's evaluation run on every frame pair (1-frame gaps); v8 saw only 3–5-frame gaps on hqevfi and eds and made far too few events on short gaps. The student's gap-length input now means something instead of naming the dataset |
+| Masked slices (`loss.mask`) | – | A second teacher pass on a quarter of each batch with 2–3 of 8 time slices of its events hidden (set to −1; log counts are ≥ 0, so hidden is not empty). The decoder's path from that code must still make the hidden slices' events: the x-t loss with the visible slices set to the real counts, so only the hidden ones count | v5.3's trick, through the decoder instead of a separate head: the code must describe the whole gap from part of the events, closer to what the student does from frames alone |
+
+- Validation: a skip range gives two lines per dataset, `val hqevfi skip4` and `val hqevfi skip0`. `mask` is the masked-slice score (same hidden slices at every validation; lower is better).
+- Cost: the masked pass adds about a quarter of a teacher step; validation of hqevfi and eds takes twice as long (two skips).
+- The measured frame noise and thresholds now also see short gaps (`nll_zero` moves, see the checks). Watch `c` per dataset.
+- Train the teacher from scratch. v8 checkpoints load; a single `skip` number works as before.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.steps=40000 train.out=runs/teacher_v8.2
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/teacher_v8.2/last.pt model.pred_dim=384 train.out=runs/student_v8.2
+```
+
+Checks (CPU, toy):
+- Skip range: the batch's skip sets the hidden frames, `dt` and the context stride; one skip per batch, drawn evenly (2,000 batches: 458 / 500 / 502 / 540 for skips 0–3).
+- Hidden slices leak nothing: more events in a hidden slice change the masked code by 0.0, in a visible slice by 1.1. With no slice hidden the masked loss is 0 (1.6e-12). The masked loss reaches the teacher, the decoder and the thresholds; every stage and `model.tube` option gets gradients.
+- Toy teachers, 800 steps each, toy gaps of 4 frames (skip 3) and of 1 frame (skip 0); events: expected per sampled draw against the real ones:
+
+| Teacher | `nll` skip 3 | events skip 3 (real 56.1k) | `nll` skip 0 | events skip 0 (real 12.3k) |
+|---|---|---|---|---|
+| v8 (skip 3) | **0.452** | 56.5k | 0.432 | 4.5k (× 0.37) |
+| skip 0–3 only | 0.478 | 58.3k | **0.382** | **7.4k (× 0.60)** |
+| mask only (skip 3) | 0.483 | 56.2k | 0.407 | 5.4k (× 0.44) |
+| v8.2 (both) | 0.567 | 59.9k | 0.387 | 7.0k (× 0.57) |
+
+- Toy students (400 steps) on the last two teachers, skip 0–3: `nll_student` 0.944 / 0.485 (skip 3 / 0) on the skip-only teacher, **0.923 / 0.472** on the v8.2 teacher (gap 0.44 → 0.33 and 0.07 → 0.05). The masked teacher is worse on its own at skip 3, but its code is easier for the student, and the student is what generates.
+- Random skip is what fixes short gaps (× 0.37 → × 0.60 of the real events); they are still short of the real count on toy. On real data compare against `loss.mask=0`.
+- `generate.py`, `eval_interp.py`, `check.py` run.
+
+### `v8` (separate branch)
 
 Built from `v7`. Three parts removed and the student's head replaced; everything else is v7.
 
@@ -297,6 +332,7 @@ Tube width, no hand-set value:
 |---|---|---|
 | `nll` | teacher, joint, interp | Likelihood of the real event **times**: crossing hazard of the taut path and residual rate at each event, survival of both thresholds between crossings, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. Which events were crossings is summed over by a forward pass per pixel (`loss.mix`). Every pixel pays for the residual events it expects |
 | `xt` | teacher, joint | Expected vs real ON / OFF events (crossings + residual) on blurred x-t and y-t slices (generalized KL of counts) |
+| `mask` | teacher, joint | v8.2: second teacher pass on part of the batch with 2–3 of 8 event slices hidden; the x-t loss on the hidden slices only |
 | `sigreg` | teacher, joint | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to predict later) |
 | `jepa` | student, joint | Student code vs teacher code (`stopgrad` in the student stage) |
 | `nll_student` | student, joint | `nll` with the student's code |
@@ -388,6 +424,7 @@ Joint training, `data.sets` in `config.yaml`:
 
 - Each entry: `root` (holds `train/` and `val/` or `test/`), `skip`, `weight`.
 - `skip`: frames hidden between I0 and I1. Choose `(skip+1)/fps` close to the frame interval of the videos you will convert. Defaults give 25-50 ms gaps (HQ-EVFI 4, BS-ERGB 0, EDS 2, CED 0).
+- v8.2: `skip: [lo, hi]` draws one skip per batch from lo..hi (defaults: HQ-EVFI 0–4, EDS 0–2), so training also sees the 1-frame gaps of generation; validation runs at both ends.
 - Every batch comes from one dataset (same number of hidden frames); dataset d with probability ∝ `weight`.
 - Every sample carries `ds` (position in `data.sets`; stays the same when an entry is set to `null`) and `cfa` (2x2 color filter of the crop, -1 without a filter).
 - Validation: fixed samples per dataset (`val/`, else `test/`), one line per dataset.
@@ -432,6 +469,7 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
 | `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
+| `mask` | v8.2: masked-slice score, the hidden event slices guessed through the decoder | Falls with training |
 
 The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen backbone weights.
 
@@ -475,7 +513,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 
 | Key | Effect |
 |---|---|
-| `data.sets` | Datasets trained together: `root`, `skip` (hidden frames in the gap; `(skip+1)/fps` close to the frame interval of the videos you will convert), `weight` (share of batches), `gamma` (PNG → linear light, from `check_data.py`) |
+| `data.sets` | Datasets trained together: `root`, `skip` (hidden frames in the gap; `(skip+1)/fps` close to the frame interval of the videos you will convert; v8.2: `[lo, hi]` = one per batch), `weight` (share of batches), `gamma` (PNG → linear light, from `check_data.py`) |
 | `data.context` | Frames per side for the student, taken at the gap's own stride, so training sees the same frame spacing as generation (even for V-JEPA 2.1) |
 | `data.bins` | Time bins of the teacher's event input (32, ~1.1 ms each) |
 | `model.backbone` | `vjepa2_1`, `levjepa`, or `none` (no world knowledge) |
@@ -489,6 +527,7 @@ python eval_interp.py --ckpt ... --skip bsergb=3 --crop 4096      # large crop =
 | `model.sigma_event` | Threshold spread per event, fixed (fraction of c); `null` = learned |
 | `model.measure_c` | Thresholds measured from frame change vs real ON/OFF counts per dataset (`c_init` until the first batch of a dataset) |
 | `loss.xt`, `loss.xt_blur` | Weight of the x-t / y-t loss (2.0; 0 = off) and its blur (2 px, 2 ms) |
+| `loss.mask`, `loss.mask_share`, `loss.mask_slices` | v8.2 masked slices: weight (1.0; 0 = off), share of each batch (0.25), hidden slices per sample (2–3 of 8) |
 | `loss.photo` | Weight of the photometric loss in the interp stage (10) |
 | `loss.mix` | How far back, in events, the likelihood looks for a pixel's last crossing (16; cost grows with it) |
 | `loss.grid` | τ steps of the likelihood path (128) |

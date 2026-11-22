@@ -9,7 +9,7 @@ import torch.nn as nn
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
-from data import JointBatches, JointDataset, collate, datasets
+from data import AtSkip, JointBatches, JointDataset, collate, datasets
 from losses import compute, diagnostics
 from model import build_model
 
@@ -94,17 +94,20 @@ net = DDP(net, device_ids=[torch.cuda.current_device()] if cuda else None) if dd
 sets = datasets(D, "train", True)  # one per entry of data.sets; every batch comes from one of them
 data = JointDataset(list(sets.values()))
 batches = JointBatches([len(d) for d in data.sets], [D["sets"][name].get("weight", 1.0) for name in sets], T["batch"],
-                       T["seed"] + 1000 * rank + step)  # each rank its own stream, a new one after a resume
+                       T["seed"] + 1000 * rank + step, [d.skips for d in data.sets])  # each rank its own stream, a new one after a resume
 loader = DataLoader(data, batch_sampler=batches, num_workers=D["workers"], collate_fn=collate, pin_memory=True,
                     persistent_workers=D["workers"] > 0)
 vals = {}
 if rank == 0:
     for (name, d), share in zip(sets.items(), batches.p):
-        print(f"data {name}: {len(d.seqs)} sequences, {len(d)} samples, skip {d.skip}, {100 * share:.0f}% of batches", flush=True)
+        sk = d.skips[0] if d.skips[0] == d.skips[1] else f"{d.skips[0]}-{d.skips[1]} (one per batch)"
+        print(f"data {name}: {len(d.seqs)} sequences, {len(d)} samples, skip {sk}, {100 * share:.0f}% of batches", flush=True)
     for name, vd in datasets(D, "val", False).items():  # fixed samples spread over all val (or test) sequences
-        if len(vd):
-            vals[name] = DataLoader(Subset(vd, torch.linspace(0, len(vd) - 1, T["val_batches"] * T["batch"]).long().tolist()),
-                                    T["batch"], num_workers=D["workers"], collate_fn=collate)
+        if len(vd):  # a skip range: validation at both ends, "val <name> skip<k>"
+            idx = torch.linspace(0, len(vd) - 1, T["val_batches"] * T["batch"]).long().tolist()
+            for k in sorted(set(vd.skips), reverse=True):
+                key = name if vd.skips[0] == vd.skips[1] else f"{name} skip{k}"
+                vals[key] = DataLoader(Subset(AtSkip(vd, k), idx), T["batch"], num_workers=D["workers"], collate_fn=collate)
 
 
 def lr_at(step):

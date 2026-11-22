@@ -451,8 +451,13 @@ class EvTween(nn.Module):
         y0, y1 = self.bright(i0, ds, cfa), self.bright(i1, ds, cfa)
         return dict(x=torch.cat([i0, i1], 1), i0=i0, i1=i1, y0=y0, y1=y1, H=H, W=W, ds=ds, cfa=cfa)
 
-    def encode(self, p, voxel):
-        x = torch.cat([torch.log1p(self._pad(voxel)), p["i0"], p["i1"]], 1)
+    def encode(self, p, voxel, hide=None):
+        # hide (B, slices): masked-slice pass (loss.mask), those time slices of the events are set to -1 (log counts are
+        # >= 0, so the teacher tells a hidden slice from an empty one)
+        v = torch.log1p(self._pad(voxel))
+        if hide is not None:
+            v = torch.where(hide.repeat_interleave(v.shape[1] // 2 // hide.shape[1], 1).repeat(1, 2)[:, :, None, None], -1.0, v)
+        x = torch.cat([v, p["i0"], p["i1"]], 1)
         with self._ac(x):
             return self.teacher(x).float()
 

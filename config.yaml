@@ -1,11 +1,12 @@
 data:
   sets:                        # datasets trained together (converted by <DATASET>/<name>.py); every batch comes from one of them
-    hqevfi: {root: data/hqevfi, skip: 4, weight: 1.0, gamma: 1.0}   # 142 fps: 5 frame steps = 35 ms gaps
+    hqevfi: {root: data/hqevfi, skip: [0, 4], weight: 1.0, gamma: 1.0}   # 142 fps: 1-5 frame steps = 7-35 ms gaps
     bsergb: {root: data/bsergb, skip: 0, weight: 1.0, gamma: 2.2}   # 20-28 fps: 36-50 ms
-    eds:    {root: data/eds,    skip: 2, weight: 1.0, gamma: 1.0}   # 75 fps: 40 ms
+    eds:    {root: data/eds,    skip: [0, 2], weight: 1.0, gamma: 1.0}   # 75 fps: 13-40 ms
     ced:    null                                                    # left out; null keeps the ids of the others (checkpoints stay compatible)
                                # root holds train/ and val/ or test/ (val falls back to test); skip = frames hidden
                                # between I0 and I1: (skip+1)/fps close to the frame interval of the target video;
+                               # v8.2: [lo, hi] draws one skip per batch from lo..hi (validation at both ends);
                                # weight = share of batches (normalized); the order gives the dataset id (batch["ds"]);
                                # gamma: PNG value^gamma = linear light (check_data.py picks 1.0 or 2.2); each dataset
                                # also gets its own sensor (measured c, r; learned R) and RGB weights
@@ -43,6 +44,9 @@ loss:
   nll: 1.0                     # exact-time event likelihood (crossings + residual events)
   xt: 2.0                      # x-t / y-t loss: expected vs real ON / OFF events on blurred x-t, y-t slices
   xt_blur: [2, 2]              # its blur (px, ms): compares curves, not single events
+  mask: 1.0                    # v8.2: masked slices (v5.3): teacher pass with some event slices hidden, x-t loss on them
+  mask_share: 0.25             # share of each batch that gets this pass
+  mask_slices: [2, 3]          # hidden slices per sample (of 8), random
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
   photo: 10.0                  # interp stage only: the path vs the hidden real frames
