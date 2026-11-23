@@ -101,7 +101,14 @@ def discover(args):
     """Methods (in METHODS order) and sequence names found under data_test_evt/<dataset>/<split>."""
     root = events_root(args)
     if not root.is_dir():
-        raise FileNotFoundError(f"No generated events at {root}")
+        hint = ""
+        parent = root.parent.parent
+        if not args.events_root and parent.is_dir():
+            found = sorted(d.name for d in parent.iterdir() if (d / args.split).is_dir())
+            close = [d for d in found if d.lower() == args.dataset.lower()]
+            hint = (f" Did you mean '{close[0]}'? (names are case-sensitive)" if close
+                    else f" Available datasets: {', '.join(found) or 'none'}")
+        raise FileNotFoundError(f"No generated events at {root}.{hint}")
     present = [m for m in METHODS if (root / m).is_dir()]
     requested = list(args.methods) if args.methods else present
     unknown = set(requested) - set(METHODS)
