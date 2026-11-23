@@ -3,23 +3,32 @@
 Pretrained E2VID and FireNet reconstruct intensity frames from the real events and from every
 method's events in data_test_evt/<DATASET>/<SPLIT>/<method>/<sequence>/events.npz.
 
-Protocol (identical for every event source)
+Protocol (identical for every event source; follows EVREAL's standard 'std' protocol)
   * Frame k (k >= 1) is reconstructed from the events in [t_{k-1}, t_k), so it lines up with
-    frames/{k:06d}.png and frame_ts[k] of the source sequence.
-  * Each window becomes a voxel grid with --bins temporal bins (bilinear in time over the window,
-    polarity +-1), normalised like E2VID (non-zero entries to mean 0, std 1).
+    frames/{k:06d}.png and frame_ts[k] of the source sequence (EVREAL 'between_frames').
+  * Each window becomes a voxel grid with --bins temporal bins, built and normalised as in EVREAL
+    (time scaled by the window's first and last event, bilinear weights, polarity +-1; non-zero
+    entries to mean 0 / std 1), with EVREAL's centred zero padding.
   * All event sources of one sequence run as one batch, one recurrent state per source, so every
     method gets the same windows, voxel settings, padding and network state handling.
   * The network state is reset at the start of every sequence; frames k < --warmup are not scored.
+  * Outputs are normalised as in EVREAL (E2VID robust 1-99 percentile, FireNet none) and clipped to [0, 1].
   * V2V is left out: it stores one summed voxel per frame interval, without the event timing
     inside the interval that the networks need.
 
-Metrics (frames k >= --warmup; images normalised by --norm before scoring)
+Metrics (frames k >= --warmup, images in [0, 1])
   agreement_mse/ssim/lpips  reconstruction from a method's events vs reconstruction from the real
                             events, same frame and network. Main result; GT frames play no role.
   gt_mse/ssim/lpips         reconstruction vs the ground-truth frame. Secondary: the simulators were
                             given these frames. The 'real' row is the reference level.
-  MSE lower is better, SSIM (Gaussian 11x11, sigma 1.5) higher, LPIPS (AlexNet) lower.
+  MSE lower is better, SSIM (as skimage: Gaussian 11x11, sigma 1.5) higher, LPIPS (AlexNet) lower.
+
+Automatic setup (first run; --no-auto-setup turns it off)
+  * Clones EVREAL (github.com/ercanburak/EVREAL) at a pinned commit into $EVREAL_ROOT or
+    ~/.cache/evtween/EVREAL. It contains the model code and the authors' pretrained E2VID and FireNet
+    weights; both files are checked against pinned SHA-256 hashes before use.
+  * pip-installs missing packages the models and LPIPS need (lpips, opencv-python-headless, einops).
+  * LPIPS downloads torchvision's AlexNet weights on first use.
 
 Outputs
   data_test_recon/<DATASET>/<SPLIT>/<network>/<method>/<sequence>/{k:06d}.png   (--save samples|all)
@@ -29,9 +38,6 @@ Outputs
 
 Example (one A100, 32 CPUs; two workers share the GPU so loading overlaps with compute):
   python benchmarks/recon_eval.py EDS --devices cuda:0 cuda:0
-Checkpoints and model code come from --e2vid-ckpt/--firenet-ckpt and --e2vid-code/--firenet-code,
-or the environment variables RECON_E2VID_CKPT, RECON_FIRENET_CKPT, RECON_E2VID_CODE,
-RECON_FIRENET_CODE (code roots default to EVREAL_ROOT).
 """
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -206,52 +212,151 @@ def load_gray(path, width, height):
         return np.asarray(im.convert("L"), dtype=np.float32) / 255.0
 
 
-# ---------------------------------------------------------------- reference voxel grid (numpy, for tests)
+# ---------------------------------------------------------------- automatic setup (EVREAL code + official weights)
 
-def voxel_grid_numpy(t, x, y, p, e0, e1, bins, height, width):
-    """E2VID-style voxel grid of one window [e0, e1), before normalisation."""
+EVREAL_URL = "https://github.com/ercanburak/EVREAL"
+EVREAL_COMMIT = "398f03551b7f5d150ae10aa89e4e731557fce240"
+# EVREAL redistributes the authors' pretrained weights (E2VID: uzh-rpg/rpg_e2vid; FireNet:
+# cedric-scheerlinck/rpg_e2vid, branch cedric/firenet). SHA-256 and size of each file at EVREAL_COMMIT;
+# the run stops if a default checkpoint does not match.
+CHECKPOINTS = {
+    "e2vid": ("pretrained/E2VID/model.pth",
+              "db222f5cec147f8035006f4d56e11c15909d77991901693cfb1cfad286fea106", 42878166),
+    "firenet": ("pretrained/FireNet/model.pth",
+                "a64af3191a00e9f01cd47d086d9a88c35ff1e63756566ca44b4ff02301ca696e", 468053),
+}
+PACKAGES = {"lpips": "lpips", "cv2": "opencv-python-headless", "einops": "einops"}  # import name: pip name
+
+
+def default_evreal_root():
+    return Path(os.environ.get("EVREAL_ROOT") or Path.home() / ".cache" / "evtween" / "EVREAL").expanduser()
+
+
+def ensure_packages(auto, need_lpips=True):
+    """Install missing packages that the EVREAL models and LPIPS need (pip, current interpreter)."""
+    import importlib.util
+    import subprocess
+    missing = [pip for mod, pip in PACKAGES.items()
+               if (mod != "lpips" or need_lpips) and importlib.util.find_spec(mod) is None]
+    if missing:
+        if not auto:
+            raise ImportError(f"Missing packages; run: pip install {' '.join(missing)}")
+        print(f"Installing {' '.join(missing)} ...", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)
+        importlib.invalidate_caches()
+    return missing
+
+
+def ensure_evreal(root, auto):
+    """Clone EVREAL at the pinned commit if root has no checkout. Returns the checked-out commit."""
+    import subprocess
+    root = Path(root)
+    if not (root / "model" / "__init__.py").is_file():
+        if not auto:
+            raise FileNotFoundError(f"No EVREAL checkout at {root}; clone {EVREAL_URL} there "
+                                    "or drop --no-auto-setup")
+        if root.exists() and any(root.iterdir()):
+            raise FileExistsError(f"{root} exists but is not an EVREAL checkout; remove it or set --evreal-root")
+        root.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Cloning EVREAL at {EVREAL_COMMIT[:7]} into {root} ...", flush=True)
+        subprocess.run(["git", "clone", "--quiet", EVREAL_URL, str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "checkout", "--quiet", EVREAL_COMMIT], check=True)
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return head.stdout.strip() or None
+
+
+def checkpoint_path(name, args):
+    """(path, sha256, verified). A custom checkpoint (--<net>-ckpt / RECON_<NET>_CKPT) is used as given;
+    the default one from EVREAL must match its pinned hash."""
+    custom = getattr(args, f"{name}_ckpt", None) or os.environ.get(f"RECON_{name.upper()}_CKPT")
+    if custom:
+        path = Path(custom).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"{name} checkpoint not found: {path}")
+        return path, file_sha256(path), False
+    rel, sha, size = CHECKPOINTS[name]
+    path = Path(args.evreal_root) / rel
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is missing; remove {args.evreal_root} so it is cloned again")
+    digest = file_sha256(path)
+    if digest != sha:
+        raise ValueError(f"{path}: sha256 {digest} ({path.stat().st_size} bytes) does not match the pinned "
+                         f"{sha} ({size} bytes). A Git LFS pointer or a changed file? Remove the folder to re-clone.")
+    return path, digest, True
+
+
+def setup(args):
+    """Install missing packages, clone EVREAL if needed and verify the checkpoints (main process only)."""
+    args.evreal_root = str(Path(args.evreal_root).expanduser() if args.evreal_root else default_evreal_root())
+    ensure_packages(args.auto_setup, need_lpips=not args.skip_lpips)
+    commit = ensure_evreal(args.evreal_root, args.auto_setup)
+    return commit, {n: checkpoint_path(n, args) for n in args.networks}
+
+
+# ---------------------------------------------------------------- reference implementations (numpy, for tests)
+
+def voxel_grid_numpy(t, x, y, p, bins, height, width):
+    """EVREAL/E2VID voxel grid of one window, before normalisation: time scaled by the first and last
+    event of the window, bilinear weights max(0, 1 - |t_norm - b|), polarity +-1."""
     grid = np.zeros((bins, height, width), np.float64)
     if t.size == 0:
         return grid
-    tn = (t - e0) / (e1 - e0) * (bins - 1)
-    lo = np.clip(np.floor(tn).astype(np.int64), 0, bins - 1)
-    frac = tn - lo
-    np.add.at(grid, (lo, y, x), p * (1 - frac))
-    hi = lo + 1
-    ok = hi < bins
-    np.add.at(grid, (hi[ok], y[ok], x[ok]), (p * frac)[ok])
+    dt = t[-1] - t[0]
+    tn = np.linspace(0, bins - 1, t.size) if dt < 1e-9 else (t - t[0]) / dt * (bins - 1)
+    for b in range(bins):
+        np.add.at(grid[b], (y, x), p * np.maximum(0.0, 1.0 - np.abs(tn - b)))
     return grid
 
 
 def normalize_numpy(grid):
+    """EVREAL normalize_event_tensor: non-zero entries to mean 0, (population) std 1."""
     nz = grid != 0
-    out = grid.copy()
-    if nz.sum() > 0:
-        vals = grid[nz]
-        std = vals.std(ddof=1) if vals.size > 1 else 0.0
-        out[nz] = (vals - vals.mean()) / (std if std > 0 else 1.0)
-    return out
+    n = nz.sum()
+    if n == 0:
+        return grid.copy()
+    mean = grid.sum() / n
+    std = max(math.sqrt(max((grid ** 2).sum() / n - mean ** 2, 0.0)), 1e-6)
+    return nz * (grid - mean) / std
+
+
+def crop_params(height, width, num_encoders):
+    """EVREAL CropParameters: zero padding (left, right, top, bottom) to a multiple of 2**num_encoders,
+    and the crop (y0, y1, x0, x1) that takes the output back to height x width."""
+    m = 2 ** int(num_encoders)
+    hc, wc = m * math.ceil(height / m), m * math.ceil(width / m)
+    pad = (math.ceil((wc - width) / 2), math.floor((wc - width) / 2),
+           math.ceil((hc - height) / 2), math.floor((hc - height) / 2))
+    cx, cy = wc // 2, hc // 2
+    crop = (cy - height // 2, cy + math.ceil(height / 2), cx - width // 2, cx + math.ceil(width / 2))
+    return pad, crop
 
 
 # ---------------------------------------------------------------- GPU parts
 
-def voxelize(ev, edges_t, j0, j1, bins, height, width, device):
-    """Normalised voxel grids of windows j0..j1-1 for one source: (j1-j0, bins, H, W) float32."""
+def voxelize(ev, j0, j1, bins, height, width, device):
+    """Normalised voxel grids of windows j0..j1-1 for one source: (j1-j0, bins, H, W) float32.
+    Same result as voxel_grid_numpy + normalize_numpy per window."""
     count = j1 - j0
     out = torch.zeros(count * bins * height * width, dtype=torch.float32, device=device)
-    a, b = int(ev["cuts"][j0]), int(ev["cuts"][j1])
+    cuts = np.asarray(ev["cuts"][j0:j1 + 1], np.int64)
+    a, b = int(cuts[0]), int(cuts[-1])
     if b > a:
+        local = torch.from_numpy(cuts - a).to(device)
         t = torch.from_numpy(ev["t"][a:b]).to(device, non_blocking=True)
         x = torch.from_numpy(ev["x"][a:b]).to(device, non_blocking=True)
         y = torch.from_numpy(ev["y"][a:b]).to(device, non_blocking=True)
         p = torch.from_numpy(ev["p"][a:b]).to(device, non_blocking=True).float()
-        w = (torch.searchsorted(edges_t, t, right=True) - 1).clamp_(j0, j1 - 1)
-        e0, e1 = edges_t[w], edges_t[w + 1]
-        tn = (t - e0) / (e1 - e0) * (bins - 1)
+        idx = torch.arange(b - a, device=device)
+        w = torch.searchsorted(local[1:], idx, right=True)  # window of each event
+        first, stop = local[w], local[w + 1]
+        dt = t[stop - 1] - t[first]
+        by_time = (t - t[first]) / dt.clamp(min=1e-9) * (bins - 1)
+        by_rank = (idx - first).double() / (stop - first - 1).clamp(min=1).double() * (bins - 1)
+        tn = torch.where(dt >= 1e-9, by_time, by_rank)
         lo = tn.floor().long().clamp_(0, bins - 1)
         frac = (tn - lo).float()
         pix = y * width + x
-        base = (w - j0) * bins
+        base = w * bins
         out.index_add_(0, (base + lo) * (height * width) + pix, p * (1 - frac))
         if bins > 1:
             hi = lo + 1
@@ -259,85 +364,88 @@ def voxelize(ev, edges_t, j0, j1, bins, height, width, device):
             out.index_add_(0, ((base + hi) * (height * width) + pix)[ok], (p * frac)[ok])
     flat = out.view(count, -1)
     nz = flat != 0
-    n = nz.sum(1)
-    mean = flat.sum(1) / n.clamp(min=1)
-    var = (((flat - mean[:, None]) ** 2) * nz).sum(1) / (n - 1).clamp(min=1)
-    std = var.sqrt()
-    std = torch.where(std > 0, std, torch.ones_like(std))
+    n = nz.sum(1).clamp(min=1)
+    mean = flat.sum(1) / n
+    std = ((flat * flat).sum(1) / n - mean * mean).clamp(min=0).sqrt().clamp(min=1e-6)
     flat = torch.where(nz, (flat - mean[:, None]) / std[:, None], torch.zeros_like(flat))
     return flat.view(count, bins, height, width)
 
 
 @contextmanager
-def code_path(root):
-    """Import model code from root without leaking its 'model' package into other networks."""
-    added = root is not None and str(root) not in sys.path
-    if added:
-        sys.path.insert(0, str(root))
-    before = set(sys.modules)
+def evreal_imports(root):
+    """Import EVREAL's 'model'/'utils' packages without clashing with same-named modules (e.g. the repo's model.py)."""
+    names = ("model", "utils", "parse_config")
+
+    def clashes(key):
+        return any(key == n or key.startswith(n + ".") for n in names)
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules) if clashes(k)}
+    sys.path.insert(0, str(root))
     try:
         yield
     finally:
-        for key in set(sys.modules) - before:
-            if key == "model" or key.startswith("model.") or key in ("parse_config", "utils") or key.startswith("utils."):
-                sys.modules.pop(key, None)
-        if added:
-            sys.path.remove(str(root))
+        sys.path.remove(str(root))
+        for k in [k for k in sys.modules if clashes(k)]:
+            sys.modules.pop(k)
+        sys.modules.update(saved)
 
 
-def _architecture(ckpt):
-    config = ckpt.get("config") if isinstance(ckpt, dict) else None
-    if config is not None:  # pytorch-template style (event_cnn_minimal / EVREAL): config['arch']
-        try:
-            arch = config["arch"]
-            return arch["type"], dict(arch.get("args", {})), None
-        except (KeyError, TypeError):
-            pass
-    if isinstance(ckpt, dict) and "arch" in ckpt:  # rpg_e2vid style: cls(ckpt['model'])
-        return ckpt["arch"], None, ckpt.get("model", {})
-    raise ValueError("Unrecognised checkpoint: expected config['arch'] or 'arch' + 'model'")
-
-
-def build_model(checkpoint, code_root):
-    with code_path(code_root):
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if isinstance(ckpt, torch.nn.Module):
-            return ckpt
-        arch, kwargs, positional = _architecture(ckpt)
-        cls = getattr(importlib.import_module("model.model"), arch)
-        model = cls(**kwargs) if kwargs is not None else cls(positional)
-        state = next((ckpt[k] for k in ("state_dict", "model_state_dict") if k in ckpt), None)
-        if state is None:
-            raise ValueError(f"No state_dict in {checkpoint}")
-        model.load_state_dict({k.removeprefix("module."): v for k, v in state.items()})
-        return model
+def build_model(name, checkpoint, evreal_root):
+    """Instantiate the network exactly as EVREAL's eval.py does for 'E2VID' and 'FireNet'."""
+    with evreal_imports(evreal_root):
+        arch = importlib.import_module("model")
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        if name == "e2vid":
+            kwargs = dict(ckpt["model"])
+            kwargs["final_activation"] = "sigmoid"
+            model = arch.E2VIDRecurrent(kwargs)
+        elif name == "firenet":
+            kwargs = dict(ckpt["config"]["model"])
+            kwargs["final_activation"] = ""
+            model = arch.FireNet_legacy(kwargs)
+        else:
+            raise ValueError(name)
+        model.load_state_dict(ckpt["state_dict"])
+    for prm in model.parameters():
+        prm.requires_grad_(False)
+    return model
 
 
 class Network:
-    """Recurrent reconstruction network with one state per batch item (= per event source)."""
-    def __init__(self, name, model, device, pad, amp):
-        self.name, self.model, self.device, self.pad, self.amp = name, model.to(device).eval(), device, pad, amp
-        self.stateful = hasattr(self.model, "reset_states")
-        self.states = None
+    """EVREAL-style recurrent network: reset_states(), forward(voxels) -> {'image'}; one state per batch item."""
+    def __init__(self, name, model, device, amp):
+        self.name, self.model, self.device, self.amp = name, model.to(device).eval(), device, amp
+        self.num_encoders = int(model.num_encoders)
 
     def reset(self):
-        self.states = None
-        if self.stateful:
-            self.model.reset_states()
+        self.model.reset_states()
 
     def step(self, voxels):
-        h, w = voxels.shape[-2:]
-        ph, pw = (-h) % self.pad, (-w) % self.pad
-        x = F.pad(voxels, (0, pw, 0, ph)) if ph or pw else voxels
+        pad, (y0, y1, x0, x1) = crop_params(voxels.shape[-2], voxels.shape[-1], self.num_encoders)
+        x = F.pad(voxels, pad) if any(pad) else voxels
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
-            out = self.model(x) if self.stateful else self.model(x, self.states)
-        if isinstance(out, dict):
-            img = out["image"]
-        elif isinstance(out, (tuple, list)):
-            img, self.states = out[0], out[1]
-        else:
-            img = out
-        return img[..., :h, :w].float()
+            out = self.model(x)
+        return out["image"][..., y0:y1, x0:x1].float()
+
+
+def robust_normalize(img, q_lo, q_hi):
+    """EVREAL normalize(): (img - P_lo) / (P_hi - P_lo) per image, percentiles with linear interpolation."""
+    q = torch.tensor([q_lo / 100, q_hi / 100], device=img.device, dtype=torch.float32)
+    out = torch.empty_like(img)
+    for i in range(img.shape[0]):
+        lo, hi = torch.quantile(img[i].flatten().float(), q)
+        scale = torch.where(hi > lo, hi - lo, torch.ones_like(hi))
+        out[i] = (img[i] - lo) / scale
+    return out
+
+
+def postprocess(img, network, norm):
+    """Output normalisation before saving and scoring, then clip to [0, 1].
+    evreal: EVREAL 'std' settings (E2VID robust 1-99 percentiles, FireNet none); minmax: per image 0-100; none."""
+    if norm == "evreal" and network == "e2vid":
+        img = robust_normalize(img, 1, 99)
+    elif norm == "minmax":
+        img = robust_normalize(img, 0, 100)
+    return img.clamp(0, 1)
 
 
 def gaussian_window(size=11, sigma=1.5, device=None):
@@ -346,8 +454,10 @@ def gaussian_window(size=11, sigma=1.5, device=None):
 
 
 class Scorer:
-    def __init__(self, device, norm, use_lpips=True, batch=64):
-        self.device, self.norm, self.batch = device, norm, batch
+    """MSE, SSIM (as skimage: Gaussian 11x11, sigma 1.5, no sample covariance) and LPIPS (AlexNet, v0.1)
+    on images in [0, 1], as in EVREAL."""
+    def __init__(self, device, use_lpips=True, batch=64):
+        self.device, self.batch = device, batch
         g = gaussian_window(device=device)
         self.gx, self.gy = g.view(1, 1, 1, -1), g.view(1, 1, -1, 1)
         self.lpips = None
@@ -356,14 +466,6 @@ class Scorer:
             self.lpips = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
             for prm in self.lpips.parameters():
                 prm.requires_grad_(False)
-
-    def prepare(self, img):
-        if self.norm == "minmax":
-            flat = img.flatten(1)
-            lo, hi = flat.min(1).values, flat.max(1).values
-            scale = torch.where(hi > lo, hi - lo, torch.ones_like(hi))
-            return ((img - lo.view(-1, 1, 1, 1)) / scale.view(-1, 1, 1, 1)).clamp_(0, 1)
-        return img.clamp(0, 1)
 
     def ssim(self, x, y):
         def blur(z):
@@ -376,10 +478,10 @@ class Scorer:
 
     @_inference
     def __call__(self, pred, ref):
-        """pred, ref: (N, 1, H, W). Returns {metric: (N,) tensor}."""
+        """pred, ref: (N, 1, H, W) in [0, 1]. Returns {metric: (N,) tensor}."""
         out = {m: [] for m in METRICS}
         for i in range(0, pred.shape[0], self.batch):
-            p, r = self.prepare(pred[i:i + self.batch]), self.prepare(ref[i:i + self.batch])
+            p, r = pred[i:i + self.batch].clamp(0, 1), ref[i:i + self.batch].clamp(0, 1)
             out["mse"].append(((p - r) ** 2).mean((1, 2, 3)))
             out["ssim"].append(self.ssim(p, r))
             if self.lpips is not None:
@@ -421,7 +523,6 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool):
     has_real = REAL in data.events
     h, w = data.meta["height"], data.meta["width"]
     n_frames = len(data.edges)
-    edges_t = torch.from_numpy(data.edges).to(device)
     samples = (set(range(1, n_frames)) if args.save == "all"
                else sample_frames(n_frames, args.warmup, args.samples) if args.save == "samples" else set())
     for net in networks:
@@ -439,16 +540,16 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool):
     for j0 in range(0, windows, args.chunk):
         j1 = min(windows, j0 + args.chunk)
         request(j1, min(windows, j1 + args.chunk))  # prefetch the next chunk's frames
-        vox = torch.stack([voxelize(data.events[n], edges_t, j0, j1, args.bins, h, w, device) for n in names])
+        vox = torch.stack([voxelize(data.events[n], j0, j1, args.bins, h, w, device) for n in names])
         pending = []  # (k, network, recon (S,1,H,W))
         for c in range(j1 - j0):
             k = j0 + c + 1
             for net in networks:
-                img = net.step(vox[:, c])
+                img = postprocess(net.step(vox[:, c]), net.name, args.norm)
                 if k >= args.warmup:
                     pending.append((k, net.name, img))
                 if k in samples:
-                    saves.append((net.name, k, img.clamp(0, 1).cpu().numpy()))
+                    saves.append((net.name, k, img.cpu().numpy()))
         del vox
         if not pending:
             continue
@@ -504,22 +605,6 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool):
 
 # ---------------------------------------------------------------- workers
 
-def resolve(args):
-    def pick(value, env, fallback=None):
-        value = value or os.environ.get(env) or fallback
-        return Path(value).expanduser() if value else None
-    evreal = os.environ.get("EVREAL_ROOT")
-    ckpts = {"e2vid": pick(args.e2vid_ckpt, "RECON_E2VID_CKPT"),
-             "firenet": pick(args.firenet_ckpt, "RECON_FIRENET_CKPT")}
-    codes = {"e2vid": pick(args.e2vid_code, "RECON_E2VID_CODE", evreal),
-             "firenet": pick(args.firenet_code, "RECON_FIRENET_CODE", evreal)}
-    for net in args.networks:
-        if ckpts[net] is None or not ckpts[net].is_file():
-            raise FileNotFoundError(f"{net} checkpoint not found ({ckpts[net]}); set --{net}-ckpt "
-                                    f"or RECON_{net.upper()}_CKPT")
-    return ckpts, codes
-
-
 def worker(device, names, args, run_dir, worker_id):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
@@ -527,10 +612,9 @@ def worker(device, names, args, run_dir, worker_id):
     torch.set_num_threads(max(1, args.io_workers // 2))
     if str(device).startswith("cuda"):
         torch.cuda.set_device(torch.device(device))
-    ckpts, codes = resolve(args)
-    networks = [Network(n, build_model(ckpts[n], codes[n]), device, args.pad if n == "e2vid" else 1, args.amp)
+    networks = [Network(n, build_model(n, checkpoint_path(n, args)[0], args.evreal_root), device, args.amp)
                 for n in args.networks]
-    scorer = Scorer(device, args.norm, use_lpips=not args.skip_lpips, batch=args.metric_batch)
+    scorer = Scorer(device, use_lpips=not args.skip_lpips, batch=args.metric_batch)
     done, errors = 0, []
     with ThreadPoolExecutor(args.io_workers) as io_pool, ThreadPoolExecutor(1) as prefetch:
         loads = {}
@@ -586,25 +670,34 @@ def run(args):
     (run_dir / "per_frame").mkdir(parents=True, exist_ok=True)
     (run_dir / "sanity").mkdir(parents=True, exist_ok=True)
     todo = [n for n in names if not (run_dir / "per_frame" / f"{n}.csv").is_file()]
-    ckpts, codes = resolve(args)
+    commit, ckpts = setup(args)
     config = dict(
         dataset=args.dataset, split=args.split, events_root=str(events_root(args)), methods=methods,
         excluded={m: EXCLUDED[m] for m in EXCLUDED if (events_root(args) / m).is_dir()},
         sequences=names, networks=list(args.networks), bins=args.bins, warmup=args.warmup, norm=args.norm,
-        window="frame k <- events in [t_{k-1}, t_k)", voxel="bilinear in time, polarity +-1, non-zero mean 0 / std 1",
-        pad={"e2vid": args.pad, "firenet": 1}, amp=args.amp, tf32=args.tf32, lpips=not args.skip_lpips,
+        window="frame k <- events in [t_{k-1}, t_k) (EVREAL between_frames)",
+        voxel="EVREAL: time scaled by first/last event of the window, bilinear, polarity +-1; "
+              "non-zero entries mean 0 / population std 1",
+        padding="EVREAL CropParameters: centred zero padding to a multiple of 2**num_encoders",
+        postprocess={"evreal": "E2VID robust 1-99 percentile, FireNet none; clip [0, 1]",
+                     "minmax": "per image 0-100 percentile; clip [0, 1]", "none": "clip [0, 1]"}[args.norm],
+        amp=args.amp, tf32=args.tf32, lpips=not args.skip_lpips,
         save=args.save, samples=args.samples, devices=list(args.devices),
         recon_root=str(recon_base(args)),
-        checkpoints={n: dict(path=str(ckpts[n]), sha256=file_sha256(ckpts[n]), code=str(codes[n]))
-                     for n in args.networks},
+        evreal=dict(root=args.evreal_root, commit=commit, pinned=EVREAL_COMMIT, url=EVREAL_URL),
+        checkpoints={n: dict(path=str(path), sha256=sha, verified_against_pin=ok)
+                     for n, (path, sha, ok) in ckpts.items()},
         torch=str(torch.__version__), host=platform.node(),
         gpu=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [],
         code_sha256=file_sha256(Path(__file__)))
     cfg_path = run_dir / "config.json"
     if cfg_path.is_file():
         old = json.loads(cfg_path.read_text())
-        keep = ("methods", "networks", "bins", "warmup", "norm", "pad", "amp", "lpips", "checkpoints")
+        keep = ("methods", "networks", "bins", "warmup", "norm", "amp", "lpips")
         changed = [k for k in keep if old.get(k) != config[k]]
+        if {n: c["sha256"] for n, c in old.get("checkpoints", {}).items()} != \
+                {n: c["sha256"] for n, c in config["checkpoints"].items()}:
+            changed.append("checkpoints")
         if changed:
             raise ValueError(f"Resuming {run_dir} with different settings: {changed}")
     cfg_path.write_text(json.dumps(config, indent=2))
@@ -746,13 +839,17 @@ def parser():
     p.add_argument("--data-root", help="Override the source sequences root (<root>/<dataset>/<split>/<seq>)")
     p.add_argument("--recon-root", help="Override data_test_recon/<dataset>/<split>")
     p.add_argument("--run-dir", help="Resume (or name) a report folder; finished sequences are skipped")
-    p.add_argument("--e2vid-ckpt"), p.add_argument("--firenet-ckpt")
-    p.add_argument("--e2vid-code"), p.add_argument("--firenet-code")
+    p.add_argument("--evreal-root", help="EVREAL checkout (default: $EVREAL_ROOT or ~/.cache/evtween/EVREAL); "
+                   "cloned at the pinned commit if missing")
+    p.add_argument("--no-auto-setup", dest="auto_setup", action="store_false",
+                   help="Do not clone EVREAL or pip-install missing packages; fail instead")
+    p.add_argument("--e2vid-ckpt", help="Use another E2VID checkpoint in the same format instead of EVREAL's")
+    p.add_argument("--firenet-ckpt", help="Use another FireNet checkpoint in the same format instead of EVREAL's")
     p.add_argument("--bins", type=int, default=5)
     p.add_argument("--warmup", type=int, default=10, help="Frames k < warmup are reconstructed but not scored")
-    p.add_argument("--norm", choices=("minmax", "none"), default="minmax",
-                   help="Per-image normalisation of reconstruction and reference before scoring")
-    p.add_argument("--pad", type=int, default=16, help="E2VID input padding multiple")
+    p.add_argument("--norm", choices=("evreal", "minmax", "none"), default="evreal",
+                   help="Output normalisation before saving and scoring (evreal: E2VID robust 1-99 percentile, "
+                        "FireNet none, as in EVREAL's standard protocol)")
     p.add_argument("--save", choices=("none", "samples", "all"), default="samples")
     p.add_argument("--samples", type=int, default=5, help="Frames saved per sequence with --save samples")
     p.add_argument("--devices", nargs="+", default=["cuda:0"],

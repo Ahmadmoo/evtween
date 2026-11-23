@@ -104,14 +104,48 @@ def test_sample_frames():
     assert min(r.sample_frames(100, 0, 5)) == 1
 
 
-def test_numpy_voxel_preserves_polarity_sum():
+def test_numpy_voxel_follows_evreal():
     rng = np.random.default_rng(1)
     ev = make_events(rng, 500, 1.0)
-    grid = r.voxel_grid_numpy(ev["t"], ev["x"], ev["y"], ev["p"].astype(float), 0.0, 1.0, 5, H, W)
-    assert np.isclose(grid.sum(), ev["p"].sum())
+    grid = r.voxel_grid_numpy(ev["t"], ev["x"], ev["y"], ev["p"].astype(float), 5, H, W)
+    assert np.isclose(grid.sum(), ev["p"].sum())  # bilinear weights of each event sum to 1
+    # first event lands fully in bin 0, last event fully in the last bin
+    one = r.voxel_grid_numpy(np.array([2.0, 3.0]), np.array([1, 2]), np.array([0, 0]), np.array([1.0, -1.0]), 5, 2, 4)
+    assert one[0, 0, 1] == 1 and one[4, 0, 2] == -1 and np.count_nonzero(one) == 2
+    # identical timestamps: spread by rank (EVREAL linspace)
+    same = r.voxel_grid_numpy(np.zeros(3), np.array([0, 1, 2]), np.zeros(3, int), np.ones(3), 5, 1, 3)
+    assert same[0, 0, 0] == 1 and same[2, 0, 1] == 1 and same[4, 0, 2] == 1
     norm = r.normalize_numpy(grid)
     nz = grid != 0
-    assert np.isclose(norm[nz].mean(), 0, atol=1e-9) and np.isclose(norm[nz].std(ddof=1), 1)
+    assert np.isclose(norm[nz].mean(), 0, atol=1e-9) and np.isclose(norm[nz].std(ddof=0), 1)
+
+
+def test_crop_params_match_evreal():
+    pad, crop = r.crop_params(618, 773, 3)
+    assert pad == (2, 1, 3, 3) and crop == (3, 621, 2, 775)
+    assert crop[1] - crop[0] == 618 and crop[3] - crop[2] == 773
+    assert r.crop_params(480, 640, 3) == ((0, 0, 0, 0), (0, 480, 0, 640))
+
+
+def test_setup_checks(tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError):
+        r.ensure_evreal(tmp_path / "none", auto=False)
+    root = tmp_path / "evreal"
+    rel = r.CHECKPOINTS["firenet"][0]
+    (root / rel).parent.mkdir(parents=True)
+    (root / rel).write_bytes(b"not the real weights")
+    args = SimpleNamespace(evreal_root=str(root), firenet_ckpt=None, e2vid_ckpt=None)
+    monkeypatch.delenv("RECON_FIRENET_CKPT", raising=False)
+    with pytest.raises(ValueError, match="does not match"):
+        r.checkpoint_path("firenet", args)
+    args.firenet_ckpt = str(root / rel)
+    path, sha, verified = r.checkpoint_path("firenet", args)
+    assert path == root / rel and not verified and len(sha) == 64
+    monkeypatch.setattr(r, "PACKAGES", {"json": "json"})
+    assert r.ensure_packages(auto=False) == []
+    monkeypatch.setattr(r, "PACKAGES", {"surely_missing_pkg_xyz": "surely-missing-pkg-xyz"})
+    with pytest.raises(ImportError):
+        r.ensure_packages(auto=False)
 
 
 def test_summarize_and_wilcoxon(tmp_path):
@@ -151,16 +185,21 @@ def test_summarize_and_wilcoxon(tmp_path):
 @needs_torch
 def test_voxelize_matches_numpy():
     rng = np.random.default_rng(3)
-    edges = np.array([0.0, 0.03, 0.05, 0.11, 0.2])
+    edges = np.array([0.0, 0.03, 0.05, 0.11, 0.2, 0.3, 0.4])
     ev = make_events(rng, 4000, 0.2 - 1e-9)
+    # window 4 [0.2, 0.3): one event; window 5 [0.3, 0.4): three events at the same time; window 3 empty-ish
+    extra_t = np.array([0.25, 0.35, 0.35, 0.35])
+    ev = {k: np.concatenate([ev[k], v]) for k, v in dict(
+        t=extra_t, x=np.array([1, 2, 3, 4], np.int32), y=np.array([1, 1, 1, 1], np.int32),
+        p=np.array([1, -1, 1, 1], np.int8)).items()}
     ev = r._canonical(ev["t"], ev["x"], ev["y"], ev["p"])
     _, ev["cuts"] = r._stats(ev, edges)
-    vox = r.voxelize(ev, torch.from_numpy(edges), 1, 4, 5, H, W, "cpu").numpy()
-    for j in range(1, 4):
+    vox = r.voxelize(ev, 1, 6, 5, H, W, "cpu").numpy()
+    for j in range(1, 6):
         a, b = ev["cuts"][j], ev["cuts"][j + 1]
         ref = r.normalize_numpy(r.voxel_grid_numpy(ev["t"][a:b], ev["x"][a:b], ev["y"][a:b],
-                                                   ev["p"][a:b].astype(float), edges[j], edges[j + 1], 5, H, W))
-        assert np.allclose(vox[j - 1], ref, atol=1e-4)
+                                                   ev["p"][a:b].astype(float), 5, H, W))
+        assert np.allclose(vox[j - 1], ref, atol=1e-4), j
 
 
 @needs_torch
@@ -169,44 +208,64 @@ def test_ssim_matches_skimage():
     rng = np.random.default_rng(4)
     a = rng.random((40, 50)).astype(np.float32)
     b = np.clip(a + rng.normal(0, 0.1, a.shape), 0, 1).astype(np.float32)
-    sc = r.Scorer("cpu", "none", use_lpips=False)
+    sc = r.Scorer("cpu", use_lpips=False)
     ours = sc.ssim(torch.from_numpy(a)[None, None], torch.from_numpy(b)[None, None]).item()
     ref = structural_similarity(a, b, data_range=1.0, gaussian_weights=True, sigma=1.5,
                                 use_sample_covariance=False)
     assert abs(ours - ref) < 1e-4
 
 
-DUMMY = '''
+FAKE_EVREAL = '''
 import torch
-class Dummy(torch.nn.Module):
-    """Recurrent toy network with the rpg_e2vid interface: forward(x, prev_states) -> (img, states)."""
-    def __init__(self, config):
+
+
+class _Toy(torch.nn.Module):
+    """Recurrent toy network with EVREAL's interface: reset_states(), forward(x) -> {'image': ...}."""
+    def __init__(self, kwargs):
         super().__init__()
-        self.conv = torch.nn.Conv2d(config.get("num_bins", 5), 1, 3, padding=1)
-    def forward(self, x, prev_states=None):
+        self.num_encoders = int(kwargs.get("num_encoders", 3))
+        self.final_activation = kwargs["final_activation"]
+        self.conv = torch.nn.Conv2d(int(kwargs["num_bins"]), 1, 3, padding=1)
+        self.reset_states()
+
+    def reset_states(self):
+        self.state = None
+
+    def forward(self, x):
+        assert x.shape[-1] % 2 ** self.num_encoders == 0 and x.shape[-2] % 2 ** self.num_encoders == 0
         y = self.conv(x)
-        if prev_states is not None:
-            y = y + 0.5 * prev_states
-        return torch.sigmoid(y), y.detach()
+        if self.state is not None:
+            y = y + 0.5 * self.state
+        self.state = y
+        return {"image": torch.sigmoid(y) if self.final_activation == "sigmoid" else y}
+
+
+class E2VIDRecurrent(_Toy):
+    pass
+
+
+class FireNet_legacy(_Toy):
+    pass
 '''
 
 
 @needs_torch
-def test_end_to_end_cpu(toy):
-    code = toy.tmp / "code"
-    (code / "model").mkdir(parents=True)
-    (code / "model" / "__init__.py").write_text("")
-    (code / "model" / "model.py").write_text(DUMMY)
-    sys.path.insert(0, str(code))
-    from model.model import Dummy
-    ckpt = toy.tmp / "dummy.pth"
-    torch.save(dict(arch="Dummy", model={"num_bins": 5}, state_dict=Dummy({"num_bins": 5}).state_dict()), ckpt)
-    sys.path.remove(str(code))
-    for key in [k for k in sys.modules if k == "model" or k.startswith("model.")]:
-        sys.modules.pop(key)
+def test_end_to_end_cpu(toy, monkeypatch):
+    root = toy.tmp / "evreal"
+    (root / "model").mkdir(parents=True)
+    (root / "model" / "__init__.py").write_text(FAKE_EVREAL)
+    with r.evreal_imports(root):
+        import model as fake
+        e2 = fake.E2VIDRecurrent(dict(num_bins=5, num_encoders=3, final_activation="sigmoid"))
+        fn = fake.FireNet_legacy(dict(num_bins=5, num_encoders=2, final_activation=""))
+    torch.save(dict(arch="E2VIDRecurrent", model=dict(num_bins=5, num_encoders=3), state_dict=e2.state_dict()),
+               toy.tmp / "e2vid.pth")
+    torch.save(dict(arch="FireNet", config=dict(model=dict(num_bins=5, num_encoders=2)), state_dict=fn.state_dict()),
+               toy.tmp / "firenet.pth")
+    monkeypatch.setattr(r, "PACKAGES", {})
     args = toy.args
-    args.e2vid_ckpt = args.firenet_ckpt = str(ckpt)
-    args.e2vid_code = args.firenet_code = str(code)
+    args.evreal_root, args.auto_setup = str(root), False
+    args.e2vid_ckpt, args.firenet_ckpt = str(toy.tmp / "e2vid.pth"), str(toy.tmp / "firenet.pth")
     run_dir = r.run(args)
     import pandas as pd
     frames = pd.read_csv(run_dir / "per_frame.csv")
@@ -215,6 +274,9 @@ def test_end_to_end_cpu(toy):
     assert frames.loc[frames.method == r.REAL, "agreement_mse"].isna().all()
     assert frames.loc[frames.method != r.REAL, "agreement_mse"].notna().all()
     assert frames["gt_ssim"].between(-1, 1).all()
+    assert frames["gt_mse"].between(0, 1).all()
+    cfg = json.loads((run_dir / "config.json").read_text())
+    assert cfg["norm"] == "evreal" and not cfg["checkpoints"]["e2vid"]["verified_against_pin"]
     summary = pd.read_csv(run_dir / "summary.csv")
     assert set(summary.method) == {r.REAL, "v2e", "evtween_v5.2_teacher"}
     sanity = pd.read_csv(run_dir / "sanity.csv")
