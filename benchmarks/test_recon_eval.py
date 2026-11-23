@@ -204,7 +204,8 @@ def test_voxelize_matches_numpy():
 
 @needs_torch
 def test_ssim_matches_skimage():
-    from skimage.metrics import structural_similarity
+    structural_similarity = pytest.importorskip(
+        "skimage.metrics", reason="scikit-image is only needed for this check").structural_similarity
     rng = np.random.default_rng(4)
     a = rng.random((40, 50)).astype(np.float32)
     b = np.clip(a + rng.normal(0, 0.1, a.shape), 0, 1).astype(np.float32)
