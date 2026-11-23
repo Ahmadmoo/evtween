@@ -12,7 +12,7 @@ every other benchmark metric.
 | `run.py` | Parallel, resumable runner |
 | `summarize.py` | Mean per generator over sequences, `summary.csv` and `summary.png` |
 | `check_device.py` | GPU vs CPU on synthetic events: same scores? how much faster? |
-| `*_v2_fast.py` | Faster version of the same metric (see v2_fast below) |
+| `*_v2_fast.py`, `explore_v2_fast.ipynb` | Faster version of the same metric, its summary and explorer notebook (see v2_fast below) |
 | `test_mmd.py` | Analytical cases, dense O(n²) reference, fast/exact/GPU-path agreement, runner, resume, GPU scheduling |
 
 ## Definition
@@ -175,6 +175,14 @@ python -m MMD.check_device_v2_fast        # fused / element-wise GPU vs kernel.p
 python -m MMD.run_v2_fast eds test --sigma-spatial-px 2 --sigma-temporal-ms 1 --device cuda
 python -m MMD.summarize_v2_fast MMD/runs/eds-test-v2-<hash>
 ```
+
+`explore_v2_fast.ipynb` (helpers in `explore_v2_fast.py`, tests in
+`test_explore_v2_fast.py`) compares v2_fast runs at different sigmas: Table 1 / Plot 1 the
+metrics against σ, Table 2 / Plot 2 the three terms a = S_gg/N², b = S_pp/M², c = S_gp/(NM)
+against σ, Plot 3 the same sums event by event in a short window (3-D point cloud, with a
+"difference" view showing where GT has events the prediction lacks and vice versa). All
+inputs (dataset, split, run folders, the window) are set in the first cell; plots are
+interactive plotly figures.
 
 Resources for a GPU run: one GPU (A100 80GB or H100), 16 CPUs (loading and merging events
 run on the CPU; at most 4 threads prepare tiles), 128 GB RAM for the largest EDS sequence.
