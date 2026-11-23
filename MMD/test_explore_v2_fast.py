@@ -120,14 +120,16 @@ class ExploreTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_PLOTLY, "plotly is not installed")
     def test_plots_build_with_plotly(self):
-        scores = ex.load_scores(ex.runs_from_folders(self.folders, "eds", "test"))
-        for fig in (ex.metric_vs_sigma(scores), ex.terms_vs_sigma(scores)):
-            fig.to_json()  # plotly validates every property on the way
-            for button in fig.layout.updatemenus[0].buttons:
-                self.assertEqual(len(button.args[0]["visible"]), len(fig.data))
+        for folders, kind in ((self.folders, "scatter"), (self.folders[:1], "bar")):
+            scores = ex.load_scores(ex.runs_from_folders(folders, "eds", "test"))
+            for fig in (ex.metric_vs_sigma(scores), ex.terms_vs_sigma(scores)):
+                fig.to_html(full_html=False, include_plotlyjs=False)  # validates properties
+                self.assertEqual({trace.type for trace in fig.data}, {kind})
+                for button in fig.layout.updatemenus[0].buttons:
+                    self.assertEqual(len(button.args[0]["visible"]), len(fig.data))
         window = ex.load_window(self.folders[1], "s1", "far", None, 30)
         fig, _ = ex.point_cloud(window, sigmas_px=(1, 2), max_points=500)
-        fig.to_json()
+        fig.to_html(full_html=False, include_plotlyjs=False)
         self.assertEqual(len(fig.layout.updatemenus[0].buttons), 8)
 
 

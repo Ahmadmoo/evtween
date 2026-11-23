@@ -180,102 +180,144 @@ def terms_table(scores):
 
 # ----------------------------------------------------------------------------- plots
 
-def _mean_and_spread(scores, value):
-    grouped = scores.groupby(["sigma_temporal_ms", "generator", "sigma_spatial_px"])[value]
-    return grouped.mean(), grouped.std().fillna(0.0)
+def show(fig):
+    """Show a plotly figure as HTML with plotly.js embedded.
+
+    Like the repository's other notebooks; works where fig.show() stays blank (no plotly
+    renderer in the Jupyter front end).
+    """
+    from IPython.display import HTML, display
+
+    display(HTML(fig.to_html(full_html=False, include_plotlyjs=True,
+                             config={"displaylogo": False, "responsive": True})))
+
+
+def _generators(scores):
+    return list(scores.groupby("generator").similarity.mean().sort_values(ascending=False).index)
+
+
+def _menu(buttons, y):
+    return [dict(buttons=buttons, direction="down", x=0, xanchor="left", y=y, yanchor="top",
+                 showactive=True)]
 
 
 def metric_vs_sigma(scores):
-    """Plot 1: metric (dropdown) against σ spatial; one line per generator, error = std."""
+    """Plot 1: a metric (dropdown) per generator, mean ± std over sequences.
+
+    Several spatial sigmas: one line per generator against σ. One sigma: a bar per generator.
+    """
     import plotly.graph_objects as go
 
     fig = go.Figure()
-    generators = list(scores.groupby("generator").similarity.mean()
-                      .sort_values(ascending=False).index)
+    generators = _generators(scores)
     temporals = sorted(scores.sigma_temporal_ms.unique())
+    single = scores.sigma_spatial_px.nunique() == 1
     keys = [(metric, st) for metric in METRICS for st in temporals]
     owners = []
     for metric, st in keys:
-        mean, spread = _mean_and_spread(scores, metric)
-        for g in generators:
-            if (st, g) not in mean.index:
-                continue
+        grouped = scores[scores.sigma_temporal_ms == st].groupby(
+            ["generator", "sigma_spatial_px"])[metric]
+        mean, spread = grouped.mean(), grouped.std().fillna(0.0)
+        present = [g for g in generators if g in mean.index.get_level_values(0)]
+        visible = (metric, st) == keys[0]
+        if single:
+            fig.add_trace(go.Bar(
+                x=present, y=[float(mean.loc[g].iloc[0]) for g in present],
+                error_y=dict(type="data", array=[float(spread.loc[g].iloc[0]) for g in present],
+                             visible=True),
+                name=metric, visible=visible, marker=dict(color="#4c78a8"),
+                hovertemplate=f"%{{x}}<br>{metric} %{{y:.4g}}<extra></extra>"))
             owners.append((metric, st))
-            m, s = mean.loc[(st, g)], spread.loc[(st, g)]
+            continue
+        for g in present:
+            m, s = mean.loc[g], spread.loc[g]
             fig.add_trace(go.Scatter(
-                x=list(m.index), y=list(m.values), mode="lines+markers", name=g,
-                error_y=dict(type="data", array=list(s.values), visible=True),
-                visible=(metric, st) == keys[0], legendgroup=g,
+                x=[float(v) for v in m.index], y=[float(v) for v in m.values],
+                mode="lines+markers", name=g, legendgroup=g, visible=visible,
+                error_y=dict(type="data", array=[float(v) for v in s.values], visible=True),
                 hovertemplate=f"{g}<br>σ %{{x:g}} px<br>{metric} %{{y:.4g}}<extra></extra>"))
+            owners.append((metric, st))
+    where = (f"at σ {scores.sigma_spatial_px.iloc[0]:g} px" if single else "vs spatial σ")
     buttons = []
     for metric, st in keys:
         title, hint = METRICS[metric]
         label = title if len(temporals) == 1 else f"{title} · σt {st:g} ms"
         buttons.append(dict(label=label, method="update", args=[
             {"visible": [owner == (metric, st) for owner in owners]},
-            {"title.text": f"{label} ({hint}) vs spatial σ, mean ± std over sequences",
+            {"title.text": f"{label} ({hint}) {where}, mean ± std over sequences",
              "yaxis.title.text": metric,
              "yaxis.autorange": "reversed" if metric == "rank" else True}]))
     first = buttons[0]["args"][1]
     fig.update_layout(
-        title=dict(text=first["title.text"]), xaxis_title="spatial σ (px)",
-        yaxis_title=first["yaxis.title.text"], height=480, hovermode="closest",
-        updatemenus=[dict(buttons=buttons, direction="down", x=0, xanchor="left", y=1.15,
-                          yanchor="top", showactive=True)],
-        margin=dict(t=110))
+        title=dict(text=first["title.text"]),
+        xaxis=dict(title=dict(text="generator" if single else "spatial σ (px)")),
+        yaxis=dict(title=dict(text=first["yaxis.title.text"])),
+        height=480, hovermode="closest", showlegend=not single,
+        updatemenus=_menu(buttons, 1.15), margin=dict(t=110))
     return fig
 
 
 def terms_vs_sigma(scores):
-    """Plot 2: a, b, c against σ spatial, one panel each; absolute (log) or relative to a."""
+    """Plot 2: a, b, c, one panel each; absolute (log) or relative to a (dropdown).
+
+    Several spatial sigmas: lines against σ. One sigma: a bar per generator (a: one bar,
+    it only depends on GT).
+    """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     fig = make_subplots(rows=1, cols=3, subplot_titles=list(TERMS.values()),
                         horizontal_spacing=0.07)
-    generators = list(scores.groupby("generator").similarity.mean()
-                      .sort_values(ascending=False).index)
+    generators = _generators(scores)
     temporals = sorted(scores.sigma_temporal_ms.unique())
     st = temporals[0]
-    data = scores[scores.sigma_temporal_ms == st]
+    data = scores[scores.sigma_temporal_ms == st].assign(a_over_a=1.0)
+    single = data.sigma_spatial_px.nunique() == 1
     views = {"absolute": ("a", "b", "c"), "relative": ("a_over_a", "b_over_a", "c_over_a")}
-    data = data.assign(a_over_a=1.0)
     owners = []
     for view, columns in views.items():
         for col, column in enumerate(columns, 1):
-            # a depends on GT only: one line.
-            lines = ["GT"] if col == 1 else generators
-            for g in lines:
-                part = data if g == "GT" else data[data.generator == g]
-                if col == 1:
-                    part = part.drop_duplicates(["sigma_spatial_px", "sequence"])
-                mean = part.groupby("sigma_spatial_px")[column].mean()
+            means = {}
+            for g in (["GT"] if col == 1 else generators):
+                part = (data.drop_duplicates(["sigma_spatial_px", "sequence"]) if g == "GT"
+                        else data[data.generator == g])
+                if len(part):
+                    means[g] = part.groupby("sigma_spatial_px")[column].mean()
+            if single:
+                fig.add_trace(go.Bar(
+                    x=list(means), y=[float(m.iloc[0]) for m in means.values()],
+                    showlegend=False, visible=view == "absolute",
+                    marker=dict(color="#555555" if col == 1 else "#4c78a8"),
+                    hovertemplate="%{x}<br>%{y:.4g}<extra></extra>"), row=1, col=col)
+                owners.append(view)
+                continue
+            for g, mean in means.items():
                 fig.add_trace(go.Scatter(
-                    x=list(mean.index), y=list(mean.values), mode="lines+markers", name=g,
-                    legendgroup=g, showlegend=col == 2 or (col == 1 and g == "GT"),
+                    x=[float(v) for v in mean.index], y=[float(v) for v in mean.values],
+                    mode="lines+markers", name=g, legendgroup=g,
+                    showlegend=col == 2 or (col == 1 and g == "GT"),
                     line=dict(color="black", dash="dot") if g == "GT" else None,
                     visible=view == "absolute",
                     hovertemplate=f"{g}<br>σ %{{x:g}} px<br>%{{y:.4g}}<extra></extra>"),
                     row=1, col=col)
                 owners.append(view)
-    axes = {f"yaxis{'' if i == 1 else i}.type": None for i in (1, 2, 3)}
+    where = f"at σ {data.sigma_spatial_px.iloc[0]:g} px" if single else "vs spatial σ"
+    axes = ("yaxis.type", "yaxis2.type", "yaxis3.type")
     buttons = [
         dict(label="Absolute (log scale)", method="update",
              args=[{"visible": [o == "absolute" for o in owners]},
                    {**{k: "log" for k in axes},
-                    "title.text": f"The three terms vs spatial σ (σt {st:g} ms), mean over "
+                    "title.text": f"The three terms {where} (σt {st:g} ms), mean over "
                                   "sequences"}]),
         dict(label="Relative to GT–GT (b / a, c / a)", method="update",
              args=[{"visible": [o == "relative" for o in owners]},
                    {**{k: "linear" for k in axes},
-                    "title.text": f"b / a and c / a vs spatial σ (σt {st:g} ms): b/a > 1 = "
+                    "title.text": f"b / a and c / a {where} (σt {st:g} ms): b/a > 1 = "
                                   "prediction more clustered than GT; c/a = overlap"}])]
     fig.update_layout(title=dict(text=buttons[0]["args"][1]["title.text"]), height=460,
-                      updatemenus=[dict(buttons=buttons, direction="down", x=0,
-                                        xanchor="left", y=1.2, yanchor="top")],
-                      margin=dict(t=120))
+                      updatemenus=_menu(buttons, 1.2), margin=dict(t=120))
     for i in (1, 2, 3):
-        fig.update_xaxes(title_text="spatial σ (px)", row=1, col=i)
+        fig.update_xaxes(title_text="generator" if single else "spatial σ (px)", row=1, col=i)
         fig.update_yaxes(type="log", row=1, col=i)
     if len(temporals) > 1:
         print(f"Plot 2 shows σt = {st:g} ms; other σt values: {temporals[1:]}")
