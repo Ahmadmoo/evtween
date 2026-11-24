@@ -99,7 +99,7 @@ checkpoint and Rails datasets are not available in the development workspace.
 ## Student v8.2
 
 The same runners also accept `evtween_v8.2_student`. Its expected checkpoint is
-`$EVTWEEN_WEIGHTS/V8.2/student.pt` (uppercase V, following the V8 convention).
+`$EVTWEEN_WEIGHTS/v8.2/student.pt` (lowercase v, matching the checkpoint directory).
 Use the actual v8.2 student checkpoint, not the V8 checkpoint.
 
 Keep the benchmark branch checked out. Set up a separate model checkout once:
@@ -112,7 +112,7 @@ if [ ! -e "$EVTWEEN_V82_ROOT" ]; then
 fi
 test "$(git -C "$EVTWEEN_V82_ROOT" rev-parse HEAD)" = fafd1a756b53485da3403149cedb7a22f165bcdb
 export EVTWEEN_WEIGHTS="${EVTWEEN_WEIGHTS:-$(dirname "$PWD")/evtween-tides-compare/benchmarks/event_generation/checkpoints/evtween_versions}"
-test -f "$EVTWEEN_WEIGHTS/V8.2/student.pt"
+test -f "$EVTWEEN_WEIGHTS/v8.2/student.pt"
 ```
 
 Then replace `evtween_v8_student` with `evtween_v8.2_student` in the generation,
