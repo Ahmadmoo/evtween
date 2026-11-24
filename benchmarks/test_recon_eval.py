@@ -62,7 +62,7 @@ def toy(tmp_path):
     args = r.parser().parse_args([DATASET, "--events-root", str(evt), "--data-root", str(data),
                                   "--recon-root", str(tmp_path / "recon"), "--run-dir", str(tmp_path / "run"),
                                   "--warmup", "3", "--chunk", "5", "--devices", "cpu", "--skip-lpips",
-                                  "--samples", "2", "--io-workers", "2"])
+                                  "--save", "samples", "--samples", "2", "--io-workers", "2"])
     return SimpleNamespace(args=args, tmp=tmp_path, seqs=seqs)
 
 
@@ -180,6 +180,59 @@ def test_summarize_and_wilcoxon(tmp_path):
         assert (run / name).is_file()
 
 
+def _frames_df(psnr_by_frame, methods=("v2e", "iebcs"), networks=("e2vid", "firenet")):
+    import pandas as pd
+    rows = []
+    for k, p in psnr_by_frame.items():
+        for net in networks:
+            for m in (r.REAL, *methods):
+                mse = 10 ** (-(p if m != r.REAL else 99) / 10)  # 'real' must not influence the selection
+                rows.append(dict(network=net, method=m, frame=k, gt_mse=mse, gt_ssim=0.5,
+                                 agreement_ssim=np.nan if m == r.REAL else 0.6,
+                                 agreement_lpips=np.nan if m == r.REAL else 0.2))
+    return pd.DataFrame(rows)
+
+
+def test_select_frames_categories_without_duplicates():
+    frames = list(range(10, 110))
+    psnr = {k: float(k) for k in frames}                      # PSNR grows with k
+    motion = {k: float(k % 7 == 0) * 100 + (200 if k == 109 else 0) for k in frames}
+    counts = dict(high_psnr=10, low_psnr=10, high_motion=10, temporal=10)
+    sel, mean_psnr = r.select_frames(_frames_df(psnr), motion, counts, 40)
+    assert len(sel) == 40 and len(set(sel)) == 40
+    assert [k for k, c in sel.items() if c == "high_psnr"] == list(range(100, 110))
+    assert [k for k, c in sel.items() if c == "low_psnr"] == list(range(10, 20))
+    hm = [k for k, c in sel.items() if c == "high_motion"]
+    assert 109 not in hm and len(hm) == 10                     # 109 already taken as high PSNR: next candidate
+    assert all(motion[k] >= 100 for k in hm)
+    temporal = [k for k, c in sel.items() if c == "temporal"]
+    assert len(temporal) == 10 and np.diff(temporal).min() >= 3   # spread out
+    assert np.isclose(mean_psnr[50], 50)                         # 'real' excluded from the average
+
+
+def test_select_frames_small_sequence_and_total():
+    psnr = {k: float(k) for k in range(10, 22)}
+    sel, _ = r.select_frames(_frames_df(psnr), {k: 0.0 for k in psnr}, dict(
+        high_psnr=10, low_psnr=10, high_motion=10, temporal=10), 40)
+    assert sorted(sel) == list(range(10, 22))                     # fewer frames than requested: all of them
+    psnr = {k: float(k) for k in range(10, 200)}
+    sel, _ = r.select_frames(_frames_df(psnr), {}, dict(high_psnr=2, low_psnr=2, high_motion=2, temporal=1), 12)
+    assert len(sel) == 12 and sum(c == "temporal" for c in sel.values()) == 8   # no motion data; temporal tops up
+
+
+def test_psnr_from_mse():
+    assert np.isclose(r.psnr_from_mse(0.01), 20) and np.isfinite(r.psnr_from_mse(0.0))
+
+
+def test_contact_sheet(tmp_path):
+    im = Image.fromarray((np.random.default_rng(0).random((30, 40)) * 255).astype(np.uint8))
+    rows = [(net, [(["ground truth", "frame 3", ""], im), (["v2e", "GT: PSNR 20.00", "vs real: LPIPS 0.2"], im)])
+            for net in ("e2vid", "firenet")]
+    path = r.contact_sheet(tmp_path / "s" / "000003_temporal.png", "title", rows, tile_width=80)
+    with Image.open(path) as sheet:
+        assert sheet.width > 2 * 80 and sheet.height > 2 * 60
+
+
 # ---------------------------------------------------------------- torch
 
 @needs_torch
@@ -287,6 +340,20 @@ def test_end_to_end_cpu(toy, monkeypatch):
     assert json.loads((toy.tmp / "recon" / "e2vid" / r.REAL / "seq0" / "recon.json").read_text())["frames"] == [3, 13]
     fig = r.qualitative(run_dir, "seq0", network="firenet")
     assert fig.is_file()
+    # hybrid: reuse the stored metrics of this run, save the selected frames and contact sheets
+    args.save, args.select_total = "hybrid", 6
+    args.select_high_psnr = args.select_low_psnr = args.select_motion = args.select_temporal = 1
+    r.run(args)
+    sel = pd.read_csv(run_dir / "selection.csv")
+    assert set(sel.sequence) == {"seq0", "seq1"} and (sel.groupby("sequence").size() == 6).all()
+    for seq, g in sel.groupby("sequence"):
+        ks = sorted(g.frame)
+        for net in ("e2vid", "firenet"):
+            for method in ([r.REAL, "v2e", "evtween_v5.2_teacher"] if seq == "seq0" else [r.REAL, "evtween_v5.2_teacher"]):
+                saved = {int(p.stem) for p in (toy.tmp / "recon" / net / method / seq).glob("*.png")}
+                assert set(ks) <= saved
+        assert len(list((run_dir / "contact_sheets" / seq).glob("*.png"))) == 6
+    assert pd.read_csv(run_dir / "per_frame.csv").equals(frames)   # metrics untouched
     # resuming skips finished sequences and reproduces the same numbers
     again = r.run(args)
     assert pd.read_csv(again / "per_frame.csv").equals(frames)

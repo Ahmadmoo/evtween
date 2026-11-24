@@ -31,10 +31,20 @@ Automatic setup (first run; --no-auto-setup turns it off)
   * LPIPS downloads torchvision's AlexNet weights on first use.
 
 Outputs
-  data_test_recon/<DATASET>/<SPLIT>/<network>/<method>/<sequence>/{k:06d}.png   (--save samples|all)
+  data_test_recon/<DATASET>/<SPLIT>/<network>/<method>/<sequence>/{k:06d}.png   (saved frames)
+  reports/.../<timestamp>/contact_sheets/<sequence>/{k:06d}_<category>.png         (--save hybrid)
+
+Saved frames (--save)
+  hybrid (default): 40 frames per sequence, the same indices for every method and both networks:
+    10 highest and 10 lowest PSNR vs GT (from the stored gt_mse, averaged over all event-generation methods
+    and networks), 10 with the largest GT frame-to-frame change, 10 spread evenly over the rest; no
+    duplicates (--select-* change the counts). Chosen after scoring, then the sequence is replayed to save
+    them. With --run-dir of a finished run the stored metrics are reused and only the frames are made.
+  samples: --samples evenly spaced frames; all: every frame; none.
   reports/recon/<DATASET>/<SPLIT>/<timestamp>/
       config.json, per_frame/<sequence>.csv, sanity/<sequence>.csv          (written while running)
-      per_frame.csv, per_sequence.csv, summary.csv, sanity.csv, wilcoxon.csv (summarize())
+      selection/<sequence>.csv, contact_sheets/<sequence>/                  (--save hybrid)
+      per_frame.csv, per_sequence.csv, summary.csv, sanity.csv, wilcoxon.csv, selection.csv
 
 Example (one A100, 32 CPUs; two workers share the GPU so loading overlaps with compute):
   python benchmarks/recon_eval.py EDS --devices cuda:0 cuda:0
@@ -536,33 +546,42 @@ def _clock(seconds):
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
-def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag=""):
+def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag="", score=True, samples=None,
+                     categories=None):
+    """Reconstruct one sequence. score=True: compute metrics and write per_frame/ and sanity/ CSVs.
+    samples: frame indices to save as PNG (default from --save samples|all). score=False only replays the
+    reconstruction up to the last sample (same computation) and saves the samples."""
     device = scorer.device
     names = [n for n in (REAL, *args._methods) if n in data.events]
     has_real = REAL in data.events
     h, w = data.meta["height"], data.meta["width"]
     n_frames = len(data.edges)
-    samples = (set(range(1, n_frames)) if args.save == "all"
-               else sample_frames(n_frames, args.warmup, args.samples) if args.save == "samples" else set())
+    if samples is None:
+        samples = (set(range(1, n_frames)) if args.save == "all"
+                   else sample_frames(n_frames, args.warmup, args.samples) if args.save == "samples" else set())
+    samples = {int(k) for k in samples}
     for net in networks:
         net.reset()
-    rows, saves = [], []
+    rows, futures = [], []
     frame_jobs = {}
 
     def request(j0, j1):
+        if not score:
+            return
         for k in range(j0 + 1, j1 + 1):
             if k >= args.warmup and k not in frame_jobs:
                 frame_jobs[k] = io_pool.submit(load_gray, data.frames[k], w, h)
 
-    windows = n_frames - 1
+    # frame k comes from window k-1; a replay can stop after the last sample (the state only depends on the past)
+    windows = n_frames - 1 if score else min(n_frames - 1, max(samples, default=0))
     request(0, min(windows, args.chunk))
     started = last_report = time.monotonic()
     for j0 in range(0, windows, args.chunk):
         now = time.monotonic()
         if j0 and now - last_report >= args.progress_every:
             rate = j0 / (now - started)
-            print(f"{tag} {data.name}: frame {j0}/{windows} ({100 * j0 / windows:.0f}%), "
-                  f"{rate:.1f} frames/s, ETA {_clock((windows - j0) / rate)}", flush=True)
+            print(f"{tag} {data.name}: {'frame' if score else 'replay, frame'} {j0}/{windows} "
+                  f"({100 * j0 / windows:.0f}%), {rate:.1f} frames/s, ETA {_clock((windows - j0) / rate)}", flush=True)
             last_report = now
         j1 = min(windows, j0 + args.chunk)
         request(j1, min(windows, j1 + args.chunk))  # prefetch the next chunk's frames
@@ -572,10 +591,12 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag=""):
             k = j0 + c + 1
             for net in networks:
                 img = postprocess(net.step(vox[:, c]), net.name, args.norm)
-                if k >= args.warmup:
+                if score and k >= args.warmup:
                     pending.append((k, net.name, img))
                 if k in samples:
-                    saves.append((net.name, k, img.cpu().numpy()))
+                    arr = img.cpu().numpy()
+                    futures += [io_pool.submit(_save_png, recon_dir(args, net.name, method, data.name) / f"{k:06d}.png",
+                                               arr[s, 0]) for s, method in enumerate(names)]
         del vox
         if not pending:
             continue
@@ -603,22 +624,20 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag=""):
         rows += table.values()
     for k, fut in frame_jobs.items():
         fut.cancel()
-    # sample / full frame saving
-    futures = []
-    for net_name, k, imgs in saves:
-        for s, method in enumerate(names):
-            futures.append(io_pool.submit(_save_png, recon_dir(args, net_name, method, data.name) / f"{k:06d}.png",
-                                          imgs[s, 0]))
     for fut in futures:
         fut.result()
-    if saves:
-        for net_name in {s[0] for s in saves}:
+    saved = sorted(k for k in samples if k <= windows)
+    if saved:
+        for net in networks:
             for method in names:
-                meta = dict(dataset=args.dataset, split=args.split, sequence=data.name, network=net_name,
+                meta = dict(dataset=args.dataset, split=args.split, sequence=data.name, network=net.name,
                             method=method, source=str(data.source), bins=args.bins, warmup=args.warmup,
-                            window="[t_{k-1}, t_k) -> frame k", saved=args.save,
-                            frames=sorted(k for n, k, _ in saves if n == net_name), run=str(run_dir))
-                (recon_dir(args, net_name, method, data.name) / "recon.json").write_text(json.dumps(meta, indent=2))
+                            window="[t_{k-1}, t_k) -> frame k", saved=args.save, frames=saved, run=str(run_dir))
+                if categories:
+                    meta["categories"] = {str(k): categories[k] for k in saved if k in categories}
+                (recon_dir(args, net.name, method, data.name) / "recon.json").write_text(json.dumps(meta, indent=2))
+    if not score:
+        return 0
     rows.sort(key=lambda r: (r["network"], names.index(r["method"]), r["frame"]))
     # one line per network: mean agreement with the real-event reconstruction (quick look; full tables at the end)
     key = "agreement_lpips" if not args.skip_lpips else "agreement_ssim"
@@ -637,6 +656,168 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag=""):
                for n in data.missing]
     _write_csv(run_dir / "sanity" / f"{data.name}.csv", SANITY_COLUMNS, sanity)
     return len(rows)
+
+
+# ---------------------------------------------------------------- hybrid frame selection and contact sheets (no torch)
+
+SELECTION_COLUMNS = ("dataset", "split", "sequence", "frame", "t_s", "category", "mean_gt_psnr", "motion")
+CATEGORY_ORDER = ("high_psnr", "low_psnr", "high_motion", "temporal")
+
+
+def psnr_from_mse(mse):
+    """PSNR in dB of images in [0, 1], from the stored MSE (no new metric computation)."""
+    return 10 * np.log10(1.0 / np.maximum(np.asarray(mse, np.float64), 1e-10))
+
+
+def selection_counts(args):
+    return dict(high_psnr=args.select_high_psnr, low_psnr=args.select_low_psnr,
+                high_motion=args.select_motion, temporal=args.select_temporal)
+
+
+def select_frames(frames, motion, counts, total):
+    """Pick one shared set of frame indices for every method and network of a sequence.
+
+    frames: per_frame rows of one sequence (pandas). motion: {frame: mean |GT_k - GT_{k-1}|}.
+    Categories are filled in CATEGORY_ORDER without duplicates (a frame already taken is skipped and the
+    next candidate is used): highest and lowest PSNR vs GT averaged over all event-generation methods and
+    networks, highest GT motion, then frames spread evenly over the remaining ones. The temporal category
+    gets at least counts['temporal'] frames and tops the selection up to `total`.
+    Returns {frame: category} and the per-frame mean PSNR (pandas Series)."""
+    sim = frames[frames["method"] != REAL]
+    if sim.empty:
+        sim = frames
+    sim = sim[sim["gt_mse"].notna()]
+    psnr = (sim.assign(psnr=psnr_from_mse(sim["gt_mse"].astype(float)))
+            .groupby("frame")["psnr"].mean().sort_index())
+    candidates = [int(f) for f in psnr.index]
+    chosen = {}
+
+    def take(order, n, category):
+        for f in order:
+            if n <= 0:
+                break
+            f = int(f)
+            if f not in chosen:
+                chosen[f] = category
+                n -= 1
+
+    take(psnr.sort_values(ascending=False, kind="stable").index, counts["high_psnr"], "high_psnr")
+    take(psnr.sort_values(ascending=True, kind="stable").index, counts["low_psnr"], "low_psnr")
+    import pandas as pd
+    mot = pd.Series(motion, dtype=float).reindex(candidates).dropna()
+    take(mot.sort_values(ascending=False, kind="stable").index, counts["high_motion"], "high_motion")
+    remaining = [f for f in candidates if f not in chosen]
+    n = min(len(remaining), max(counts["temporal"], total - len(chosen)))
+    if n > 0:
+        positions = np.unique(np.round(np.linspace(0, len(remaining) - 1, n)).astype(int))
+        for i in positions:
+            chosen[remaining[i]] = "temporal"
+    return dict(sorted(chosen.items())), psnr
+
+
+def gt_motion(frame_paths, ks, width, height, pool):
+    """Mean absolute difference between consecutive ground-truth frames (grayscale, [0, 1]) for frame k."""
+    def diff(k):
+        return float(np.abs(load_gray(frame_paths[k], width, height)
+                            - load_gray(frame_paths[k - 1], width, height)).mean())
+    ks = [int(k) for k in ks if k >= 1]
+    return dict(zip(ks, pool.map(diff, ks)))
+
+
+def _font(size):
+    from PIL import ImageFont
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1
+        return ImageFont.load_default()
+
+
+def contact_sheet(path, title, rows, tile_width=320):
+    """rows: [(row label, [(caption lines, PIL image), ...]), ...] -> one PNG grid with captions."""
+    from PIL import ImageDraw
+    font, title_font = _font(13), _font(16)
+    first = rows[0][1][0][1]
+    tile_h = max(1, round(tile_width * first.height / first.width))
+    lines = max(len(c) for _, tiles in rows for c, _ in tiles)
+    cap_h, label_w, title_h, gap = 6 + 16 * lines, 90, 34, 6
+    cols = max(len(tiles) for _, tiles in rows)
+    sheet = Image.new("RGB", (label_w + cols * (tile_width + gap) + gap,
+                              title_h + len(rows) * (tile_h + cap_h + gap) + gap), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.text((gap, 8), title, fill="black", font=title_font)
+    for r, (label, tiles) in enumerate(rows):
+        y = title_h + r * (tile_h + cap_h + gap)
+        draw.text((gap, y + tile_h // 2 - 8), label, fill="black", font=title_font)
+        for c, (caption, im) in enumerate(tiles):
+            x = label_w + c * (tile_width + gap)
+            sheet.paste(im.convert("RGB").resize((tile_width, tile_h), Image.BILINEAR), (x, y))
+            for i, line in enumerate(caption):
+                draw.text((x + 2, y + tile_h + 3 + 16 * i), line, fill="black", font=font)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path, optimize=False, compress_level=1)
+    return path
+
+
+def contact_sheets(run_dir, args, name, selection, frames, frame_paths, networks, methods, psnr, motion):
+    """One sheet per selected frame: rows = networks, columns = GT, real, every method (same frame everywhere)."""
+    out = []
+    frames = frames.set_index(["network", "method", "frame"])
+    for k, category in selection.items():
+        gt = Image.open(frame_paths[k]).convert("L")
+        rows = []
+        for net in networks:
+            tiles = [(["ground truth", f"frame {k}"], gt)]
+            for method in methods:
+                png = recon_dir(args, net, method, name) / f"{k:06d}.png"
+                if not png.is_file():
+                    continue
+                caption = [method]
+                if (net, method, k) in frames.index:
+                    row = frames.loc[(net, method, k)]
+                    caption += [f"vs GT  PSNR {float(psnr_from_mse(row['gt_mse'])):.2f}",
+                                f"vs GT  SSIM {row['gt_ssim']:.3f}"]
+                    if method != REAL and pd_notna(row.get("agreement_lpips")):
+                        caption.append(f"vs real LPIPS {row['agreement_lpips']:.3f}")
+                    if method != REAL and pd_notna(row.get("agreement_ssim")):
+                        caption.append(f"vs real SSIM {row['agreement_ssim']:.3f}")
+                tiles.append((caption, Image.open(png)))
+            rows.append((net, tiles))
+        title = (f"{args.dataset} / {name} / frame {k} ({category})   mean PSNR {psnr.get(k, float('nan')):.2f} dB"
+                 f"   motion {motion.get(k, float('nan')):.4f}")
+        out.append(contact_sheet(run_dir / "contact_sheets" / name / f"{k:06d}_{category}.png", title, rows,
+                                 args.sheet_tile_width))
+    return out
+
+
+def pd_notna(value):
+    try:
+        return value is not None and value == value and value != ""
+    except (TypeError, ValueError):
+        return False
+
+
+def render_selection(data, networks, scorer, args, run_dir, io_pool, tag=""):
+    """--save hybrid: choose frames from per_frame/<seq>.csv, replay the reconstruction to save exactly
+    those frames for every method and network, then write the contact sheets and selection/<seq>.csv."""
+    import pandas as pd
+    frames = pd.read_csv(run_dir / "per_frame" / f"{data.name}.csv")
+    ks = sorted(int(k) for k in frames["frame"].unique())
+    w, h = data.meta["width"], data.meta["height"]
+    motion = gt_motion(data.frames, ks, w, h, io_pool)
+    selection, psnr = select_frames(frames, motion, selection_counts(args), args.select_total)
+    process_sequence(data, networks, scorer, args, run_dir, io_pool, tag, score=False,
+                     samples=set(selection), categories=selection)
+    methods = [n for n in (REAL, *args._methods) if n in data.events]
+    contact_sheets(run_dir, args, data.name, selection, frames, data.frames, [n.name for n in networks],
+                   methods, psnr, motion)
+    rows = [dict(dataset=args.dataset, split=args.split, sequence=data.name, frame=k, t_s=float(data.edges[k]),
+                 category=c, mean_gt_psnr=float(psnr.get(k, float("nan"))), motion=motion.get(k, float("nan")))
+            for k, c in selection.items()]
+    _write_csv(run_dir / "selection" / f"{data.name}.csv", SELECTION_COLUMNS, rows)  # written last: marks done
+    per_cat = ", ".join(f"{c} {sum(v == c for v in selection.values())}" for c in CATEGORY_ORDER)
+    print(f"{tag} {data.name}: saved {len(selection)} selected frames ({per_cat}) -> contact_sheets/{data.name}/",
+          flush=True)
+    return selection
 
 
 # ---------------------------------------------------------------- workers
@@ -674,11 +855,19 @@ def worker(device, names, args, run_dir, worker_id):
                     if v["windows"] and v["empty_windows"] > 0.2 * v["windows"]:
                         print(f"{tag} WARNING {name}/{k}: {v['empty_windows']} of {v['windows']} "
                               "frame windows have no events", flush=True)
-                rows = process_sequence(data, networks, scorer, args, run_dir, io_pool, tag)
+                if (run_dir / "per_frame" / f"{name}.csv").is_file():
+                    rows = None
+                    print(f"{tag} {name}: metrics already in per_frame/{name}.csv; selecting and saving frames only",
+                          flush=True)
+                else:
+                    rows = process_sequence(data, networks, scorer, args, run_dir, io_pool, tag,
+                                            samples=set() if args.save == "hybrid" else None)
+                if args.save == "hybrid":
+                    render_selection(data, networks, scorer, args, run_dir, io_pool, tag)
                 del data
                 done += 1
-                print(f"{tag} {name}: DONE in {_clock(time.monotonic() - start)} ({rows} scored rows) "
-                      f"-> per_frame/{name}.csv", flush=True)
+                print(f"{tag} {name}: DONE in {_clock(time.monotonic() - start)}"
+                      + (f" ({rows} scored rows) -> per_frame/{name}.csv" if rows is not None else ""), flush=True)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
                 print(f"[w{worker_id}] ERROR {name}: {exc}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
@@ -718,7 +907,9 @@ def run(args):
         run_dir = ROOT / "reports" / "recon" / args.dataset / args.split / datetime.now().strftime("%Y%m%d-%H%M%S")
     (run_dir / "per_frame").mkdir(parents=True, exist_ok=True)
     (run_dir / "sanity").mkdir(parents=True, exist_ok=True)
-    todo = [n for n in names if not (run_dir / "per_frame" / f"{n}.csv").is_file()]
+    (run_dir / "selection").mkdir(parents=True, exist_ok=True)
+    todo = [n for n in names if not (run_dir / "per_frame" / f"{n}.csv").is_file()
+            or (args.save == "hybrid" and not (run_dir / "selection" / f"{n}.csv").is_file())]
     commit, ckpts = setup(args)
     config = dict(
         dataset=args.dataset, split=args.split, events_root=str(events_root(args)), methods=methods,
@@ -732,6 +923,11 @@ def run(args):
                      "minmax": "per image 0-100 percentile; clip [0, 1]", "none": "clip [0, 1]"}[args.norm],
         amp=args.amp, tf32=args.tf32, lpips=not args.skip_lpips,
         save=args.save, samples=args.samples, devices=list(args.devices),
+        selection=dict(selection_counts(args), total=args.select_total,
+                       rule="per sequence, one shared frame set for all methods and networks; categories filled in "
+                            "order high_psnr, low_psnr, high_motion, temporal without duplicates; PSNR from gt_mse, "
+                            "averaged over event-generation methods and networks; motion = mean |GT_k - GT_k-1|; "
+                            "temporal tops up to total") if args.save == "hybrid" else None,
         recon_root=str(recon_base(args)),
         evreal=dict(root=args.evreal_root, commit=commit, pinned=EVREAL_COMMIT, url=EVREAL_URL),
         checkpoints={n: dict(path=str(path), sha256=sha, verified_against_pin=ok)
@@ -766,6 +962,12 @@ def run(args):
                     errors += fut.result()[1]
     summarize(run_dir)
     print(f"Summary tables: {run_dir / 'summary.csv'}, sanity.csv, wilcoxon.csv", flush=True)
+    if args.save == "hybrid":
+        files = sorted((run_dir / "selection").glob("*.csv"))
+        if files:
+            import pandas as pd
+            pd.concat([pd.read_csv(f) for f in files], ignore_index=True).to_csv(run_dir / "selection.csv", index=False)
+        print(f"Selected frames: {run_dir / 'selection.csv'}; contact sheets: {run_dir / 'contact_sheets'}", flush=True)
     if errors:
         raise RuntimeError("Some sequences failed (rerun with --run-dir to resume):\n" + "\n".join(errors))
     return run_dir
@@ -858,7 +1060,7 @@ def qualitative(run_dir, sequence, frame=None, network="e2vid", methods=None, ou
         raise FileNotFoundError(f"No saved frames for {sequence} under {base / REAL}")
     frame = frame if frame is not None else found[len(found) // 2]
     meta = json.loads((base / REAL / sequence / "recon.json").read_text())
-    gt = Image.open(Path(meta["source"]) / "frames" / f"{frame:06d}.png").convert("L")
+    gt = Image.open(sorted((Path(meta["source"]) / "frames").glob("*.png"))[frame]).convert("L")
     panels = [("ground truth", gt)] + [(s, Image.open(base / s / sequence / f"{frame:06d}.png"))
                                        for s in sources if (base / s / sequence / f"{frame:06d}.png").is_file()]
     rows_n = math.ceil(len(panels) / columns)
@@ -900,8 +1102,17 @@ def parser():
     p.add_argument("--norm", choices=("evreal", "minmax", "none"), default="evreal",
                    help="Output normalisation before saving and scoring (evreal: E2VID robust 1-99 percentile, "
                         "FireNet none, as in EVREAL's standard protocol)")
-    p.add_argument("--save", choices=("none", "samples", "all"), default="samples")
+    p.add_argument("--save", choices=("hybrid", "samples", "all", "none"), default="hybrid",
+                   help="hybrid: frames chosen from the metrics (see --select-*), same frames for every method and "
+                        "network, plus contact sheets; samples: --samples evenly spaced frames; all; none")
     p.add_argument("--samples", type=int, default=5, help="Frames saved per sequence with --save samples")
+    p.add_argument("--select-high-psnr", type=int, default=10, help="hybrid: highest mean PSNR vs GT")
+    p.add_argument("--select-low-psnr", type=int, default=10, help="hybrid: lowest mean PSNR vs GT")
+    p.add_argument("--select-motion", type=int, default=10, help="hybrid: largest GT frame-to-frame change")
+    p.add_argument("--select-temporal", type=int, default=10, help="hybrid: at least this many evenly spread frames")
+    p.add_argument("--select-total", type=int, default=40,
+                   help="hybrid: frames per sequence; evenly spread frames fill up to this number")
+    p.add_argument("--sheet-tile-width", type=int, default=320, help="Width of one image in a contact sheet")
     p.add_argument("--devices", nargs="+", default=["cuda:0"],
                    help="One worker per entry; repeat a GPU (cuda:0 cuda:0) to run two workers on it")
     p.add_argument("--io-workers", type=int, help="Loader threads per worker (default: CPUs / workers)")
