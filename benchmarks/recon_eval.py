@@ -55,6 +55,7 @@ import platform
 import sys
 import time
 import traceback
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -470,7 +471,13 @@ class Scorer:
         self.lpips = None
         if use_lpips:
             import lpips
-            self.lpips = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+            with warnings.catch_warnings():
+                # lpips loads AlexNet with torchvision's deprecated 'pretrained' argument and its own bundled
+                # weights without weights_only; both are harmless, so hide them here only
+                warnings.filterwarnings("ignore", category=UserWarning, module=r"torchvision\.models\._utils")
+                warnings.filterwarnings("ignore", category=FutureWarning,
+                                        message=r"You are using `torch.load` with `weights_only=False`")
+                self.lpips = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
             for prm in self.lpips.parameters():
                 prm.requires_grad_(False)
 
@@ -524,7 +531,12 @@ def _save_png(path, img):
 
 
 @_inference
-def process_sequence(data, networks, scorer, args, run_dir, io_pool):
+def _clock(seconds):
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag=""):
     device = scorer.device
     names = [n for n in (REAL, *args._methods) if n in data.events]
     has_real = REAL in data.events
@@ -544,7 +556,14 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool):
 
     windows = n_frames - 1
     request(0, min(windows, args.chunk))
+    started = last_report = time.monotonic()
     for j0 in range(0, windows, args.chunk):
+        now = time.monotonic()
+        if j0 and now - last_report >= args.progress_every:
+            rate = j0 / (now - started)
+            print(f"{tag} {data.name}: frame {j0}/{windows} ({100 * j0 / windows:.0f}%), "
+                  f"{rate:.1f} frames/s, ETA {_clock((windows - j0) / rate)}", flush=True)
+            last_report = now
         j1 = min(windows, j0 + args.chunk)
         request(j1, min(windows, j1 + args.chunk))  # prefetch the next chunk's frames
         vox = torch.stack([voxelize(data.events[n], j0, j1, args.bins, h, w, device) for n in names])
@@ -601,6 +620,16 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool):
                             frames=sorted(k for n, k, _ in saves if n == net_name), run=str(run_dir))
                 (recon_dir(args, net_name, method, data.name) / "recon.json").write_text(json.dumps(meta, indent=2))
     rows.sort(key=lambda r: (r["network"], names.index(r["method"]), r["frame"]))
+    # one line per network: mean agreement with the real-event reconstruction (quick look; full tables at the end)
+    key = "agreement_lpips" if not args.skip_lpips else "agreement_ssim"
+    for net in networks:
+        means = []
+        for method in names[1:] if has_real else []:
+            vals = [r[key] for r in rows if r["network"] == net.name and r["method"] == method and r[key] != ""]
+            if vals:
+                means.append(f"{method} {np.mean(vals):.3f}")
+        if means:
+            print(f"{tag} {data.name}: {net.name} mean {key}: " + " | ".join(means), flush=True)
     _write_csv(run_dir / "per_frame" / f"{data.name}.csv", FRAME_COLUMNS, rows)
     sanity = [dict(dataset=args.dataset, split=args.split, sequence=data.name, method=n, status="ok",
                    **data.stats[n]) for n in names]
@@ -633,10 +662,23 @@ def worker(device, names, args, run_dir, worker_id):
             start = time.monotonic()
             try:
                 data = loads.pop(i).result()
-                rows = process_sequence(data, networks, scorer, args, run_dir, io_pool)
+                tag = f"[w{worker_id} {device}]"
+                counts = ", ".join(f"{k} {v['events'] / 1e6:.2f}M" for k, v in data.stats.items())
+                print(f"{tag} {name}: loaded {len(data.edges)} frames {data.meta['width']}x{data.meta['height']} "
+                      f"in {time.monotonic() - start:.1f}s; events: {counts}"
+                      + (f"; missing: {', '.join(data.missing)}" if data.missing else ""), flush=True)
+                if REAL not in data.events:
+                    print(f"{tag} WARNING {name}: no real events (ev_*.npy) in {data.source}; "
+                          "agreement metrics will be empty", flush=True)
+                for k, v in data.stats.items():
+                    if v["windows"] and v["empty_windows"] > 0.2 * v["windows"]:
+                        print(f"{tag} WARNING {name}/{k}: {v['empty_windows']} of {v['windows']} "
+                              "frame windows have no events", flush=True)
+                rows = process_sequence(data, networks, scorer, args, run_dir, io_pool, tag)
                 del data
                 done += 1
-                print(f"[w{worker_id} {device}] {name}: {rows} rows in {time.monotonic()-start:.1f}s", flush=True)
+                print(f"{tag} {name}: DONE in {_clock(time.monotonic() - start)} ({rows} scored rows) "
+                      f"-> per_frame/{name}.csv", flush=True)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
                 print(f"[w{worker_id}] ERROR {name}: {exc}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
@@ -723,6 +765,7 @@ def run(args):
                 for fut in futures:
                     errors += fut.result()[1]
     summarize(run_dir)
+    print(f"Summary tables: {run_dir / 'summary.csv'}, sanity.csv, wilcoxon.csv", flush=True)
     if errors:
         raise RuntimeError("Some sequences failed (rerun with --run-dir to resume):\n" + "\n".join(errors))
     return run_dir
@@ -868,6 +911,7 @@ def parser():
     p.add_argument("--amp", action="store_true", help="fp16 autocast for the networks (faster, slightly different)")
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
     p.add_argument("--skip-lpips", action="store_true")
+    p.add_argument("--progress-every", type=float, default=30, help="Seconds between progress lines")
     p.add_argument("--summarize-only", metavar="RUN_DIR", help="Rebuild the summary tables of a run")
     return p
 
