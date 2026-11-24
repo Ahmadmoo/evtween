@@ -24,7 +24,7 @@ EVTWEEN = {f"evtween_{v}_{mode}": (v, mode)
            for v in ("v5.2", "v5.3") for mode in ("teacher", "student")}
 EVTWEEN["evtween_v7_teacher"] = ("v7", "teacher")
 EVTWEEN["evtween_v7_student"] = ("v7", "student")
-EVTWEEN["evtween_v8_student"] = ("v8", "student")
+EVTWEEN["evtween_v8_student"] = ("V8", "student")
 METHODS = (*BASELINES, "fracevent", *EVTWEEN)
 
 
@@ -37,7 +37,7 @@ def evtween_checkout(version):
         "v5.2": ("EVTWEEN_V52_ROOT", LAB / "evtween_bnchmark-v5.2"),
         "v5.3": ("EVTWEEN_V53_ROOT", PROJECT),
         "v7": ("EVTWEEN_V7_ROOT", LAB / "evtween_bnchmark-v7"),
-        "v8": ("EVTWEEN_V8_ROOT", LAB / "evtween_bnchmark-v8"),
+        "V8": ("EVTWEEN_V8_ROOT", LAB / "evtween_bnchmark-v8"),
     }
     return setting(*paths[version])
 
