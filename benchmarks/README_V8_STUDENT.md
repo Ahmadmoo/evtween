@@ -95,3 +95,33 @@ The v8 generation source matches all five exact source boundaries required by
 the existing worker adapter. Both fast metric parsers use the shared registry.
 Real checkpoint loading and GPU generation must be validated on Rails; the
 checkpoint and Rails datasets are not available in the development workspace.
+
+## Student v8.2
+
+The same runners also accept `evtween_v8.2_student`. Its expected checkpoint is
+`$EVTWEEN_WEIGHTS/V8.2/student.pt` (uppercase V, following the V8 convention).
+Use the actual v8.2 student checkpoint, not the V8 checkpoint.
+
+Keep the benchmark branch checked out. Set up a separate model checkout once:
+
+```bash
+git fetch origin v8.2
+export EVTWEEN_V82_ROOT="$(dirname "$PWD")/evtween_bnchmark-v8.2-fafd1a7"
+if [ ! -e "$EVTWEEN_V82_ROOT" ]; then
+  git worktree add --detach "$EVTWEEN_V82_ROOT" fafd1a756b53485da3403149cedb7a22f165bcdb
+fi
+test "$(git -C "$EVTWEEN_V82_ROOT" rev-parse HEAD)" = fafd1a756b53485da3403149cedb7a22f165bcdb
+export EVTWEEN_WEIGHTS="${EVTWEEN_WEIGHTS:-$(dirname "$PWD")/evtween-tides-compare/benchmarks/event_generation/checkpoints/evtween_versions}"
+test -f "$EVTWEEN_WEIGHTS/V8.2/student.pt"
+```
+
+Then replace `evtween_v8_student` with `evtween_v8.2_student` in the generation,
+general metric and voxel metric commands above. Existing V8 outputs are separate.
+Generated files are under
+`data_test_evt/<dataset>/test/evtween_v8.2_student/<sequence>/events.npz`.
+The voxel runner accepts `--report-root reports_voxel_v82` for a separate report root.
+
+Source compatibility was checked against v8.2 commit
+`fafd1a756b53485da3403149cedb7a22f165bcdb`: all five exact worker adapter boundaries
+match its generate.py, and all three fast runners consult the shared registry.
+Real checkpoint loading and GPU inference remain to be tested on Rails.
