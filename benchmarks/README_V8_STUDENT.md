@@ -27,15 +27,15 @@ test "$(git -C "$EVTWEEN_V8_ROOT" rev-parse HEAD)" = 348c41f2d99b69266dbe0d3ffba
 ```
 
 Weights follow the existing convention:
-`$EVTWEEN_WEIGHTS/v8/student.pt`.
+`$EVTWEEN_WEIGHTS/V8/student.pt`.
 The root defaults to
 `../evtween-tides-compare/benchmarks/event_generation/checkpoints/evtween_versions`
 relative to the benchmark repository. If your weights are elsewhere, explicitly set
-`EVTWEEN_WEIGHTS` to the directory **containing v8**, not to the weight file.
+`EVTWEEN_WEIGHTS` to the directory **containing V8**, not to the weight file.
 
 ```bash
 export EVTWEEN_WEIGHTS="${EVTWEEN_WEIGHTS:-$(dirname "$PWD")/evtween-tides-compare/benchmarks/event_generation/checkpoints/evtween_versions}"
-test -f "$EVTWEEN_WEIGHTS/v8/student.pt"
+test -f "$EVTWEEN_WEIGHTS/V8/student.pt"
 ```
 
 Use the real student checkpoint containing `cfg` and `model`, with stage
