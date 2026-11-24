@@ -72,15 +72,16 @@ def _figure(out, title, networks, methods, png, scores, gt, show_gt, tile_width)
     rows = []
     for net in networks:
         tiles = []
-        if show_gt and gt is not None:
-            tiles.append((gt[1], Image.open(gt[0]).convert("L")))
         for m in methods:
             path = png(net, m)
             if path.is_file():
                 row = scores.get((net, m))
                 tiles.append((_caption(m, row, show_gt), Image.open(path)))
-        if tiles:
-            rows.append((net, tiles))
+        if not tiles:  # nothing reconstructed was saved for this network: no row (never a GT-only row)
+            continue
+        if show_gt and gt is not None:
+            tiles.insert(0, (gt[1], Image.open(gt[0]).convert("L")))
+        rows.append((net, tiles))
     if not rows:
         return None
     return r.contact_sheet(Path(out), title, rows, tile_width)
