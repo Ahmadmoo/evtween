@@ -6,7 +6,7 @@ Frames show the endpoints of a motion; events show the path between them.
 A teacher learns a small **path code** `z` from real events. A video world model (V-JEPA 2.1 or LeVJEPA) learns to predict that code from frames alone.
 A physics decoder turns the code into a log-intensity trajectory `L(u, τ)` (the frames warped along learned flows and blended), and a crossing solver emits events with continuous timestamps.
 The pixels see the **least-event path** inside a tube around `L` as wide as the measured frame noise, so noise in the frames makes no crossings.
-**Residual events** come on top at a learned rate per pixel and polarity: a part tied to the slope of the raw path and a background part. The thresholds and the tube width are **measured** from the data, not learned.
+**Residual events** come on top at a learned rate per pixel and polarity: a part tied to the slope of the raw path, which fires like a pixel does (each time its running count passes a whole number), and a random background part. The thresholds and the tube width are **measured** from the data, not learned.
 At test time only RGB is needed.
 
 ```
@@ -14,7 +14,7 @@ TRAIN
  I0, I1 + real events in the gap ──> event encoder (teacher) ──> z        (per 8×8 patch)
  context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
  z or ẑ + I0, I1 ──> physics decoder ──> L(u,τ) ──> taut path in the noise tube ──> crossings  ─┐
-                                    └──> κ, ν maps ──> residual rate (raw slope of L + background) ┴─> exact-time likelihood + x-t / y-t loss
+                                    └──> κ, ν maps ──> residual rate (raw slope of L + background) ┴─> likelihood, x-t / y-t, earth mover's, PMSE
 
 TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
@@ -22,23 +22,36 @@ TEST
 
 ### This version (`v8.3`)
 
-Built from `v8.2`. One student loss and more validation values; the model and the teacher are v8.2's.
+Built from `v8.2`, for scattered, broken edges. On real data most generated events were drawn per pixel at random (slope + background: 61–80 % of the teacher's events, 71–86 % of the student's), and independent random events can't form lines (v6-wiggle's finding). The likelihood also rewards spreading events where the model is unsure. The model is v8.2's: the sampler draws slope events differently, and two losses are added.
 
 | Change | v8.2 | v8.3 | Why |
 |---|---|---|---|
-| `loss.distill` | – | Student (and joint) stage: the student's expected residual events per pixel and polarity over the gap (slope part + background, from its own decoded path) vs the teacher's, generalized KL of counts, nats per pixel like `nll` | On real data (first 40 pairs, `on_sources.py`) the v8.2 student makes about twice the teacher's share of background events and fewer crossings: background 41 vs 26 % (BS-ERGB), 26 vs 9 % (HQ-EVFI), 35 vs 16 % (EDS). Where the student is unsure of the timing, the NLL rewards a flat rate; flat background looks like scattered edges |
-| Validation | `res_share` (teacher) | also `bg_share`, and the student's `res_share_student`, `bg_share_student` | The student's shares should move toward the teacher's |
+| Slope events (sampler) | Poisson per pixel, polarity by coin flip | Each pixel adds up its expected slope events per polarity and fires each time the sum passes a whole number (uniform start phase, kept between gaps). The background stays Poisson | As a real pixel: every pixel an edge passes fires, no holes. Same expected count |
+| `loss.emd` | – | Earth mover's distance between the expected and the real events, per polarity, along t (per pixel, ms), x (per row and bin, px) and y (per column and bin, px): shapes only, per real event. Teacher and student | The likelihood pays to cover every place an event might be (a cloud); this pays for how far events are off, so a sharp line beats a cloud. Chamfer is a distance too |
+| `loss.pmse` | – | PMSE of a sampled stream as its expected value, `(E[N] − G)² + Var[N]`, on 2×2×2 and 4×4×4 blocks (16 time slices × px): crossings and slope events ~0 variance, background Poisson. Relative to the real blocks' mean square. Teacher and student | Trains PMSE directly; random events cost their variance |
 
-- `loss.distill=0` is v8.2. In the student stage `loss.nll` scales only `nll_student`; a lower `loss.nll` (e.g. 0.25) is the other way to stop the hedging, with no code change.
-- Fine-tune from the v8.2 student:
+- The likelihood still scores slope events as Poisson with the same rate; only the sampler fires them on schedule.
+- Validation also prints `emd`, `pmse` and the student's `emd_student`, `pmse_student`.
+- `loss.emd` 0.02: its value is a distance per event (about 25 on toy crops), so the term stays near the size of `nll`.
+- Train teacher and student from scratch (v8.2 checkpoints also load: same model). The extra cost of the two losses was not measured on GPU.
 
 ```bash
-torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/student_v8.2/last.pt model.pred_dim=384 train.out=runs/student_v8.3 train.steps=20000 train.lr=1e-4
+torchrun --nproc_per_node 4 train.py train.stage=teacher train.steps=40000 train.out=runs/teacher_v8.3
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/teacher_v8.3/last.pt model.pred_dim=384 train.out=runs/student_v8.3
 ```
 
-Checks (CPU, toy):
-- `distill` reaches the student and `to_z` (the decoder is frozen in the student stage). Student, joint and teacher stages run.
-- 60 fine-tune steps from the toy v8.2 student: `nll_student` at skip 3 0.907 (distill 0) vs 0.869 (distill 1). The toy student does not hedge (`bg_share_student` 0.21, the teacher's `bg_share` 0.40), so the toy cannot show the effect; the test is `bg_share_student` in validation and `on_sources.py` on real data.
+Checks:
+- Sampler alone, on the real v8.2 student (first 40 pairs, 50 sequences): Chamfer 4.844 → 4.839, PMSE-2 0.0312 → 0.0294, PMSE-4 0.0121 → 0.0118, IEI 0.233 → 0.253; Fano and ON % unchanged.
+- Sampler (CPU): with constant rates every pixel's slope events are within 1 of the expected count (64×64 px, 4 gaps); background count and ON share as expected; a ramp gives crossings only.
+- `emd` on one real event in a 256 px row: sharp in place 6.1, 3 px off 8.8, spread ±5 px 8.6, half the mass 11.2, 10× the mass 6.1, nothing 67. Predicting fewer events never lowers it.
+- Toy (CPU), trained from scratch with the same budgets (teacher 800, student 400 steps), 3 val sequences × 10 frame pairs:
+
+| | Chamfer | ON % (GT 45.6) | IEI | Fano | PMSE-2 | PMSE-4 | count |
+|---|---|---|---|---|---|---|---|
+| v8.2 | 2.29 | 41.7 | 0.313 | 0.650 | 0.0132 | 0.0046 | 0.23 |
+| v8.3 | **1.91** | **46.5** | **0.295** | **0.577** | 0.0133 | 0.0049 | **0.15** |
+
+- Tested and left out: two κ maps (ON only on rises, OFF only on falls). Alone: ON 32 % (GT 46 %), PMSE-2 0.019. With the two losses: Chamfer 1.82, but PMSE-2 0.0148 and PMSE-4 0.0061.
 
 ### `v8.2` (separate branch)
 
@@ -344,7 +357,7 @@ Tube width, no hand-set value:
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
 | Residual events | `model.residual_rate`: per pixel and polarity, `(κ_rise·rise + κ_fall·fall) / C_pol + ν_pol·dt` per unit τ, with rise / fall the slope of the **raw** path `L`. 6 decoder maps: `s["kappa"]` (ON / OFF × rise / fall) and `s["nu"]` (ON / OFF, events per second). They don't reset the pixel |
 | Sensor | After each crossing the pixel sets `ref = L` and draws thresholds `X·C` with `X ~ IG(1, k)`. ON fires when the running max of `(L − ref)/C_on` reaches `X_on` (OFF likewise). Thresholds measured per dataset from frame change vs real event counts (`model.measure_c`); threshold spread per event fixed (`model.sigma_event`); no refractory time. Brightness per dataset: learned RGB weights, then `PNG^gamma`; under a Bayer filter (CED) each pixel uses its own channel |
-| Events | `physics.Simulator` samples the same model: exact crossings of the taut path (grid of at least 128 steps, finer where the path is fast; linear pieces) with the random thresholds, plus residual events as a Poisson process. Between gaps the pixel reference moves with the path's free start, so the jump fires nothing. Each event carries its source `s`: 0 crossing, 1 residual (slope), 2 background |
+| Events | `physics.Simulator` samples the same model: exact crossings of the taut path (grid of at least 128 steps, finer where the path is fast; linear pieces) with the random thresholds; slope events per polarity each time their running count passes a whole number; background as a Poisson process. Between gaps the pixel reference moves with the path's free start, so the jump fires nothing. Each event carries its source `s`: 0 crossing, 1 residual (slope), 2 background |
 
 ### Losses
 
@@ -353,10 +366,12 @@ Tube width, no hand-set value:
 | `nll` | teacher, joint, interp | Likelihood of the real event **times**: crossing hazard of the taut path and residual rate at each event, survival of both thresholds between crossings, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. Which events were crossings is summed over by a forward pass per pixel (`loss.mix`). Every pixel pays for the residual events it expects |
 | `xt` | teacher, joint | Expected vs real ON / OFF events (crossings + residual) on blurred x-t and y-t slices (generalized KL of counts) |
 | `mask` | teacher, joint | v8.2: second teacher pass on part of the batch with 2–3 of 8 event slices hidden; the x-t loss on the hidden slices only |
+| `emd` | teacher, joint | v8.3: earth mover's distance between expected and real events along t, x, y, per polarity (shapes, per real event) |
+| `pmse` | teacher, joint | v8.3: PMSE of a sampled stream as its expected value (block error + background variance), relative |
 | `sigreg` | teacher, joint | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to predict later) |
 | `jepa` | student, joint | Student code vs teacher code (`stopgrad` in the student stage) |
 | `nll_student` | student, joint | `nll` with the student's code |
-| `distill` | student, joint | v8.3: student's expected residual events per pixel (slope + background) vs the teacher's, generalized KL of counts |
+| `emd_student`, `pmse_student` | student, joint | v8.3: `emd`, `pmse` with the student's code (same weights) |
 | `photo` | interp | `L(τ)` must match the real hidden frames |
 
 ---
@@ -489,8 +504,8 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 | `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
-| `bg_share` | v8.3: share of the teacher's expected events that are background | Low where the sensor is clean (BS-ERGB, HQ-EVFI) |
-| `res_share_student`, `bg_share_student` | v8.3: the same shares with the student's code | Close to the teacher's; far above them = the student hedges with flat rates |
+| `emd`, `emd_student` | v8.3: earth mover's distance per real event (ms along t + px along x and y), teacher's / student's code | Falls with training; the student's above the teacher's |
+| `pmse`, `pmse_student` | v8.3: expected PMSE of a sample relative to the real blocks' mean square | Falls with training; well below 1 |
 | `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
 | `mask` | v8.2: masked-slice score, the hidden event slices guessed through the decoder | Falls with training |
 
@@ -580,4 +595,4 @@ Not tested here: real data on GPU, pretrained weight downloads, the LeVJEPA wrap
 Known limits:
 - The sensor model ignores low-light bandwidth; the likelihood reads `L` on a τ grid (`loss.grid`) with linear interpolation.
 - The noise table uses pixels without events; tiny real changes below the threshold are counted as noise, so `σ_L` is slightly too large. In v7 nothing learned narrows the tube (unless `model.tube: scalar`); the residual rate makes the events of changes the tube flattens.
-- The residual events are a Poisson process: they don't have the regular timing of crossings. If `res_share` gets large, timing statistics (ISI) move toward Poisson.
+- The likelihood scores slope events as a Poisson process, the sampler fires them on schedule (v8.3): same expected count, more regular timing than the likelihood assumes. The background is Poisson in both.

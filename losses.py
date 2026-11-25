@@ -31,6 +31,7 @@ def ig_logs(x, k):
 MIX = 16  # how far back (in events) the likelihood looks for a pixel's last crossing (loss.mix)
 XT_BINS = 64  # time bins of the x-t / y-t loss (the tau grid summed in groups)
 MASK_SLICES = 8  # loss.mask: the gap cut into 8 time slices (8 x-t bins, data.bins / 8 teacher bins each)
+PMSE_SLICES = 16  # loss.pmse: the gap cut into 16 time slices (4 x-t bins each)
 
 
 def path_grid(model, s, steps=128):
@@ -63,23 +64,30 @@ def _blur(v, ax, sig):
     return F.conv3d(v.reshape(1, B * C, *v.shape[2:]), k.view(shape), padding=tuple(pad), groups=B * C).view_as(v)
 
 
-def xt_loss(model, s, ev, dt, Lg, Rg, blur=(2.0, 2.0), hide=None):
-    # x-t / y-t loss: the ON / OFF events the model expects (crossings of the taut path: rise / C_on, fall / C_off; residual
-    # events Rg) against the real events, both cut into x-t slices (one per row, blurred in x and t) and y-t slices (one per
-    # column, blurred in y and t), compared slice by slice with the generalized KL of counts (0 when equal). The blur
-    # (px, ms) compares the curves, not single events: which pixel fires when inside a curve is the sensor's randomness
+def counts(model, s, ev, Lg, Rg):
+    # the ON / OFF events the model expects (crossings of the taut path: rise / C_on, fall / C_off; slope and background
+    # events Rg) and the real ones, per x-t bin and pixel: (B, 2, T, H, W) each
     b, pix, tau, pol = ev
     B, _, H, W = s["y0"].shape
     steps = Lg.shape[1] - 1
     T = XT_BINS if steps % XT_BINS == 0 else steps
     C = model.sensor(s["ds"])[0]
+    dL = (Lg[:, 1:] - Lg[:, :-1]).view(B, T, steps // T, H * W)
+    m = torch.stack([F.relu(dL).sum(2) / C[:, :1, None], F.relu(-dL).sum(2) / C[:, 1:, None]], 1)
+    m = (m + Rg.view(B, 2, T, steps // T, H * W).sum(3)).view(B, 2, T, H, W)
+    key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
+    g = torch.zeros(B * 2 * T * H * W, device=m.device, dtype=m.dtype).index_add_(0, key, torch.ones_like(tau, dtype=m.dtype))
+    return m, g.view_as(m)
 
+
+def xt_loss(model, s, ev, dt, Lg, Rg, blur=(2.0, 2.0), hide=None):
+    # x-t / y-t loss: the ON / OFF events the model expects against the real events (counts), both cut into x-t slices
+    # (one per row, blurred in x and t) and y-t slices (one per column, blurred in y and t), compared slice by slice with
+    # the generalized KL of counts (0 when equal). The blur (px, ms) compares the curves, not single events: which pixel
+    # fires when inside a curve is the sensor's randomness
     def run(Lg, Rg):
-        dL = (Lg[:, 1:] - Lg[:, :-1]).view(B, T, steps // T, H * W)
-        m = torch.stack([F.relu(dL).sum(2) / C[:, :1, None], F.relu(-dL).sum(2) / C[:, 1:, None]], 1)
-        m = (m + Rg.view(B, 2, T, steps // T, H * W).sum(3)).view(B, 2, T, H, W)
-        key = ((b * 2 + (pol < 0).long()) * T + (tau * T).long().clamp(0, T - 1)) * H * W + pix
-        g = torch.zeros(B * 2 * T * H * W, device=m.device, dtype=m.dtype).index_add_(0, key, torch.ones_like(tau, dtype=m.dtype)).view_as(m)
+        m, g = counts(model, s, ev, Lg, Rg)
+        B, _, T, H, W = m.shape
         if hide is not None:  # masked-slice pass: the visible slices are the real counts, so only the hidden ones count
             m = torch.where(hide.repeat_interleave(T // hide.shape[1], 1).view(B, 1, T, 1, 1), m, g)
         st = blur[1] * 1e-3 / dt * T  # time blur in bins, per sample
@@ -90,6 +98,50 @@ def xt_loss(model, s, ev, dt, Lg, Rg, blur=(2.0, 2.0), hide=None):
             mb, gb = _blur(mt, ax, px), _blur(gt, ax, px)
             out = out + (mb - gb + torch.xlogy(gb, gb) - gb * mb.clamp(min=1e-12).log()).sum() / 2
         return out / (B * H * W)
+
+    return checkpoint(run, Lg, Rg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg, Rg)
+
+
+def _w1(m, g, ax):
+    # 1-d earth mover's distance along axis ax between the shapes of m and g (each scaled to mass 1), times the real mass.
+    # m first gets a flat floor of 10% of the larger mass: its shape is defined where it predicts nothing, and predicting
+    # fewer events than the real ones never lowers the loss
+    M, G = m.sum(ax, keepdim=True), g.sum(ax, keepdim=True)
+    m = m + 0.1 * torch.maximum(M, G) / m.shape[ax]
+    d = (m / m.sum(ax, keepdim=True).clamp(min=1e-12) - g / G.clamp(min=1e-12)).cumsum(ax).abs().sum(ax, keepdim=True)
+    return G * d
+
+
+def emd_loss(model, s, ev, dt, Lg, Rg):
+    # earth mover's distance between the events the model expects and the real ones, per polarity, along t (per pixel, in
+    # ms), x (per row and x-t bin, in px) and y (per column and bin, in px); per real event. Where, not how many: both are
+    # scaled to mass 1 (the counts are the likelihood's and the x-t loss's job), weighted by the real events. The
+    # likelihood pays to cover every place an event might be (a cloud); this pays for how far the events are off, so when
+    # unsure, one sharp line in the middle costs less than a cloud
+    def run(Lg, Rg):
+        m, g = counts(model, s, ev, Lg, Rg)
+        ms = (dt * 1e3 / m.shape[2]).view(-1, 1, 1, 1, 1)  # ms per x-t bin
+        return ((_w1(m, g, 2) * ms).sum() + _w1(m, g, 3).sum() + _w1(m, g, 4).sum()) / g.sum().clamp(min=1)
+
+    return checkpoint(run, Lg, Rg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg, Rg)
+
+
+def pmse_loss(model, s, ev, dt, Lg, Rg):
+    # PMSE of a sampled event stream, as its expected value E[(N - G)^2] = (E[N] - G)^2 + Var[N], N and G the mean counts
+    # of the 2 x 2 x 2 and 4 x 4 x 4 blocks (time slices x px) of each polarity. Crossings and slope events fire on
+    # schedule (a count off by one at most: variance ~0); background events are Poisson (variance = mean count), so random
+    # events cost more than scheduled ones. Relative to the mean square of the real blocks, mean of the two block sizes
+    def run(Lg, Rg):
+        m, g = counts(model, s, ev, Lg, Rg)
+        B, _, T, H, W = m.shape
+        n = math.gcd(PMSE_SLICES, T)
+        m, g = (x.view(B, 2, n, T // n, H, W).sum(3) for x in (m, g))
+        v = (s["nu"] * dt.view(-1, 1, 1, 1) / n)[:, :, None].expand_as(m)  # background events per cell
+        out = 0
+        for k in (2, 4):
+            M, G, V = (F.avg_pool3d(x, k) for x in (m, g, v))
+            out = out + ((M - G) ** 2 + V / k ** 3).sum() / (G ** 2).sum().clamp(min=1e-6) / 2
+        return out
 
     return checkpoint(run, Lg, Rg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg, Rg)
 
@@ -276,6 +328,9 @@ def compute(model, batch, w, stage):
             terms["sigreg"] = sigreg_loss(z)
             if w.get("xt", 0) > 0:
                 terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0)))
+            for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
+                if w.get(k, 0) > 0:
+                    terms[k] = f(model, s, ev, batch["dt"], Lg, Rg)
             if w.get("mask", 0) > 0:
                 terms["mask"] = mask_loss(model, p, batch["voxel"], ev, batch["dt"], w)
     if stage in ("student", "joint"):
@@ -284,23 +339,13 @@ def compute(model, batch, w, stage):
         sh = model.decode(p, zh)
         Lr, Lg = path_grid(model, sh, w["grid"])
         Rg = residual_grid(model, sh, Lr, batch["dt"])
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX),
-                                                                   (Lr, Lg, Rg)))
-        if w.get("distill", 0) > 0:  # v8.3: the student's expected residual events per pixel (slope + background) vs the teacher's
-            with torch.no_grad():
-                st = model.decode(p, zt)
-                a = residual_grid(model, st, path_grid(model, st, w["grid"])[0], batch["dt"]).sum(2)  # (B, ON / OFF, H*W)
-            b = Rg.sum(2)
-            terms["distill"] = (a * (a.clamp(min=1e-8) / b.clamp(min=1e-8)).log() - a + b).sum(1).mean()  # KL of counts, per pixel
-    weight = dict(w, nll_student=w["nll"])
+        terms.update(jepa=F.mse_loss(zh, zt),
+                     nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lr, Lg, Rg)))
+        for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
+            if w.get(k, 0) > 0:
+                terms[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg)
+    weight = dict(w, nll_student=w["nll"], emd_student=w.get("emd", 0), pmse_student=w.get("pmse", 0))
     return sum(weight[k] * v for k, v in terms.items()), terms
-
-
-def shares(model, s, Lg, Rg, dt):
-    # shares of the expected events that are residual events (slope + background) and background events
-    dL, C = Lg[:, 1:] - Lg[:, :-1], model.sensor(s["ds"])[0]
-    total = (F.relu(dL).sum((1, 2)) / C[:, 0] + F.relu(-dL).sum((1, 2)) / C[:, 1]).sum() + Rg.sum()
-    return (Rg.sum() / total).item(), ((s["nu"].flatten(1).sum(1) * dt).sum() / total).item()
 
 
 @torch.no_grad()
@@ -316,7 +361,12 @@ def diagnostics(model, batch, w, student=True):
     Rg = residual_grid(model, s, Lr, batch["dt"])
     if w.get("xt", 0) > 0:
         out["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0))).item()
-    out["res_share"], out["bg_share"] = shares(model, s, Lg, Rg, batch["dt"])
+    dL, C = Lg[:, 1:] - Lg[:, :-1], model.sensor(s["ds"])[0]
+    cross = (F.relu(dL).sum((1, 2)) / C[:, 0] + F.relu(-dL).sum((1, 2)) / C[:, 1]).sum()
+    out["res_share"] = (Rg.sum() / (cross + Rg.sum())).item()  # share of the expected events that are slope or background
+    for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
+        if w.get(k, 0) > 0:
+            out[k] = f(model, s, ev, batch["dt"], Lg, Rg).item()
     if batch["mid"].shape[1]:
         out["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"]).item()
     if w.get("mask", 0) > 0:  # masked-slice guess on every sample, the same hidden slices at every validation
@@ -328,5 +378,8 @@ def diagnostics(model, batch, w, student=True):
         out["gap"] = out["nll_student"] - out["nll"]
         sh = model.decode(p, zh)
         Lr, Lg = path_grid(model, sh, w["grid"])
-        out["res_share_student"], out["bg_share_student"] = shares(model, sh, Lg, residual_grid(model, sh, Lr, batch["dt"]), batch["dt"])
+        Rg = residual_grid(model, sh, Lr, batch["dt"])
+        for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
+            if w.get(k, 0) > 0:
+                out[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg).item()
     return out
