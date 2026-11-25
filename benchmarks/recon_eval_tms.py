@@ -63,6 +63,7 @@ else:
 torch, F = r.torch, r.F
 ROOT, REAL, METRICS = r.ROOT, r.REAL, r.METRICS
 BIN_TIMES = ("ms", "events")
+DEFAULT_BIN_MS = (2.0, 5.0, 10.0, 20.0)
 VALUE_COLUMNS = tuple(f"{kind}_{m}" for kind in ("agreement", "gt") for m in METRICS)
 WINDOW_COLUMNS = ("dataset", "split", "sequence", "config", "bin_ms", "bin_time", "network", "method", "window",
                   "t_start_s", "t_end_s", "gt_frame", "gt_offset_ms", *VALUE_COLUMNS)
@@ -80,7 +81,15 @@ def config_name(bin_ms, bin_time):
 
 
 def configurations(args):
+    if getattr(args, "_configs", None):
+        return list(args._configs)
     return [(float(d), bt) for d in args.bin_ms for bt in args.bin_time]
+
+
+def parse_config_name(name):
+    """'bin2.5ms_events' -> (2.5, 'events')."""
+    d, bt = name[3:].rsplit("_", 1)
+    return float(d.removesuffix("ms")), bt
 
 
 def window_edges(duration_s, window_s):
@@ -193,7 +202,7 @@ def process_config(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_p
     if n_win <= 0:
         print(f"{tag} {data.name} {cfg}: sequence shorter than one {window_s * 1000:g} ms window; skipped", flush=True)
         if score:
-            r._write_csv(out_dir / "per_window" / f"{data.name}.csv", WINDOW_COLUMNS, [])
+            r.write_rows(out_dir / "per_window" / f"{data.name}.csv", WINDOW_COLUMNS, [], args, "window")
         return 0
     views = {n: dict(t=data.events[n]["t"], x=data.events[n]["x"], y=data.events[n]["y"], p=data.events[n]["p"],
                      cuts=np.searchsorted(data.events[n]["t"], edges)) for n in names}
@@ -301,7 +310,7 @@ def process_config(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_p
                 means.append(f"{m} {np.mean(vals):.3f}")
         if means:
             print(f"{tag} {data.name} {cfg}: {net.name} mean {key}: " + " | ".join(means), flush=True)
-    r._write_csv(out_dir / "per_window" / f"{data.name}.csv", WINDOW_COLUMNS, rows)
+    r.write_rows(out_dir / "per_window" / f"{data.name}.csv", WINDOW_COLUMNS, rows, args, "window")
     sanity = []
     for n in names:
         counts = np.diff(views[n]["cuts"])
@@ -310,7 +319,7 @@ def process_config(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_p
                            empty_windows=int((counts == 0).sum()), mean_events_per_window=float(counts.mean())))
     sanity += [dict(dataset=args.dataset, split=args.split, sequence=data.name, config=cfg, method=n, status="missing")
                for n in data.missing]
-    r._write_csv(out_dir / "sanity" / f"{data.name}.csv", SANITY_COLUMNS, sanity)
+    r.write_rows(out_dir / "sanity" / f"{data.name}.csv", SANITY_COLUMNS, sanity, args)
     n_gt = int(sum(1 for j in range(first, n_win) if matched[j] >= 0))
     print(f"{tag} {data.name} {cfg}: {n_win - first} scored windows of {window_s * 1000:g} ms, "
           f"{n_gt} within {args.gt_tol_ms:g} ms of a GT frame", flush=True)
@@ -432,6 +441,35 @@ def render_selection(data, bin_ms, bin_time, networks, scorer, args, run_dir, io
     return selection
 
 
+def add_to_selection(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_pool, tag=""):
+    """--add-methods with --save hybrid: save the added methods' windows at the run's existing selection
+    (not re-selected) and rebuild the contact sheets with them."""
+    import pandas as pd
+    cfg = config_name(bin_ms, bin_time)
+    path = run_dir / cfg / "selection" / f"{data.name}.csv"
+    if not path.is_file():
+        print(f"{tag} {data.name} {cfg}: no selection in this run; no windows saved for the added methods", flush=True)
+        return
+    sel = pd.read_csv(path)
+    if sel.empty:
+        return
+    selection = {int(w): c for w, c in zip(sel["window"], sel["category"])}
+    process_config(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_pool, tag, score=False,
+                   samples=set(selection), categories=selection)
+    windows = pd.read_csv(run_dir / cfg / "per_window" / f"{data.name}.csv")
+    mean_agreement = pd.Series(sel["mean_agreement"].to_numpy(), index=sel["window"].astype(int))
+    activity = {int(w): (int(a) if pd.notna(a) else 0) for w, a in zip(sel["window"], sel["real_events"])}
+    metric = sel["agreement_metric"].iloc[0] if "agreement_metric" in sel else "agreement_lpips"
+    contact_sheets_tms(run_dir, args, cfg, data.name, selection, windows, data.frames, data.edges,
+                       [n.name for n in networks], [REAL, *args._all_methods], mean_agreement, activity, metric)
+    print(f"{tag} {data.name} {cfg}: saved {len(selection)} selected windows for {', '.join(args._added)}; "
+          "contact sheets rebuilt", flush=True)
+
+
+def added_marker(run_dir, cfg, added, name):
+    return Path(run_dir) / cfg / "added" / "+".join(added) / f"{name}.done"
+
+
 # ---------------------------------------------------------------- workers
 
 def _done(run_dir, cfg, name, args):
@@ -471,6 +509,16 @@ def worker(device, names, args, run_dir, worker_id):
                           flush=True)
                 for bin_ms, bin_time in configurations(args):
                     cfg = config_name(bin_ms, bin_time)
+                    if getattr(args, "_added", None):
+                        marker = added_marker(run_dir, cfg, args._added, name)
+                        if marker.is_file():
+                            continue
+                        process_config(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_pool, tag)
+                        if args.save == "hybrid":
+                            add_to_selection(data, bin_ms, bin_time, networks, scorer, args, run_dir, io_pool, tag)
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(datetime.now().isoformat(timespec="seconds"))
+                        continue
                     if _done(run_dir, cfg, name, args):
                         continue
                     if not (run_dir / cfg / "per_window" / f"{name}.csv").is_file():
@@ -490,11 +538,85 @@ def _worker_entry(device, names, args, run_dir, worker_id):
     return worker(device, names, args, run_dir, worker_id)
 
 
+ADD_SETTINGS = {
+    "networks": lambda a, v: setattr(a, "networks", list(v)),
+    "bins": lambda a, v: setattr(a, "bins", v),
+    "warmup_s": lambda a, v: setattr(a, "warmup_s", v),
+    "gt_tol_ms": lambda a, v: setattr(a, "gt_tol_ms", v),
+    "norm": lambda a, v: setattr(a, "norm", v),
+    "amp": lambda a, v: setattr(a, "amp", v),
+    "tf32": lambda a, v: setattr(a, "tf32", v),
+    "lpips": lambda a, v: setattr(a, "skip_lpips", not v),
+    "save": lambda a, v: setattr(a, "save", v),
+    "samples": lambda a, v: setattr(a, "samples", v),
+    "recon_root": lambda a, v: setattr(a, "recon_root", v),
+    "events_root": lambda a, v: setattr(a, "events_root", v),
+    "selection": lambda a, v: [setattr(a, k, v[c]) for k, c in (
+        ("select_best", "best_agreement"), ("select_worst", "worst_agreement"), ("select_activity", "high_activity"),
+        ("select_temporal", "temporal"), ("select_total", "total")) if c in v],
+}
+
+
+def run_add(args):
+    """--add-methods: evaluate new methods into an existing run, for that run's settings (bin lengths included)."""
+    config = r.addition_setup(args, ADD_SETTINGS)
+    run_dir = Path(args.run_dir)
+    in_run = [parse_config_name(c) for c in config["configs"]]
+    if args.bin_ms is not None or args.bin_time is not None:  # narrow to some of the run's settings
+        absent = [f"{float(d):g} ms" for d in (args.bin_ms or []) if float(d) not in {c[0] for c in in_run}]
+        absent += [bt for bt in (args.bin_time or []) if bt not in {c[1] for c in in_run}]
+        if absent:
+            raise ValueError(f"Not in this run: {absent}; its settings are {config['configs']} "
+                             "(leave out --bin-ms/--bin-time to use all of them)")
+        in_run = [c for c in in_run if (args.bin_ms is None or c[0] in {float(d) for d in args.bin_ms})
+                  and (args.bin_time is None or c[1] in args.bin_time)]
+        if not in_run:
+            raise ValueError(f"No setting of this run matches --bin-ms/--bin-time; its settings are {config['configs']}")
+    args._configs = in_run
+    new, names = r.discover(args)
+    skipped = [n for n in names if n not in config.get("sequences", names)]
+    names = [n for n in names if n in config.get("sequences", names)]
+    args._methods, args._added = new, tuple(new)
+    args._all_methods = sorted(set(config["methods"]) | set(new), key=lambda m: r.ORDER.get(m, len(r.ORDER)))
+    commit, ckpts = r.setup(args)
+    r.finish_addition(args, run_dir, config, new, names, ckpts)
+    cfgs = [config_name(*c) for c in in_run]
+    todo = [n for n in names if not all(added_marker(run_dir, c, args._added, n).is_file() for c in cfgs)]
+    print(f"Adding {', '.join(new)} to {run_dir} with its settings ({', '.join(cfgs)}; warm-up {args.warmup_s} s, "
+          f"GT tolerance {args.gt_tol_ms} ms, save {args.save}): {len(names)} sequences "
+          f"({len(names) - len(todo)} already done)" + (f"; not in the run, skipped: {skipped}" if skipped else ""),
+          flush=True)
+    errors = []
+    if todo:
+        devices = list(args.devices)
+        if len(devices) == 1:
+            _, errors = worker(devices[0], todo, args, run_dir, 0)
+        else:
+            shares = r.balance(todo, args, new, len(devices))
+            with ProcessPoolExecutor(len(devices), mp_context=mp.get_context("spawn")) as pool:
+                futures = [pool.submit(_worker_entry, d, s, args, run_dir, i)
+                           for i, (d, s) in enumerate(zip(devices, shares)) if s]
+                for fut in futures:
+                    errors += fut.result()[1]
+    summarize(run_dir)
+    print(f"Summary: {run_dir / 'summary_all.csv'} (now with {', '.join(new)}); "
+          f"across bin lengths: {run_dir / 'comparison.csv'}", flush=True)
+    if errors:
+        raise RuntimeError("Some sequences failed (rerun the same command to resume):\n" + "\n".join(errors))
+    return run_dir
+
+
 def run(args):
     if torch is None:
         raise ImportError("PyTorch is required for reconstruction")
     if not getattr(args, "io_workers", None):
         args.io_workers = max(2, (os.cpu_count() or 4) // len(args.devices))
+    if getattr(args, "add_methods", None):
+        return run_add(args)
+    if args.bin_ms is None:
+        args.bin_ms = list(DEFAULT_BIN_MS)
+    if args.bin_time is None:
+        args.bin_time = list(BIN_TIMES)
     methods, names = r.discover(args)
     args._methods = methods
     run_dir = Path(args.run_dir) if args.run_dir else \
@@ -633,10 +755,11 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("dataset", help="Folder name under data_test_evt/ (e.g. eds, hqevfi, bsergb)")
     p.add_argument("--split", default="test")
-    p.add_argument("--bin-ms", nargs="+", type=float, default=[2, 5, 10, 20],
-                   help="Bin lengths in ms; each gives windows of --bins x bin_ms")
-    p.add_argument("--bin-time", nargs="+", choices=BIN_TIMES, default=list(BIN_TIMES),
-                   help="ms: fixed bin edges; events: EVREAL fixed-duration scaling (first/last event)")
+    p.add_argument("--bin-ms", nargs="+", type=float, default=None,
+                   help="Bin lengths in ms; each gives windows of --bins x bin_ms (default 2 5 10 20; with "
+                        "--add-methods: the run's own, or a subset of them)")
+    p.add_argument("--bin-time", nargs="+", choices=BIN_TIMES, default=None,
+                   help="ms: fixed bin edges; events: EVREAL fixed-duration scaling (first/last event); default both")
     p.add_argument("--warmup-s", type=float, default=0.5, help="Windows ending before this time are not scored")
     p.add_argument("--gt-tol-ms", type=float, default=1.0,
                    help="Score against a GT frame only if it is within this many ms of the window end (EVREAL: 1)")
@@ -667,6 +790,9 @@ def parser():
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
     p.add_argument("--skip-lpips", action="store_true")
     p.add_argument("--progress-every", type=float, default=30)
+    p.add_argument("--add-methods", nargs="+", metavar="METHOD",
+                   help="Add these methods to the run in --run-dir, using that run's settings and bin lengths; other "
+                        "methods' results are kept, real events are reconstructed again as the reference")
     p.add_argument("--summarize-only", metavar="RUN_DIR")
     return p
 

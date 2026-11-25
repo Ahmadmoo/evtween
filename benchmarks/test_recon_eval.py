@@ -303,6 +303,24 @@ class FireNet_legacy(_Toy):
 '''
 
 
+def fake_networks(toy, monkeypatch):
+    """Fake EVREAL checkout + toy checkpoints; returns (evreal root, e2vid ckpt, firenet ckpt)."""
+    root = toy.tmp / "evreal"
+    if not (root / "model" / "__init__.py").is_file():
+        (root / "model").mkdir(parents=True)
+        (root / "model" / "__init__.py").write_text(FAKE_EVREAL)
+        with r.evreal_imports(root):
+            import model as fake
+            torch.manual_seed(0)
+            e2 = fake.E2VIDRecurrent(dict(num_bins=5, num_encoders=3, final_activation="sigmoid"))
+            fn = fake.FireNet_legacy(dict(num_bins=5, num_encoders=2, final_activation=""))
+        torch.save(dict(model=dict(num_bins=5, num_encoders=3), state_dict=e2.state_dict()), toy.tmp / "e2vid.pth")
+        torch.save(dict(config=dict(model=dict(num_bins=5, num_encoders=2)), state_dict=fn.state_dict()),
+                   toy.tmp / "firenet.pth")
+    monkeypatch.setattr(r, "PACKAGES", {})
+    return root, toy.tmp / "e2vid.pth", toy.tmp / "firenet.pth"
+
+
 @needs_torch
 def test_end_to_end_cpu(toy, monkeypatch):
     root = toy.tmp / "evreal"
@@ -357,3 +375,88 @@ def test_end_to_end_cpu(toy, monkeypatch):
     # resuming skips finished sequences and reproduces the same numbers
     again = r.run(args)
     assert pd.read_csv(again / "per_frame.csv").equals(frames)
+
+
+# ---------------------------------------------------------------- --add-methods
+
+def test_merge_csv_keeps_other_methods(tmp_path):
+    path = tmp_path / "x.csv"
+    cols = ("network", "method", "frame", "v")
+    r._write_csv(path, cols, [dict(network="e2vid", method=m, frame=k, v=f"{m}{k}")
+                              for m in (r.REAL, "v2e") for k in (2, 1)])
+    new = [dict(network="e2vid", method=m, frame=k, v=f"new{m}{k}") for m in (r.REAL, "evtween_v8_student") for k in (1, 2)]
+    r.merge_csv(path, cols, new, ["evtween_v8_student"], "frame")
+    import pandas as pd
+    out = pd.read_csv(path)
+    assert list(out.method) == [r.REAL, r.REAL, "v2e", "v2e", "evtween_v8_student", "evtween_v8_student"]
+    assert list(out.frame) == [1, 2, 1, 2, 1, 2]
+    assert set(out[out.method == r.REAL].v) == {"real1", "real2"}      # the run's own real rows are kept
+    r.merge_csv(path, cols, [dict(network="e2vid", method="evtween_v8_student", frame=1, v="again")],
+                ["evtween_v8_student"], "frame")                          # re-adding replaces, never duplicates
+    out = pd.read_csv(path)
+    assert list(out[out.method == "evtween_v8_student"].v) == ["again"]
+
+
+def test_addition_setup_copies_the_runs_settings(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = dict(dataset="eds", split="test", methods=["v2e", "iebcs"], sequences=["a"], networks=["firenet"],
+               warmup=7, norm="minmax", amp=False, tf32=False, lpips=False, save="samples", samples=3,
+               recon_root=str(tmp_path / "rr"), events_root=str(tmp_path / "ev"),
+               selection=dict(high_psnr=4, low_psnr=3, high_motion=2, temporal=1, total=12))
+    (run / "config.json").write_text(json.dumps(cfg))
+    args = r.parser().parse_args(["eds", "--run-dir", str(run), "--add-methods", "evtween_v8_student"])
+    out = r.addition_setup(args, r.ADD_SETTINGS)
+    assert out["methods"] == ["v2e", "iebcs"] and args.methods == ["evtween_v8_student"]
+    assert (args.networks, args.warmup, args.norm, args.tf32, args.skip_lpips) == (["firenet"], 7, "minmax", False, True)
+    assert (args.save, args.samples, args.recon_root, args.events_root) == ("samples", 3, cfg["recon_root"], cfg["events_root"])
+    assert (args.select_high_psnr, args.select_motion, args.select_total) == (4, 2, 12)
+    bad = [["eds", "--add-methods", "x"],                                                   # no --run-dir
+           ["eds", "--run-dir", str(run), "--add-methods", "v2e"],                         # already in the run
+           ["hqevfi", "--run-dir", str(run), "--add-methods", "evtween_v8_student"],       # other dataset
+           ["eds", "--run-dir", str(run), "--add-methods", "evtween_v8_student", "--methods", "v2e"],
+           ["eds", "--run-dir", str(tmp_path / "nope"), "--add-methods", "evtween_v8_student"]]
+    for argv in bad:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            r.addition_setup(r.parser().parse_args(argv), r.ADD_SETTINGS)
+
+
+@needs_torch
+def test_add_methods_matches_a_full_run(toy, monkeypatch):
+    import pandas as pd
+    root, e2, fn = fake_networks(toy, monkeypatch)
+    a = toy.args
+    common = [DATASET, "--events-root", a.events_root, "--data-root", a.data_root, "--devices", "cpu", "--skip-lpips",
+              "--io-workers", "2", "--chunk", "5", "--warmup", "3", "--evreal-root", str(root), "--no-auto-setup",
+              "--e2vid-ckpt", str(e2), "--firenet-ckpt", str(fn), "--save", "hybrid", "--select-high-psnr", "1",
+              "--select-low-psnr", "1", "--select-motion", "1", "--select-temporal", "1", "--select-total", "4"]
+    full = r.run(r.parser().parse_args(common + ["--methods", "v2e", "evtween_v5.2_teacher",
+                                                 "--run-dir", str(toy.tmp / "full"), "--recon-root", str(toy.tmp / "rf")]))
+    part = r.run(r.parser().parse_args(common + ["--methods", "v2e",
+                                                 "--run-dir", str(toy.tmp / "part"), "--recon-root", str(toy.tmp / "rp")]))
+    before = pd.read_csv(part / "per_frame.csv")
+    sel_before = pd.read_csv(part / "selection.csv")
+    add = r.parser().parse_args([DATASET, "--events-root", a.events_root, "--data-root", a.data_root, "--devices", "cpu",
+                                 "--io-workers", "2", "--evreal-root", str(root), "--no-auto-setup",
+                                 "--e2vid-ckpt", str(e2), "--firenet-ckpt", str(fn),
+                                 "--run-dir", str(part), "--add-methods", "evtween_v5.2_teacher"])
+    r.run(add)                                                   # settings (warm-up 3, no LPIPS, hybrid) come from the run
+    after = pd.read_csv(part / "per_frame.csv")
+    cfg = json.loads((part / "config.json").read_text())
+    assert cfg["methods"] == ["v2e", "evtween_v5.2_teacher"] and cfg["added"][0]["methods"] == ["evtween_v5.2_teacher"]
+    keep = ["sequence", "network", "method", "frame"]
+    old = after[after.method != "evtween_v5.2_teacher"].sort_values(keep).reset_index(drop=True)
+    assert old.equals(before.sort_values(keep).reset_index(drop=True))          # existing rows untouched
+    ref = pd.read_csv(full / "per_frame.csv")
+    got = after.sort_values(keep).reset_index(drop=True)
+    ref = ref.sort_values(keep).reset_index(drop=True)
+    assert list(got[keep].itertuples(index=False)) == list(ref[keep].itertuples(index=False))
+    added = got.method == "evtween_v5.2_teacher"
+    for c in ("agreement_mse", "agreement_ssim", "gt_mse", "gt_ssim"):
+        assert np.allclose(got.loc[added, c], ref.loc[added, c], atol=1e-5)   # same numbers as a full run
+    assert pd.read_csv(part / "selection.csv").equals(sel_before)             # selection kept, not redone
+    for _, row in sel_before.iterrows():
+        assert (toy.tmp / "rp" / "e2vid" / "evtween_v5.2_teacher" / row.sequence / f"{row.frame:06d}.png").is_file()
+    assert set(pd.read_csv(part / "summary.csv").method) == {r.REAL, "v2e", "evtween_v5.2_teacher"}
+    r.run(add)                                                   # again: all sequences done, nothing changes
+    assert pd.read_csv(part / "per_frame.csv").equals(after)

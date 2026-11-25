@@ -535,6 +535,75 @@ def _write_csv(path, columns, rows):
     os.replace(tmp, path)
 
 
+ORDER = {m: i for i, m in enumerate((REAL, *METHODS))}
+
+
+def merge_csv(path, columns, rows, methods, index_key=None):
+    """Replace the rows of `methods` in an existing CSV by `rows` (rows of other methods are kept)."""
+    methods = set(methods)
+    old = []
+    if path.is_file():
+        with path.open(newline="") as f:
+            old = [row for row in csv.DictReader(f) if row.get("method") not in methods]
+    merged = old + [row for row in rows if row["method"] in methods]
+
+    def key(row):
+        idx = row.get(index_key, "") if index_key else ""
+        return (row.get("network", ""), ORDER.get(row["method"], len(ORDER)), float(idx) if idx not in ("", None) else 0.0)
+    merged.sort(key=key)
+    _write_csv(path, columns, merged)
+
+
+def write_rows(path, columns, rows, args, index_key=None):
+    """Normal runs write the CSV; --add-methods merges only the added methods' rows into it."""
+    added = getattr(args, "_added", None)
+    if added:
+        merge_csv(path, columns, rows, added, index_key)
+    else:
+        _write_csv(path, columns, rows)
+
+
+def added_marker(run_dir, added, name):
+    return Path(run_dir) / "added" / "+".join(added) / f"{name}.done"
+
+
+def addition_setup(args, mapping):
+    """--add-methods: read the run's config.json and copy its settings onto args, so the added methods are
+    evaluated exactly like the others. mapping: {config key: function(args, value)}. Returns the config."""
+    if not args.run_dir:
+        raise ValueError("--add-methods needs --run-dir pointing at the run to extend")
+    if args.methods:
+        raise ValueError("Use --add-methods for the new methods (not --methods)")
+    path = Path(args.run_dir) / "config.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} not found: --run-dir must be an existing run")
+    config = json.loads(path.read_text())
+    if config.get("dataset") != args.dataset or config.get("split", args.split) != args.split:
+        raise ValueError(f"{args.run_dir} is a run of {config.get('dataset')}/{config.get('split')}, "
+                         f"not {args.dataset}/{args.split}")
+    already = [m for m in args.add_methods if m in config["methods"]]
+    if already:
+        raise ValueError(f"Already in this run: {already}. Start a new run to re-evaluate them.")
+    for key, apply in mapping.items():
+        if config.get(key) is not None:
+            apply(args, config[key])
+    args.methods = list(args.add_methods)
+    return config
+
+
+def finish_addition(args, run_dir, config, new, names, ckpts):
+    """Check the networks are the same, then record the added methods in config.json."""
+    old = {n: c["sha256"] for n, c in config.get("checkpoints", {}).items()}
+    now = {n: sha for n, (_, sha, _) in ckpts.items()}
+    if old and old != now:
+        raise ValueError(f"The network weights differ from the run's ({old} vs {now}); cannot add methods to it")
+    config["methods"] = sorted(set(config["methods"]) | set(new), key=lambda m: ORDER.get(m, len(ORDER)))
+    config.setdefault("added", []).append(dict(methods=list(new), sequences=list(names),
+                                               time=datetime.now().isoformat(timespec="seconds"),
+                                               code_sha256=file_sha256(Path(__file__))))
+    (Path(run_dir) / "config.json").write_text(json.dumps(config, indent=2))
+
+
 def _save_png(path, img):
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.clip(np.rint(img * 255), 0, 255).astype(np.uint8)).save(path, compress_level=1)
@@ -649,12 +718,12 @@ def process_sequence(data, networks, scorer, args, run_dir, io_pool, tag="", sco
                 means.append(f"{method} {np.mean(vals):.3f}")
         if means:
             print(f"{tag} {data.name}: {net.name} mean {key}: " + " | ".join(means), flush=True)
-    _write_csv(run_dir / "per_frame" / f"{data.name}.csv", FRAME_COLUMNS, rows)
+    write_rows(run_dir / "per_frame" / f"{data.name}.csv", FRAME_COLUMNS, rows, args, "frame")
     sanity = [dict(dataset=args.dataset, split=args.split, sequence=data.name, method=n, status="ok",
                    **data.stats[n]) for n in names]
     sanity += [dict(dataset=args.dataset, split=args.split, sequence=data.name, method=n, status="missing")
                for n in data.missing]
-    _write_csv(run_dir / "sanity" / f"{data.name}.csv", SANITY_COLUMNS, sanity)
+    write_rows(run_dir / "sanity" / f"{data.name}.csv", SANITY_COLUMNS, sanity, args)
     return len(rows)
 
 
@@ -820,6 +889,27 @@ def render_selection(data, networks, scorer, args, run_dir, io_pool, tag=""):
     return selection
 
 
+def add_to_selection(data, networks, scorer, args, run_dir, io_pool, tag=""):
+    """--add-methods with --save hybrid: save the added methods' frames at the run's existing selection
+    (not re-selected, so every method shows the same frames) and rebuild the contact sheets with them."""
+    import pandas as pd
+    path = run_dir / "selection" / f"{data.name}.csv"
+    if not path.is_file():
+        print(f"{tag} {data.name}: no selection in this run; no frames saved for the added methods", flush=True)
+        return
+    sel = pd.read_csv(path)
+    selection = {int(k): c for k, c in zip(sel["frame"], sel["category"])}
+    process_sequence(data, networks, scorer, args, run_dir, io_pool, tag, score=False,
+                     samples=set(selection), categories=selection)
+    frames = pd.read_csv(run_dir / "per_frame" / f"{data.name}.csv")
+    psnr = pd.Series(sel["mean_gt_psnr"].to_numpy(), index=sel["frame"].astype(int))
+    motion = dict(zip(sel["frame"].astype(int), sel["motion"]))
+    contact_sheets(run_dir, args, data.name, selection, frames, data.frames, [n.name for n in networks],
+                   [REAL, *args._all_methods], psnr, motion)
+    print(f"{tag} {data.name}: saved {len(selection)} selected frames for {', '.join(args._added)}; "
+          "contact sheets rebuilt", flush=True)
+
+
 # ---------------------------------------------------------------- workers
 
 def worker(device, names, args, run_dir, worker_id):
@@ -855,14 +945,22 @@ def worker(device, names, args, run_dir, worker_id):
                     if v["windows"] and v["empty_windows"] > 0.2 * v["windows"]:
                         print(f"{tag} WARNING {name}/{k}: {v['empty_windows']} of {v['windows']} "
                               "frame windows have no events", flush=True)
-                if (run_dir / "per_frame" / f"{name}.csv").is_file():
+                if getattr(args, "_added", None):
+                    rows = process_sequence(data, networks, scorer, args, run_dir, io_pool, tag,
+                                            samples=set() if args.save == "hybrid" else None)
+                    if args.save == "hybrid":
+                        add_to_selection(data, networks, scorer, args, run_dir, io_pool, tag)
+                    marker = added_marker(run_dir, args._added, name)
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text(datetime.now().isoformat(timespec="seconds"))
+                elif (run_dir / "per_frame" / f"{name}.csv").is_file():
                     rows = None
                     print(f"{tag} {name}: metrics already in per_frame/{name}.csv; selecting and saving frames only",
                           flush=True)
                 else:
                     rows = process_sequence(data, networks, scorer, args, run_dir, io_pool, tag,
                                             samples=set() if args.save == "hybrid" else None)
-                if args.save == "hybrid":
+                if args.save == "hybrid" and not getattr(args, "_added", None):
                     render_selection(data, networks, scorer, args, run_dir, io_pool, tag)
                 del data
                 done += 1
@@ -894,11 +992,70 @@ def balance(names, args, methods, workers):
     return shares
 
 
+ADD_SETTINGS = {
+    "networks": lambda a, v: setattr(a, "networks", list(v)),
+    "bins": lambda a, v: setattr(a, "bins", v),
+    "warmup": lambda a, v: setattr(a, "warmup", v),
+    "norm": lambda a, v: setattr(a, "norm", v),
+    "amp": lambda a, v: setattr(a, "amp", v),
+    "tf32": lambda a, v: setattr(a, "tf32", v),
+    "lpips": lambda a, v: setattr(a, "skip_lpips", not v),
+    "save": lambda a, v: setattr(a, "save", v),
+    "samples": lambda a, v: setattr(a, "samples", v),
+    "recon_root": lambda a, v: setattr(a, "recon_root", v),
+    "events_root": lambda a, v: setattr(a, "events_root", v),
+    "selection": lambda a, v: [setattr(a, k, v[c]) for k, c in (
+        ("select_high_psnr", "high_psnr"), ("select_low_psnr", "low_psnr"), ("select_motion", "high_motion"),
+        ("select_temporal", "temporal"), ("select_total", "total")) if c in v],
+}
+
+
+def _run_workers(args, todo, methods, run_dir):
+    errors = []
+    if todo:
+        devices = list(args.devices)
+        if len(devices) == 1:
+            _, errors = worker(devices[0], todo, args, run_dir, 0)
+        else:
+            shares = balance(todo, args, methods, len(devices))
+            with ProcessPoolExecutor(len(devices), mp_context=mp.get_context("spawn")) as pool:
+                futures = [pool.submit(_worker_entry, d, s, args, run_dir, i)
+                           for i, (d, s) in enumerate(zip(devices, shares)) if s]
+                for fut in futures:
+                    errors += fut.result()[1]
+    return errors
+
+
+def run_add(args):
+    """--add-methods: evaluate new methods into an existing run with that run's settings."""
+    config = addition_setup(args, ADD_SETTINGS)
+    run_dir = Path(args.run_dir)
+    new, names = discover(args)
+    skipped = [n for n in names if n not in config.get("sequences", names)]
+    names = [n for n in names if n in config.get("sequences", names)]
+    args._methods, args._added = new, tuple(new)
+    args._all_methods = sorted(set(config["methods"]) | set(new), key=lambda m: ORDER.get(m, len(ORDER)))
+    commit, ckpts = setup(args)
+    finish_addition(args, run_dir, config, new, names, ckpts)
+    todo = [n for n in names if not added_marker(run_dir, args._added, n).is_file()]
+    print(f"Adding {', '.join(new)} to {run_dir} with its settings (warm-up {args.warmup}, norm {args.norm}, "
+          f"save {args.save}): {len(names)} sequences ({len(names) - len(todo)} already done)"
+          + (f"; not in the run, skipped: {skipped}" if skipped else ""), flush=True)
+    errors = _run_workers(args, todo, new, run_dir)
+    summarize(run_dir)
+    print(f"Summary tables: {run_dir / 'summary.csv'} (now with {', '.join(new)})", flush=True)
+    if errors:
+        raise RuntimeError("Some sequences failed (rerun the same command to resume):\n" + "\n".join(errors))
+    return run_dir
+
+
 def run(args):
     if torch is None:
         raise ImportError("PyTorch is required for reconstruction")
     if not getattr(args, "io_workers", None):
         args.io_workers = max(2, (os.cpu_count() or 4) // len(args.devices))
+    if getattr(args, "add_methods", None):
+        return run_add(args)
     methods, names = discover(args)
     args._methods = methods
     if args.run_dir:
@@ -1123,6 +1280,9 @@ def parser():
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
     p.add_argument("--skip-lpips", action="store_true")
     p.add_argument("--progress-every", type=float, default=30, help="Seconds between progress lines")
+    p.add_argument("--add-methods", nargs="+", metavar="METHOD",
+                   help="Add these methods to the run in --run-dir, using that run's settings; other methods' "
+                        "results are kept, real events are reconstructed again as the reference")
     p.add_argument("--summarize-only", metavar="RUN_DIR", help="Rebuild the summary tables of a run")
     return p
 

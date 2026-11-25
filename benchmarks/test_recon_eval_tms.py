@@ -12,7 +12,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import recon_eval as r  # noqa: E402
 import recon_eval_tms as tms  # noqa: E402
-from test_recon_eval import FAKE_EVREAL, H, W, make_events, toy  # noqa: E402,F401  (toy is a fixture)
+from test_recon_eval import FAKE_EVREAL, H, W, fake_networks, make_events, toy  # noqa: E402,F401
 
 torch = r.torch
 needs_torch = pytest.mark.skipif(torch is None, reason="PyTorch not installed")
@@ -182,3 +182,64 @@ def test_end_to_end_cpu(toy, monkeypatch):  # noqa: F811
     # resume: nothing recomputed, same numbers
     again = tms.run(args)
     assert pd.read_csv(again / "bin10ms_ms" / "per_window.csv").equals(w10)
+
+
+# ---------------------------------------------------------------- --add-methods
+
+def test_add_methods_bin_selection(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "config.json").write_text(json.dumps(dict(
+        dataset="eds", split="test", methods=["v2e"], sequences=["a"], configs=["bin5ms_ms", "bin10ms_ms", "bin10ms_events"],
+        warmup_s=0.2, gt_tol_ms=2.0, bins=5)))
+
+    class Stop(Exception):
+        pass
+
+    def stop(args):
+        raise Stop(args._configs)
+    monkeypatch.setattr(r, "discover", stop)
+
+    def configs(*extra):
+        args = tms.parser().parse_args(["eds", "--run-dir", str(run), "--add-methods", "evtween_v8_student", *extra])
+        with pytest.raises(Stop) as e:
+            tms.run_add(args)
+        assert args.warmup_s == 0.2 and args.gt_tol_ms == 2.0
+        return [tms.config_name(*c) for c in e.value.args[0]]
+    assert configs() == ["bin5ms_ms", "bin10ms_ms", "bin10ms_events"]          # all of the run's settings
+    assert configs("--bin-ms", "10") == ["bin10ms_ms", "bin10ms_events"]
+    assert configs("--bin-ms", "10", "--bin-time", "ms") == ["bin10ms_ms"]
+    for bad in (["--bin-ms", "7"], ["--bin-ms", "5", "10", "20"], ["--bin-time", "events", "--bin-ms", "5"]):
+        args = tms.parser().parse_args(["eds", "--run-dir", str(run), "--add-methods", "evtween_v8_student", *bad])
+        with pytest.raises(ValueError):
+            tms.run_add(args)
+    assert tms.parse_config_name("bin2.5ms_events") == (2.5, "events")
+
+
+@needs_torch
+def test_add_methods_end_to_end(toy, monkeypatch):  # noqa: F811
+    import pandas as pd
+    root, e2, fn = fake_networks(toy, monkeypatch)
+    a = toy.args
+    base = [a.dataset, "--events-root", a.events_root, "--data-root", a.data_root, "--devices", "cpu", "--skip-lpips",
+            "--io-workers", "2", "--chunk", "7", "--evreal-root", str(root), "--no-auto-setup",
+            "--e2vid-ckpt", str(e2), "--firenet-ckpt", str(fn)]
+    sel = ["--select-best", "1", "--select-worst", "1", "--select-activity", "1", "--select-temporal", "1",
+           "--select-total", "4", "--bin-ms", "10", "--bin-time", "ms", "--warmup-s", "0.1"]
+    full = tms.run(tms.parser().parse_args(base + sel + ["--methods", "v2e", "evtween_v5.2_teacher",
+                                                         "--run-dir", str(toy.tmp / "tf"), "--recon-root", str(toy.tmp / "rtf")]))
+    part = tms.run(tms.parser().parse_args(base + sel + ["--methods", "v2e",
+                                                         "--run-dir", str(toy.tmp / "tp"), "--recon-root", str(toy.tmp / "rtp")]))
+    sel_before = pd.read_csv(part / "selection.csv")
+    tms.run(tms.parser().parse_args(base + ["--run-dir", str(part), "--add-methods", "evtween_v5.2_teacher"]))
+    keep = ["sequence", "network", "method", "window"]
+    got = pd.read_csv(part / "bin10ms_ms" / "per_window.csv").sort_values(keep).reset_index(drop=True)
+    ref = pd.read_csv(full / "bin10ms_ms" / "per_window.csv").sort_values(keep).reset_index(drop=True)
+    assert list(got[keep].itertuples(index=False)) == list(ref[keep].itertuples(index=False))
+    added = got.method == "evtween_v5.2_teacher"
+    assert np.allclose(got.loc[added, "agreement_mse"], ref.loc[added, "agreement_mse"], atol=1e-5)
+    assert pd.read_csv(part / "selection.csv").equals(sel_before)
+    for _, row in sel_before.iterrows():
+        assert (toy.tmp / "rtp" / "bin10ms_ms" / "e2vid" / "evtween_v5.2_teacher" / row.sequence /
+                f"w{row.window:06d}.png").is_file()
+    assert "evtween_v5.2_teacher" in set(pd.read_csv(part / "summary_all.csv").method)
