@@ -281,10 +281,26 @@ def compute(model, batch, w, stage):
     if stage in ("student", "joint"):
         zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
-        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, model.decode(p, zh), ev, batch["dt"], w["grid"],
-                                                                   w.get("mix", MIX)))
+        sh = model.decode(p, zh)
+        Lr, Lg = path_grid(model, sh, w["grid"])
+        Rg = residual_grid(model, sh, Lr, batch["dt"])
+        terms.update(jepa=F.mse_loss(zh, zt), nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX),
+                                                                   (Lr, Lg, Rg)))
+        if w.get("distill", 0) > 0:  # v8.3: the student's expected residual events per pixel (slope + background) vs the teacher's
+            with torch.no_grad():
+                st = model.decode(p, zt)
+                a = residual_grid(model, st, path_grid(model, st, w["grid"])[0], batch["dt"]).sum(2)  # (B, ON / OFF, H*W)
+            b = Rg.sum(2)
+            terms["distill"] = (a * (a.clamp(min=1e-8) / b.clamp(min=1e-8)).log() - a + b).sum(1).mean()  # KL of counts, per pixel
     weight = dict(w, nll_student=w["nll"])
     return sum(weight[k] * v for k, v in terms.items()), terms
+
+
+def shares(model, s, Lg, Rg, dt):
+    # shares of the expected events that are residual events (slope + background) and background events
+    dL, C = Lg[:, 1:] - Lg[:, :-1], model.sensor(s["ds"])[0]
+    total = (F.relu(dL).sum((1, 2)) / C[:, 0] + F.relu(-dL).sum((1, 2)) / C[:, 1]).sum() + Rg.sum()
+    return (Rg.sum() / total).item(), ((s["nu"].flatten(1).sum(1) * dt).sum() / total).item()
 
 
 @torch.no_grad()
@@ -300,15 +316,17 @@ def diagnostics(model, batch, w, student=True):
     Rg = residual_grid(model, s, Lr, batch["dt"])
     if w.get("xt", 0) > 0:
         out["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0))).item()
-    dL, C = Lg[:, 1:] - Lg[:, :-1], model.sensor(s["ds"])[0]
-    cross = (F.relu(dL).sum((1, 2)) / C[:, 0] + F.relu(-dL).sum((1, 2)) / C[:, 1]).sum()
-    out["res_share"] = (Rg.sum() / (cross + Rg.sum())).item()  # share of the expected events that are residual events
+    out["res_share"], out["bg_share"] = shares(model, s, Lg, Rg, batch["dt"])
     if batch["mid"].shape[1]:
         out["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"]).item()
     if w.get("mask", 0) > 0:  # masked-slice guess on every sample, the same hidden slices at every validation
         gen = torch.Generator(batch["dt"].device).manual_seed(0)
         out["mask"] = mask_loss(model, p, batch["voxel"], ev, batch["dt"], w, 1.0, gen).item()
     if student:
-        out["nll_student"] = nll(model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"]))
+        zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
+        out["nll_student"] = nll(zh)
         out["gap"] = out["nll_student"] - out["nll"]
+        sh = model.decode(p, zh)
+        Lr, Lg = path_grid(model, sh, w["grid"])
+        out["res_share_student"], out["bg_share_student"] = shares(model, sh, Lg, residual_grid(model, sh, Lr, batch["dt"]), batch["dt"])
     return out

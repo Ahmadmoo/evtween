@@ -49,6 +49,8 @@ loss:
   mask_slices: [2, 3]          # hidden slices per sample (of 8), random
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
+  distill: 1.0                 # v8.3: student's expected residual events per pixel (slope + background) vs the teacher's,
+                               # generalized KL (an NLL-trained student hedges with flat background where unsure of the timing)
   photo: 10.0                  # interp stage only: the path vs the hidden real frames
   grid: 128                    # tau steps of the likelihood path
   mix: 16                      # how far back (in events) the likelihood looks for a pixel's last crossing

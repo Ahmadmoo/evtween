@@ -20,7 +20,27 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v8.2`)
+### This version (`v8.3`)
+
+Built from `v8.2`. One student loss and more validation values; the model and the teacher are v8.2's.
+
+| Change | v8.2 | v8.3 | Why |
+|---|---|---|---|
+| `loss.distill` | – | Student (and joint) stage: the student's expected residual events per pixel and polarity over the gap (slope part + background, from its own decoded path) vs the teacher's, generalized KL of counts, nats per pixel like `nll` | On real data (first 40 pairs, `on_sources.py`) the v8.2 student makes about twice the teacher's share of background events and fewer crossings: background 41 vs 26 % (BS-ERGB), 26 vs 9 % (HQ-EVFI), 35 vs 16 % (EDS). Where the student is unsure of the timing, the NLL rewards a flat rate; flat background looks like scattered edges |
+| Validation | `res_share` (teacher) | also `bg_share`, and the student's `res_share_student`, `bg_share_student` | The student's shares should move toward the teacher's |
+
+- `loss.distill=0` is v8.2. In the student stage `loss.nll` scales only `nll_student`; a lower `loss.nll` (e.g. 0.25) is the other way to stop the hedging, with no code change.
+- Fine-tune from the v8.2 student:
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/student_v8.2/last.pt model.pred_dim=384 train.out=runs/student_v8.3 train.steps=20000 train.lr=1e-4
+```
+
+Checks (CPU, toy):
+- `distill` reaches the student and `to_z` (the decoder is frozen in the student stage). Student, joint and teacher stages run.
+- 60 fine-tune steps from the toy v8.2 student: `nll_student` at skip 3 0.907 (distill 0) vs 0.869 (distill 1). The toy student does not hedge (`bg_share_student` 0.21, the teacher's `bg_share` 0.40), so the toy cannot show the effect; the test is `bg_share_student` in validation and `on_sources.py` on real data.
+
+### `v8.2` (separate branch)
 
 Built from `v8` (conv student head; v8.1's attention head is not in here). Two training changes; the model is v8's.
 
@@ -336,6 +356,7 @@ Tube width, no hand-set value:
 | `sigreg` | teacher, joint | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to predict later) |
 | `jepa` | student, joint | Student code vs teacher code (`stopgrad` in the student stage) |
 | `nll_student` | student, joint | `nll` with the student's code |
+| `distill` | student, joint | v8.3: student's expected residual events per pixel (slope + background) vs the teacher's, generalized KL of counts |
 | `photo` | interp | `L(τ)` must match the real hidden frames |
 
 ---
@@ -468,6 +489,8 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 | `gap` | `nll_student − nll`: in-between information the video cannot predict | Small; report it vs gap length |
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
+| `bg_share` | v8.3: share of the teacher's expected events that are background | Low where the sensor is clean (BS-ERGB, HQ-EVFI) |
+| `res_share_student`, `bg_share_student` | v8.3: the same shares with the student's code | Close to the teacher's; far above them = the student hedges with flat rates |
 | `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
 | `mask` | v8.2: masked-slice score, the hidden event slices guessed through the decoder | Falls with training |
 
