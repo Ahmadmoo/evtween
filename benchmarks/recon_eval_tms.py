@@ -609,6 +609,7 @@ def run_add(args):
 def run(args):
     if torch is None:
         raise ImportError("PyTorch is required for reconstruction")
+    r.check_devices(args.devices)
     if not getattr(args, "io_workers", None):
         args.io_workers = max(2, (os.cpu_count() or 4) // len(args.devices))
     if getattr(args, "add_methods", None):

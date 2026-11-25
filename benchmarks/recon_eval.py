@@ -581,9 +581,14 @@ def addition_setup(args, mapping):
     if config.get("dataset") != args.dataset or config.get("split", args.split) != args.split:
         raise ValueError(f"{args.run_dir} is a run of {config.get('dataset')}/{config.get('split')}, "
                          f"not {args.dataset}/{args.split}")
-    already = [m for m in args.add_methods if m in config["methods"]]
-    if already:
-        raise ValueError(f"Already in this run: {already}. Start a new run to re-evaluate them.")
+    added_before = {m for entry in config.get("added", []) for m in entry.get("methods", [])}
+    original = [m for m in args.add_methods if m in config["methods"] and m not in added_before]
+    if original:
+        raise ValueError(f"Already in this run (evaluated with the run itself): {original}. "
+                         "Start a new run to re-evaluate them.")
+    resuming = [m for m in args.add_methods if m in added_before]
+    if resuming:  # an earlier --add-methods of these was interrupted: continue it (finished sequences are skipped)
+        print(f"Continuing the earlier addition of {', '.join(resuming)}", flush=True)
     for key, apply in mapping.items():
         if config.get(key) is not None:
             apply(args, config[key])
@@ -598,9 +603,14 @@ def finish_addition(args, run_dir, config, new, names, ckpts):
     if old and old != now:
         raise ValueError(f"The network weights differ from the run's ({old} vs {now}); cannot add methods to it")
     config["methods"] = sorted(set(config["methods"]) | set(new), key=lambda m: ORDER.get(m, len(ORDER)))
-    config.setdefault("added", []).append(dict(methods=list(new), sequences=list(names),
-                                               time=datetime.now().isoformat(timespec="seconds"),
-                                               code_sha256=file_sha256(Path(__file__))))
+    entry = dict(methods=list(new), sequences=list(names), time=datetime.now().isoformat(timespec="seconds"),
+                 code_sha256=file_sha256(Path(__file__)))
+    history = config.setdefault("added", [])
+    same = [e for e in history if e.get("methods") == list(new)]
+    if same:  # continuing an interrupted addition: one record, with the time it was last run
+        same[-1].update(entry)
+    else:
+        history.append(entry)
     (Path(run_dir) / "config.json").write_text(json.dumps(config, indent=2))
 
 
@@ -992,6 +1002,21 @@ def balance(names, args, methods, workers):
     return shares
 
 
+def check_devices(devices):
+    """Fail before anything is written if a device string is wrong or the GPU does not exist."""
+    for d in devices:
+        try:
+            dev = torch.device(d)
+        except RuntimeError:
+            raise ValueError(f"Invalid device {d!r}: use cuda:0, cuda:1, ... or cpu") from None
+        if dev.type == "cuda":
+            if not torch.cuda.is_available():
+                raise ValueError(f"{d}: CUDA is not available on this machine")
+            if dev.index is not None and dev.index >= torch.cuda.device_count():
+                raise ValueError(f"{d}: only {torch.cuda.device_count()} GPU(s) visible (cuda:0 .. "
+                                 f"cuda:{torch.cuda.device_count() - 1})")
+
+
 ADD_SETTINGS = {
     "networks": lambda a, v: setattr(a, "networks", list(v)),
     "bins": lambda a, v: setattr(a, "bins", v),
@@ -1052,6 +1077,7 @@ def run_add(args):
 def run(args):
     if torch is None:
         raise ImportError("PyTorch is required for reconstruction")
+    check_devices(args.devices)
     if not getattr(args, "io_workers", None):
         args.io_workers = max(2, (os.cpu_count() or 4) // len(args.devices))
     if getattr(args, "add_methods", None):

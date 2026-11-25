@@ -460,3 +460,23 @@ def test_add_methods_matches_a_full_run(toy, monkeypatch):
     assert set(pd.read_csv(part / "summary.csv").method) == {r.REAL, "v2e", "evtween_v5.2_teacher"}
     r.run(add)                                                   # again: all sequences done, nothing changes
     assert pd.read_csv(part / "per_frame.csv").equals(after)
+
+
+def test_interrupted_addition_can_continue(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = dict(dataset="eds", split="test", methods=["v2e", "evtween_v8.2_student"], sequences=["a", "b"],
+               added=[dict(methods=["evtween_v8.2_student"], sequences=["a", "b"], time="t0")])
+    (run / "config.json").write_text(json.dumps(cfg))
+    args = r.parser().parse_args(["eds", "--run-dir", str(run), "--add-methods", "evtween_v8.2_student"])
+    r.addition_setup(args, r.ADD_SETTINGS)                       # recorded by an earlier, interrupted addition: OK
+    with pytest.raises(ValueError, match="evaluated with the run itself"):
+        r.addition_setup(r.parser().parse_args(["eds", "--run-dir", str(run), "--add-methods", "v2e"]), r.ADD_SETTINGS)
+
+
+@needs_torch
+def test_check_devices():
+    r.check_devices(["cpu"])
+    for bad in (["cuda:04"], ["cpu", "gpu0"], [f"cuda:{max(1, torch.cuda.device_count()) + 8}"]):
+        with pytest.raises(ValueError):
+            r.check_devices(bad)
