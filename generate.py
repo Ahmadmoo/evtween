@@ -39,7 +39,7 @@ with torch.no_grad():
         tau = torch.tensor([(ts[q] - ts[i]) / (ts[i + 1] - ts[i]) for q in idx], device=dev)[None].float()
         p = model.prepare(ctx[:, c - 1], ctx[:, c], torch.tensor([ds], device=dev))
         z = model.predict(ctx, tau, torch.tensor([ts[i + 1] - ts[i]], device=dev).float())
-        parts.append(sim.run(model.decode(p, z), ts[i], ts[i + 1]))
+        parts.append(sim.run(model.decode_student(p, z), ts[i], ts[i + 1]))
         print(f"\r{i + 1}/{N - 1} frames, {sum(len(q['t']) for q in parts)} events", end="", flush=True)
 
 np.savez(args.out, **{k: np.concatenate([q[k] for q in parts]) for k in "txyp"})

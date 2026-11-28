@@ -146,6 +146,21 @@ def pmse_loss(model, s, ev, dt, Lg, Rg):
     return checkpoint(run, Lg, Rg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg, Rg)
 
 
+def ref_loss(model, s, ev, dt, Lg, Rg, ref):
+    # v8.5: the events the model expects against a reference (ref: the teacher's expected events, (B, 2, T, H, W), no
+    # gradient). The teacher saw the real events, so where and when each edge fires is decided there. Space and time stay
+    # apart, so no error can pay for another: space = how many ON / OFF events each pixel makes over the gap (L1); time =
+    # when each pixel fires (1-d earth mover's distance along t in ms, weighted by the reference's events, as in emd).
+    # Both per reference event. L1, not a likelihood: when unsure, one sharp answer costs less than a spread
+    def run(Lg, Rg):
+        m = counts(model, s, ev, Lg, Rg)[0]
+        n = ref.sum().clamp(min=1)
+        ms = (dt * 1e3 / m.shape[2]).view(-1, 1, 1, 1, 1)  # ms per x-t bin
+        return torch.stack([(m.sum(2) - ref.sum(2)).abs().sum() / n, (_w1(m, ref, 2) * ms).sum() / n])
+
+    return tuple(checkpoint(run, Lg, Rg, use_reentrant=False) if torch.is_grad_enabled() else run(Lg, Rg))
+
+
 def mask_loss(model, p, voxel, ev, dt, w, share=None, gen=None):
     # masked slices (v5.3's trick, through the decoder): a second teacher pass on the first share of the batch with 2-3
     # random time slices of its events hidden; the path the decoder makes from that code must still make the hidden
@@ -316,38 +331,47 @@ def compute(model, batch, w, stage):
         if model.measure_c:
             model.measure_thresholds(p, batch["ev_b"], batch["ev_pix"], batch["ev_pol"])
     terms = {}
-    if stage in ("teacher", "joint", "interp"):
-        z = model.encode(p, batch["voxel"])
-        s = model.decode(p, z)
-        Lr, Lg = path_grid(model, s, w["grid"])
-        Rg = residual_grid(model, s, Lr, batch["dt"])
-        terms["nll"] = event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lr, Lg, Rg))
-        if stage == "interp":  # teacher only, decoder frozen: the path also matches the hidden real frames
-            terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
-        else:
+    # the teacher's code and path. v8.5: in stage 2 too (teacher frozen): its decoder keeps learning teacher codes, and
+    # its expected events are the student's reference
+    z = model.encode(p, batch["voxel"])
+    z = z.detach() if stage == "student" else z
+    s = model.decode(p, z)
+    Lr, Lg = path_grid(model, s, w["grid"])
+    Rg = residual_grid(model, s, Lr, batch["dt"])
+    terms["nll"] = event_nll(model, s, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lr, Lg, Rg))
+    if stage != "teacher" and w.get("photo", 0) > 0:  # the path also matches the hidden real frames (v8.5: not only interp)
+        terms["photo"] = photo_loss(model, s, batch["mid"], batch["mid_tau"])
+    if stage != "interp":  # interp: teacher only, nll + photo
+        if stage != "student":  # the teacher's own code
             terms["sigreg"] = sigreg_loss(z)
-            if w.get("xt", 0) > 0:
-                terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0)))
-            for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
-                if w.get(k, 0) > 0:
-                    terms[k] = f(model, s, ev, batch["dt"], Lg, Rg)
-            if w.get("mask", 0) > 0:
-                terms["mask"] = mask_loss(model, p, batch["voxel"], ev, batch["dt"], w)
-    if stage in ("student", "joint"):
-        zt = model.encode(p, batch["voxel"]).detach() if stage == "student" else z
-        zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
-        sh = model.decode(p, zh)
-        Lr, Lg = path_grid(model, sh, w["grid"])
-        Rg = residual_grid(model, sh, Lr, batch["dt"])
-        terms.update(jepa=F.mse_loss(zh, zt),
-                     nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lr, Lg, Rg)))
-        if w.get("xt", 0) > 0:  # v8.4: the teacher's event losses on the student's events
-            terms["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0)))
+        if w.get("xt", 0) > 0:
+            terms["xt"] = xt_loss(model, s, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0)))
         for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
             if w.get(k, 0) > 0:
-                terms[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg)
+                terms[k] = f(model, s, ev, batch["dt"], Lg, Rg)
+        if w.get("mask", 0) > 0 and stage != "student":
+            terms["mask"] = mask_loss(model, p, batch["voxel"], ev, batch["dt"], w)
+    if stage in ("student", "joint"):
+        zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
+        sh = model.decode_student(p, zh)
+        Lrs, Lgs = path_grid(model, sh, w["grid"])
+        Rgs = residual_grid(model, sh, Lrs, batch["dt"])
+        terms.update(jepa=F.mse_loss(zh, z),
+                     nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lrs, Lgs, Rgs)))
+        if w.get("photo", 0) > 0:
+            terms["photo_student"] = photo_loss(model, sh, batch["mid"], batch["mid_tau"])
+        if w.get("xt", 0) > 0:
+            terms["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lgs, Rgs, w.get("xt_blur", (2.0, 2.0)))
+        for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
+            if w.get(k, 0) > 0:
+                terms[k + "_student"] = f(model, sh, ev, batch["dt"], Lgs, Rgs)
+        if w.get("ref_space", 0) > 0 or w.get("ref_time", 0) > 0:  # v8.5: the teacher's expected events as the reference
+            with torch.no_grad():
+                ref = counts(model, s, ev, Lg, Rg)[0]
+            terms["ref_space"], terms["ref_time"] = ref_loss(model, sh, ev, batch["dt"], Lgs, Rgs, ref)
     weight = dict(w, nll_student=w["nll"], xt_student=w.get("xt", 0), emd_student=w.get("emd", 0),
-                  pmse_student=w.get("pmse", 0))
+                  pmse_student=w.get("pmse", 0), photo_student=w.get("photo", 0), ref_space=w.get("ref_space", 0),
+                  ref_time=w.get("ref_time", 0))
     return sum(weight[k] * v for k, v in terms.items()), terms
 
 
@@ -375,16 +399,20 @@ def diagnostics(model, batch, w, student=True):
     if w.get("mask", 0) > 0:  # masked-slice guess on every sample, the same hidden slices at every validation
         gen = torch.Generator(batch["dt"].device).manual_seed(0)
         out["mask"] = mask_loss(model, p, batch["voxel"], ev, batch["dt"], w, 1.0, gen).item()
-    if student:
+    if student:  # v8.5: through the student's own decoder
         zh = model.predict(batch["ctx"], batch["ctx_tau"], batch["dt"])
-        out["nll_student"] = nll(zh)
+        sh = model.decode_student(p, zh)
+        Lrs, Lgs = path_grid(model, sh, w["grid"])
+        Rgs = residual_grid(model, sh, Lrs, batch["dt"])
+        out["nll_student"] = event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lrs, Lgs, Rgs)).item()
         out["gap"] = out["nll_student"] - out["nll"]
-        sh = model.decode(p, zh)
-        Lr, Lg = path_grid(model, sh, w["grid"])
-        Rg = residual_grid(model, sh, Lr, batch["dt"])
         if w.get("xt", 0) > 0:
-            out["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0))).item()
+            out["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lgs, Rgs, w.get("xt_blur", (2.0, 2.0))).item()
         for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
             if w.get(k, 0) > 0:
-                out[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg).item()
+                out[k + "_student"] = f(model, sh, ev, batch["dt"], Lgs, Rgs).item()
+        if batch["mid"].shape[1]:
+            out["photo_student"] = photo_loss(model, sh, batch["mid"], batch["mid_tau"]).item()
+        out["ref_space"], out["ref_time"] = (v.item() for v in ref_loss(model, sh, ev, batch["dt"], Lgs, Rgs,
+                                                                         counts(model, s, ev, Lg, Rg)[0]))
     return out

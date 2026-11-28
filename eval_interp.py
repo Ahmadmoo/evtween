@@ -89,9 +89,9 @@ for name, ds in datasets(D, args.split, False).items():
             p = model.prepare(b["i0"], b["i1"], b["ds"], b.get("cfa"))
             zt = model.encode(p, b["voxel"])
             z = {"frames only (z=0)": torch.zeros_like(zt), "teacher (frames + events)": zt}
-            if args.student:
-                z["student (frames)"] = model.predict(b["ctx"], b["ctx_tau"], b["dt"])
             s = {m: model.decode(p, z[m]) for m in z}
+            if args.student:  # v8.5: through the student's own decoder
+                s["student (frames)"] = model.decode_student(p, model.predict(b["ctx"], b["ctx_tau"], b["dt"]))
             for j in range(b["mid"].shape[1]):
                 tau, gt = b["mid_tau"][:, j], b["mid"][:, j]
                 pred = {"blend": (((1 - tau).view(-1, 1, 1, 1) * b["i0"] ** g + tau.view(-1, 1, 1, 1) * b["i1"] ** g) ** (1 / g))}

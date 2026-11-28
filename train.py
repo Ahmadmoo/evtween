@@ -17,8 +17,9 @@ from model import build_model
 # interp: the teacher alone (decoder, sensor and student frozen), for frame interpolation
 TRAIN = {"probe": ("student.", "to_counts."),
          "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
-         "student": ("student.", "to_z.", "decoder."),  # v8.4: the decoder learns to read student codes
-         "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_", "w_rgb"),
+         # v8.5: the teacher stays frozen; its decoder keeps training on teacher codes, the student's own on student codes
+         "student": ("student.", "to_z.", "decoder.", "student_decoder."),
+         "joint": ("teacher.", "decoder.", "student.", "to_z.", "student_decoder.", "log_", "w_rgb"),
          "interp": ("teacher.",)}
 
 
@@ -72,6 +73,8 @@ if T.get("init"):  # parts whose size changed (e.g. a wider student) start fresh
     model.load_state_dict({k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}, strict=False)
     if rank == 0 and skip:
         print("init: size changed, not loaded:", skip, flush=True)
+    if stage in ("student", "joint") and ck0.get("cfg", {}).get("train", {}).get("stage") not in ("student", "joint"):
+        model.student_decoder.load_state_dict(model.decoder.state_dict())  # v8.5: the student's decoder starts as the teacher's
 for n, p in model.named_parameters():
     p.requires_grad = n.startswith(TRAIN[stage]) and not model.frozen(n) and not model.fixed(n)
 params = [p for n, p in model.named_parameters() if p.requires_grad and ".lora_" not in n]

@@ -52,7 +52,9 @@ loss:
   pmse: 1.0                    # v8.3: PMSE of a sampled stream, expected (teacher and student): random events cost their variance
   sigreg: 0.05                 # keeps the path code Gaussian (LeJEPA SIGReg)
   jepa: 1.0                    # student code vs teacher code
-  photo: 10.0                  # interp stage only: the path vs the hidden real frames
+  photo: 10.0                  # the path vs the hidden real frames: interp, and v8.5's stage 2 (both decoders); skip > 0 only
+  ref_space: 1.0               # v8.5: the student's expected ON / OFF events per pixel over the gap vs the teacher's (L1)
+  ref_time: 0.1                # v8.5: when each pixel fires vs the teacher (earth mover's distance along t, ms per event)
   grid: 128                    # tau steps of the likelihood path
   mix: 16                      # how far back (in events) the likelihood looks for a pixel's last crossing
 

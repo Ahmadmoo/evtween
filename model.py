@@ -297,6 +297,9 @@ class EvTween(nn.Module):
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
         # outputs: flows a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
         self.decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
+        # v8.5: the student's own decoder, a copy of the teacher's when stage 2 starts. From then on the teacher's decoder
+        # reads teacher codes only (and gives the student's reference), this one student codes only
+        self.student_decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
         self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, context, width)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
@@ -474,9 +477,22 @@ class EvTween(nn.Module):
         return (self.to_z if head == "z" else self.to_counts)(f)
 
     def decode(self, p, z):
-        # path code -> trajectory state used by render() and the residual event rate
+        # teacher code (or z = 0) -> trajectory state used by render() and the residual event rate
+        return self._state(p, z, self.decoder)
+
+    def decode_student(self, p, z):
+        # v8.5: student code -> trajectory state, through the student's own decoder
+        return self._state(p, z, self.student_decoder)
+
+    def load_state_dict(self, sd, *args, **kwargs):
+        # checkpoints before v8.5 have one decoder: the student decodes with a copy of it, as it did then
+        if not any(k.startswith("student_decoder.") for k in sd):
+            sd = {**sd, **{"student_" + k: v for k, v in sd.items() if k.startswith("decoder.")}}
+        return super().load_state_dict(sd, *args, **kwargs)
+
+    def _state(self, p, z, decoder):
         with self._ac(z):
-            out = self.decoder(p["x"], z)
+            out = decoder(p["x"], z)
         H, W, B, K = p["H"], p["W"], z.shape[0], self.K
         a, b, d, kap, nu = out.float()[..., :H, :W].split([2 * K, 2 * K, VIS + 1, 4, 2], 1)
         bound = lambda x, m: m * torch.tanh(x / m)  # flows stay within +-flow_scale px per term, visibility logits within +-6

@@ -15,12 +15,58 @@ TRAIN
  context frames, gap never shown  ──> V-JEPA 2.1 + predictor (student) ──> ẑ ≈ z
  z or ẑ + I0, I1 ──> physics decoder ──> L(u,τ) ──> taut path in the noise tube ──> crossings  ─┐
                                     └──> κ, ν maps ──> residual rate (raw slope of L + background) ┴─> likelihood, x-t / y-t, earth mover's, PMSE
+ v8.5: z and ẑ have one decoder each (the student's starts as a copy of the teacher's); the student also matches the teacher's expected events
 
 TEST
- video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
+ video ──> student ──> ẑ ──> student's physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v8.4`)
+### This version (`v8.5`)
+
+Built from `v8.4`, for blurry edges and scattered events. The student's event losses have no reference: they compare against the real events, a sparse random sample. The likelihood can't tell which real events were crossings and which were random, so random events can cover a wrong path (scatter). When the student is unsure, `nll`, `xt`, `pmse` and `jepa` reward spreading (blur). The teacher saw the real events, so it has already decided where and when each pixel fires: its expected events become the student's reference. The teacher is v8.3's; only stage 2 changes.
+
+| Change | v8.4 | v8.5 | Why |
+|---|---|---|---|
+| Decoders | One. In stage 2 it moves to student codes, so the teacher's events get worse (toy: Chamfer 1.59 → 1.91, 2.3× the real count) | Two, the same network. `decoder` keeps training on teacher codes in stage 2 (its event losses + `photo`); `student_decoder` starts as a copy of it and trains on student codes | The reference must stay good while the student's decoder adapts. Toy teacher after stage 2: Chamfer 1.58, 1.01× the real count |
+| `ref_space`, `ref_time` | – | The student's expected events against the teacher's (no gradient into the teacher). Space: how many ON / OFF events each pixel makes over the gap (L1). Time: when each pixel fires (earth mover's distance along t, ms). Per teacher event | A dense target with no sampling noise: events where the teacher has none always cost, and L1 rewards one sharp answer when unsure. Space and time stay apart: no timing error is paid for in pixels, or the other way round |
+| `photo` | Interp stage only | Also stage 2, on both decoders' paths | The real frames inside the gap fix where each edge is at each time; random events can't fake them |
+
+- Old checkpoints load: the student decodes with a copy of the one decoder, as before (v8.4's toy scores with this code: identical).
+- Stage 2 copies the teacher's decoder into the student's when `train.init` is not a stage-2 checkpoint.
+- `photo` needs hidden frames (`skip` > 0): HQ-EVFI and EDS batches with skip ≥ 1, not BS-ERGB (skip 0). BS-ERGB still gets `ref_*`.
+- `ref_*` copies the teacher, weaknesses included. On toy the teacher's IEI is worse than the student's, and the student's IEI got worse with `ref_*`. Score the teacher before training (`evtween_eval_v8.ipynb`, teacher method); if its IEI or Fano is worse than the student's, lower `loss.ref_time`.
+- Stage 2 trains two decoders: more memory and time than v8.4. Lower `train.batch` if needed.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/student_v8.3/last.pt model.pred_dim=384 model.z_dim=128 model.flow_scale=32.0 train.steps=20000 train.lr=1e-4 train.out=runs/student_v8.5
+```
+
+`model.z_dim` and `model.flow_scale` must match the checkpoint (the v8.3 runs: 128 and 32; this config's defaults: 64 and 64). A different `z_dim` starts the teacher's last layer, the gate and `to_z` from random; a different `flow_scale` changes the flows with no error.
+
+Checks (CPU, toy): 400 student steps from the same v8.3 toy student, 3 val sequences × 10 frame pairs.
+
+Student:
+
+| | Chamfer | ON % (GT 45.6) | IEI | Fano | PMSE-2 | PMSE-4 | count (× GT) |
+|---|---|---|---|---|---|---|---|
+| v8.3 | **1.87** | 46.6 | 0.275 | 0.545 | 0.0139 | 0.0052 | **0.95** |
+| v8.4 | 1.94 | **46.2** | **0.147** | 0.528 | 0.0120 | 0.0034 | 1.22 |
+| v8.5 without `ref_*` | 1.97 | 46.5 | 0.150 | 0.539 | 0.0117 | **0.0032** | 1.18 |
+| v8.5 (`ref_space` 1, `ref_time` 0.1) | 1.93 | 47.3 | 0.162 | **0.525** | 0.0115 | **0.0032** | 1.10 |
+| v8.5, `ref_*` ×2 / ×5 | 1.93 | 47.0 | 0.174 | 0.533 | **0.0114** | **0.0032** | 1.05 |
+
+Teacher (its own code and decoder):
+
+| | Chamfer | ON % (GT 45.6) | IEI | Fano | PMSE-2 | PMSE-4 | count (× GT) |
+|---|---|---|---|---|---|---|---|
+| v8.3 (start of stage 2) | 1.59 | 44.5 | 0.288 | 0.491 | 0.0124 | 0.0040 | 0.98 |
+| v8.4 after stage 2 | 1.91 | **46.2** | 0.517 | 0.815 | 0.1138 | 0.0839 | 2.29 |
+| v8.5 after stage 2 | **1.58** | 44.7 | **0.247** | **0.479** | **0.0112** | **0.0034** | **1.01** |
+
+- The toy teacher is itself a cloud (no sharp lines), so the toy can't show sharper edges. It shows the student's count moving to the teacher's: 1.18× without `ref_*`, 1.10× with them, 1.05× with them ×2 / ×5.
+- All five stages, `generate.py`, `eval_interp.py --student` and `check.py` run.
+
+### `v8.4` (separate branch)
 
 Built from `v8.3`. On real data the v8.3 teacher (real events in) draws sharp edges and little noise; the student draws thick, blurry edges, about twice the noise in quiet scenes, and its ON % moves 1–5 points between versions. Three causes: the student had no pixels (only 16 px video tokens), the decoder was frozen on teacher codes, and training crops were always busy. The teacher is v8.3's; only stage 2 changes.
 
@@ -384,7 +430,7 @@ Tube width, no hand-set value:
 |---|---|
 | Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 8×8 patch grid. Training only |
 | Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + conv head (time slots stacked on channels, ConvNeXt blocks, real frame times and gap length); v8.4: + I0, I1 at full resolution through a conv encoder, added on the code grid, 2 more blocks there → `ẑ`; no position code, any image size |
-| Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
+| Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code. v8.5: two of them, the same network: `decoder` reads teacher codes, `student_decoder` student codes (a copy of `decoder` when stage 2 starts; `model.decode`, `model.decode_student`) |
 | Path | Warp both frames with learned time-polynomial flows (`K` terms per frame, no RAFT), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
 | Residual events | `model.residual_rate`: per pixel and polarity, `(κ_rise·rise + κ_fall·fall) / C_pol + ν_pol·dt` per unit τ, with rise / fall the slope of the **raw** path `L`. 6 decoder maps: `s["kappa"]` (ON / OFF × rise / fall) and `s["nu"]` (ON / OFF, events per second). They don't reset the pixel |
@@ -395,17 +441,22 @@ Tube width, no hand-set value:
 
 | Loss | Stage | Meaning |
 |---|---|---|
-| `nll` | teacher, joint, interp | Likelihood of the real event **times**: crossing hazard of the taut path and residual rate at each event, survival of both thresholds between crossings, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. Which events were crossings is summed over by a forward pass per pixel (`loss.mix`). Every pixel pays for the residual events it expects |
-| `xt` | teacher, joint | Expected vs real ON / OFF events (crossings + residual) on blurred x-t and y-t slices (generalized KL of counts) |
+| `nll` | teacher, student, joint, interp | Likelihood of the real event **times**: crossing hazard of the taut path and residual rate at each event, survival of both thresholds between crossings, after the last event and in silent pixels; the first wait per pixel starts from the stationary state. Which events were crossings is summed over by a forward pass per pixel (`loss.mix`). Every pixel pays for the residual events it expects |
+| `xt` | teacher, student, joint | Expected vs real ON / OFF events (crossings + residual) on blurred x-t and y-t slices (generalized KL of counts) |
 | `mask` | teacher, joint | v8.2: second teacher pass on part of the batch with 2–3 of 8 event slices hidden; the x-t loss on the hidden slices only |
-| `emd` | teacher, joint | v8.3: earth mover's distance between expected and real events along t, x, y, per polarity (shapes, per real event) |
-| `pmse` | teacher, joint | v8.3: PMSE of a sampled stream as its expected value (block error + background variance), relative |
+| `emd` | teacher, student, joint | v8.3: earth mover's distance between expected and real events along t, x, y, per polarity (shapes, per real event) |
+| `pmse` | teacher, student, joint | v8.3: PMSE of a sampled stream as its expected value (block error + background variance), relative |
 | `sigreg` | teacher, joint | LeJEPA SIGReg on `z`: keeps the code isotropic Gaussian (no collapse, easy to predict later) |
 | `jepa` | student, joint | Student code vs teacher code (`stopgrad` in the student stage) |
 | `nll_student` | student, joint | `nll` with the student's code |
 | `emd_student`, `pmse_student` | student, joint | v8.3: `emd`, `pmse` with the student's code (same weights) |
 | `xt_student` | student, joint | v8.4: `xt` with the student's code (same weight) |
-| `photo` | interp | `L(τ)` must match the real hidden frames |
+| `photo` | student, joint, interp | `L(τ)` must match the real hidden frames (batches with `skip` > 0) |
+| `photo_student` | student, joint | v8.5: `photo` on the student's path (same weight) |
+| `ref_space` | student, joint | v8.5: the student's expected ON / OFF events per pixel over the gap vs the teacher's, L1 per teacher event |
+| `ref_time` | student, joint | v8.5: when each pixel fires vs the teacher: earth mover's distance along t (ms) per teacher event |
+
+In the student stage the teacher's terms (`nll`, `xt`, `emd`, `pmse`, `photo`) train only the teacher's decoder (v8.5): the teacher itself stays frozen.
 
 ---
 
@@ -514,7 +565,7 @@ python train.py train.stage=probe model.backbone=none     train.out=runs/probe_n
 # 1. teacher + decoder on real events
 python train.py train.stage=teacher train.out=runs/teacher
 
-# 2. student (teacher frozen; v8.4: the decoder trains with the student, so start from a student checkpoint if you have one)
+# 2. student (teacher frozen; v8.5: the teacher's decoder keeps training on teacher codes, the student's own on student codes)
 python train.py train.stage=student train.init=runs/teacher/last.pt train.out=runs/student
 
 # 3. optional joint fine-tune (small lr)
@@ -538,9 +589,11 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
 | `emd`, `emd_student` | v8.3: earth mover's distance per real event (ms along t + px along x and y), teacher's / student's code | Falls with training; the student's above the teacher's |
-| `xt_student` | v8.4: x-t loss with the student's code | Falls in stage 2. The teacher's numbers rise there, since the decoder moves to the student |
+| `xt_student` | v8.4: x-t loss with the student's code | Falls in stage 2 |
+| `ref_space`, `ref_time` | v8.5: the student's expected events vs the teacher's: per-pixel counts (L1, per teacher event) and per-pixel timing (ms) | Fall in stage 2; 0 = the teacher's events |
+| `photo_student` | v8.5: the student's path vs the hidden frames | Falls in stage 2, above `photo` |
 | `pmse`, `pmse_student` | v8.3: expected PMSE of a sample relative to the real blocks' mean square | Falls with training; well below 1 |
-| `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
+| `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in stage 2 (v8.5) and the interp stage |
 | `mask` | v8.2: masked-slice score, the hidden event slices guessed through the decoder | Falls with training |
 
 The run resumes from `train.out/last.pt`. Checkpoints leave out the frozen backbone weights.
