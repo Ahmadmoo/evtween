@@ -17,7 +17,7 @@ from model import build_model
 # interp: the teacher alone (decoder, sensor and student frozen), for frame interpolation
 TRAIN = {"probe": ("student.", "to_counts."),
          "teacher": ("teacher.", "decoder.", "log_", "w_rgb"),
-         "student": ("student.", "to_z."),
+         "student": ("student.", "to_z.", "decoder."),  # v8.4: the decoder learns to read student codes
          "joint": ("teacher.", "decoder.", "student.", "to_z.", "log_", "w_rgb"),
          "interp": ("teacher.",)}
 

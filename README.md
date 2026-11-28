@@ -20,7 +20,39 @@ TEST
  video ──> student ──> ẑ ──> physics decoder ──> taut path + residual rate ──> crossing solver + sensor ──> events (t, x, y, p)
 ```
 
-### This version (`v8.3`)
+### This version (`v8.4`)
+
+Built from `v8.3`. On real data the v8.3 teacher (real events in) draws sharp edges and little noise; the student draws thick, blurry edges, about twice the noise in quiet scenes, and its ON % moves 1–5 points between versions. Three causes: the student had no pixels (only 16 px video tokens), the decoder was frozen on teacher codes, and training crops were always busy. The teacher is v8.3's; only stage 2 changes.
+
+| Change | v8.3 | v8.4 | Why |
+|---|---|---|---|
+| Student input | Video tokens only (16 px) | + I0, I1 at full resolution through a conv encoder (the teacher's class, frames only, 2.3M), added on the code grid (8 px), then 2 ConvNeXt blocks there (2.4M) | Edges need 8 px detail; the tokens have 16 px. The encoder's last layer starts at 0, so training starts from a v8.3 student |
+| Decoder in stage 2 | Frozen | Trained with the student; the teacher stays frozen and still gives `z_t` for `jepa` | It only ever learned teacher codes; at test time it only reads student codes |
+| Stage 2 losses | `jepa`, `nll_student`, `emd_student`, `pmse_student` | + `xt_student`: the teacher's event losses, all on the student's events | The student had no curve-level (x-t) loss |
+| Training crops | Retried until ≥ `data.min_events` events | 1 in 4 is a plain random crop | The model never saw quiet, noisy crops: noise in static scenes, ON / OFF balance fit on busy crops only |
+
+- With the decoder moving to the student, the teacher's own validation numbers (`nll`, `mask`, `pmse`, `gap`) get worse in stage 2; that is expected. The student's count: `nll_student`, `xt_student`, `emd_student`, `pmse_student`.
+- Start stage 2 from the v8.3 student: a random student head would feed noise codes to the decoder at the start.
+- The probe stage now also gets the pixel branch; for a backbone-only probe, use v8.3.
+
+```bash
+torchrun --nproc_per_node 4 train.py train.stage=student train.init=runs/student_v8.3/last.pt model.pred_dim=384 train.steps=20000 train.lr=1e-4 train.out=runs/student_v8.4
+```
+
+Checks (CPU, toy):
+- A v8.3 student loads; the new parts start at (almost) nothing: the code changes by 0.4 % (max 0.007).
+- When no crop can pass, 102 of 400 samples (26 %) take a single crop.
+- 400 more student steps from the same v8.3 toy student, v8.3 code vs v8.4 code, 3 val sequences × 10 frame pairs:
+
+| | Chamfer | ON % (GT 45.6) | IEI | Fano | PMSE-2 | PMSE-4 | count (× GT) |
+|---|---|---|---|---|---|---|---|
+| v8.3 | **1.87** | 46.6 | 0.275 | 0.545 | 0.0139 | 0.0052 | **0.95** |
+| v8.4 | 1.94 | **46.2** | **0.147** | **0.528** | **0.0120** | **0.0034** | 1.22 |
+
+- On toy the v8.4 student makes more events (1.22× GT); watch the count on real data. The toy has no video backbone and its random crops are all busy (no quiet crops), so it tests the code, not the gain.
+- All five stages and `generate.py` run.
+
+### `v8.3` (separate branch)
 
 Built from `v8.2`, for scattered, broken edges. On real data most generated events were drawn per pixel at random (slope + background: 61–80 % of the teacher's events, 71–86 % of the student's), and independent random events can't form lines (v6-wiggle's finding). The likelihood also rewards spreading events where the model is unsure. The model is v8.2's: the sampler draws slope events differently, and two losses are added.
 
@@ -351,7 +383,7 @@ Tube width, no hand-set value:
 | Part | What it does |
 |---|---|
 | Teacher | ConvNeXt encoder: time-binned real events + I0, I1 → `z` on the 8×8 patch grid. Training only |
-| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + conv head (time slots stacked on channels, ConvNeXt blocks, real frame times and gap length) → `ẑ`; no position code, any image size |
+| Student | Frozen video backbone on frames before I0 and after I1 (each side encoded alone) + conv head (time slots stacked on channels, ConvNeXt blocks, real frame times and gap length); v8.4: + I0, I1 at full resolution through a conv encoder, added on the code grid, 2 more blocks there → `ẑ`; no position code, any image size |
 | Decoder | UNet on I0, I1, features **gated by `z`**: every output is multiplied by a function of `z`, so `z = 0` gives exactly the path with no motion (a cross-fade), `κ = 0.01` and `ν = model.nu`, and the decoder cannot ignore the code |
 | Path | Warp both frames with learned time-polynomial flows (`K` terms per frame, no RAFT), blend with a time-varying visibility (sigmoid of a cubic in τ). `L(0)`, `L(1)` equal the frames by construction |
 | Tube | `model.taut`: the least-event path within `ε` of `L` (free ends). `ε = 1.96/√2 · σ_L`: `σ_L` is the frame noise measured per dataset and brightness on pixels without events, so 95% of noise-only pixels fit a flat path. Crossings come from this path (`model.paths`) |
@@ -372,6 +404,7 @@ Tube width, no hand-set value:
 | `jepa` | student, joint | Student code vs teacher code (`stopgrad` in the student stage) |
 | `nll_student` | student, joint | `nll` with the student's code |
 | `emd_student`, `pmse_student` | student, joint | v8.3: `emd`, `pmse` with the student's code (same weights) |
+| `xt_student` | student, joint | v8.4: `xt` with the student's code (same weight) |
 | `photo` | interp | `L(τ)` must match the real hidden frames |
 
 ---
@@ -481,7 +514,7 @@ python train.py train.stage=probe model.backbone=none     train.out=runs/probe_n
 # 1. teacher + decoder on real events
 python train.py train.stage=teacher train.out=runs/teacher
 
-# 2. student (teacher and decoder frozen)
+# 2. student (teacher frozen; v8.4: the decoder trains with the student, so start from a student checkpoint if you have one)
 python train.py train.stage=student train.init=runs/teacher/last.pt train.out=runs/student
 
 # 3. optional joint fine-tune (small lr)
@@ -505,6 +538,7 @@ python train.py train.stage=interp train.init=runs/student/last.pt data.sets.bse
 | `xt` | The x-t / y-t loss on the teacher's path | Falls with training |
 | `res_share` | Share of the expected events that are residual events (slope part + background) | Well below 1. Above ~0.8 the crossings matter little (v5.2's texture made 63–81% of the generated events) |
 | `emd`, `emd_student` | v8.3: earth mover's distance per real event (ms along t + px along x and y), teacher's / student's code | Falls with training; the student's above the teacher's |
+| `xt_student` | v8.4: x-t loss with the student's code | Falls in stage 2. The teacher's numbers rise there, since the decoder moves to the student |
 | `pmse`, `pmse_student` | v8.3: expected PMSE of a sample relative to the real blocks' mean square | Falls with training; well below 1 |
 | `photo` | The teacher's path vs the hidden frames (datasets with `skip` > 0) | Falls in the interp stage |
 | `mask` | v8.2: masked-slice score, the hidden event slices guessed through the decoder | Falls with training |

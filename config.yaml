@@ -13,7 +13,7 @@ data:
   crop: 256                    # multiple of 16
   context: 4                   # frames per side for the student, taken at the gap's stride (even for vjepa2_1: 2-frame tubelets)
   bins: 32                     # time bins of the teacher's event input (~1.1 ms each)
-  min_events: 1500             # retry crops with fewer events (v5's value)
+  min_events: 1500             # retry crops with fewer events (v5's value); v8.4: 1 in 4 training crops is not retried
   workers: 8
 
 model:

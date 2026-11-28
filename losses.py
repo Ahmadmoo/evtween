@@ -341,10 +341,13 @@ def compute(model, batch, w, stage):
         Rg = residual_grid(model, sh, Lr, batch["dt"])
         terms.update(jepa=F.mse_loss(zh, zt),
                      nll_student=event_nll(model, sh, ev, batch["dt"], w["grid"], w.get("mix", MIX), (Lr, Lg, Rg)))
+        if w.get("xt", 0) > 0:  # v8.4: the teacher's event losses on the student's events
+            terms["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0)))
         for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
             if w.get(k, 0) > 0:
                 terms[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg)
-    weight = dict(w, nll_student=w["nll"], emd_student=w.get("emd", 0), pmse_student=w.get("pmse", 0))
+    weight = dict(w, nll_student=w["nll"], xt_student=w.get("xt", 0), emd_student=w.get("emd", 0),
+                  pmse_student=w.get("pmse", 0))
     return sum(weight[k] * v for k, v in terms.items()), terms
 
 
@@ -379,6 +382,8 @@ def diagnostics(model, batch, w, student=True):
         sh = model.decode(p, zh)
         Lr, Lg = path_grid(model, sh, w["grid"])
         Rg = residual_grid(model, sh, Lr, batch["dt"])
+        if w.get("xt", 0) > 0:
+            out["xt_student"] = xt_loss(model, sh, ev, batch["dt"], Lg, Rg, w.get("xt_blur", (2.0, 2.0))).item()
         for k, f in (("emd", emd_loss), ("pmse", pmse_loss)):
             if w.get(k, 0) > 0:
                 out[k + "_student"] = f(model, sh, ev, batch["dt"], Lg, Rg).item()

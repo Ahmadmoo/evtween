@@ -71,13 +71,14 @@ class PairDataset(torch.utils.data.Dataset):
         H, W = full[i].shape[1:]
         h, w = min(self.crop, H), min(self.crop, W)
 
+        retry = self.train and bool(torch.rand(()) >= 0.25)  # v8.4: 1 in 4 training crops is plain random, quiet ones too
         for _ in range(10):
             if self.train:
                 y0, x0 = int(torch.randint(H - h + 1, ())), int(torch.randint(W - w + 1, ()))
             else:
                 y0, x0 = (H - h) // 2, (W - w) // 2
             m = (ev["x"] >= x0) & (ev["x"] < x0 + w) & (ev["y"] >= y0) & (ev["y"] < y0 + h)
-            if m.sum() >= self.min_events or not self.train:
+            if m.sum() >= self.min_events or not retry:
                 break
 
         flip = self.train and bool(torch.rand(()) < 0.5)

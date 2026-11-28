@@ -218,8 +218,10 @@ class Backbone(nn.Module):
 
 class Student(nn.Module):
     # frozen video backbone (or LoRA-tuned) on the context frames + conv head: the time slots stacked on channels, ConvNeXt
-    # blocks on the token grid, then 16 / patch cells per token side. No position code and no attention: any image size
-    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8, context=4):
+    # blocks on the token grid, then 16 / patch cells per token side. No position code and no attention: any image size.
+    # v8.4: I0, I1 at full resolution through a conv encoder (the teacher's, frames only) join on the code grid, then 2 more
+    # blocks there: the pixel detail the 16 px tokens lack. Its last layer starts at 0, so training starts from a v8.3 student
+    def __init__(self, backbone, dim, depth, patch=16, lora_rank=0, lora_blocks=8, context=4, width=64):
         super().__init__()
         self.up = 16 // patch  # path-code cells per backbone token side (patch 8: 2 x 2 per 16 x 16 token)
         self.backbone = Backbone(backbone, dim, lora_rank, lora_blocks)
@@ -228,6 +230,10 @@ class Student(nn.Module):
         self.time = nn.Linear(16 * (slots + 1), dim)  # slot times and gap length, one vector per sample
         self.blocks = nn.Sequential(*[Block(dim) for _ in range(depth)])
         self.out = nn.Sequential(LayerNorm2d(dim), nn.Conv2d(dim, dim * self.up ** 2, 1), nn.PixelShuffle(self.up))
+        self.pix = EventEncoder(6, dim, width, int(math.log2(patch)), 1)
+        nn.init.zeros_(self.pix.net[-1].weight)
+        nn.init.zeros_(self.pix.net[-1].bias)
+        self.fine = nn.Sequential(Block(dim), Block(dim))
 
     def forward(self, ctx, ctx_tau, dt):
         # ctx: frames up to I0 then from I1 on (gap frames never included); ctx_tau: their times in gap units
@@ -239,7 +245,7 @@ class Student(nn.Module):
         tok, tt = torch.cat(tok, 1), torch.cat(tt, 1)  # (B, slots, h, w, D) in time order, (B, slots)
         x = self.inp(tok.permute(0, 1, 4, 2, 3).flatten(1, 2))
         x = x + self.time(torch.cat([fourier(tt).flatten(1), fourier(dt.reshape(B).log())], -1))[..., None, None]
-        return self.out(self.blocks(x))
+        return self.fine(self.out(self.blocks(x)) + self.pix(ctx[:, T // 2 - 1:T // 2 + 1].flatten(1, 2)))
 
 
 class EventEncoder(nn.Module):
@@ -291,7 +297,7 @@ class EvTween(nn.Module):
         self.measure_c = measure_c  # thresholds measured from frames + event counts instead of learned
         # outputs: flows a, b (2K each), visibility (VIS + 1), residual rate kappa (ON / OFF x rise / fall), nu (ON / OFF)
         self.decoder = Decoder(6, z_dim, 4 * K + VIS + 1 + 6, width, depth)
-        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, context)
+        self.student = Student(backbone, pred_dim, pred_depth, patch, lora_rank, lora_blocks, context, width)
         self.to_z = nn.Conv2d(pred_dim, z_dim, 1)
         self.to_counts = nn.Conv2d(pred_dim, 2 * bins, 1)
         # one sensor and one brightness mapping per dataset (cameras differ), picked by the dataset id of each sample
